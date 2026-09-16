@@ -10,8 +10,8 @@ services:
       PGID: "100"
       UMASK: "002"
       ALLOW_ACTIONS: "false"
-      ANALYSIS_WORKERS: "2"
-      HASH_WORKERS: "2"
+      ANALYSIS_WORKERS: "1"
+      HASH_WORKERS: "1"
       SCAN_BATCH_SIZE: "64"
       SIMILARITY_DISTANCE: "6"
     volumes:

@@ -69,14 +69,14 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
 
 ## Performance settings
 
-The defaults are intentionally conservative for an Unraid array:
+The defaults are tailored for this recovery set residing on one Unraid pool drive:
 
-- **Analysis Workers: 2** — MIME detection, validation, metadata, and perceptual image hashing.
-- **Hash Workers: 2** — full BLAKE3 reads, and only for files whose byte size occurs more than once.
+- **Analysis Workers: 1** — MIME detection, validation, metadata, and perceptual image hashing without concurrent seeks.
+- **Hash Workers: 1** — one sequential full-file reader, and only for files whose byte size occurs more than once.
 - **Checkpoint Batch: 64** — maximum records submitted together and the normal commit interval.
 - **Photo Similarity Distance: 6** — conservative 64-bit perceptual-hash radius.
 
-For recovery data concentrated on one spinning disk, set both worker counts to `1`. For data genuinely spread across several disks, `2` is normally appropriate. Raising these values based only on CPU core count usually makes an HDD array slower because the heads must seek between concurrent files.
+Keep both worker counts at `1` while the source remains on one drive. If the recovery data is later redistributed across several physical drives or moved to SSD storage, `2` may be appropriate. Raising these values based only on CPU core count usually makes a single HDD slower because the head must seek between concurrent files.
 
 The similar-photo stage uses a BK-tree rather than comparing every photo against every other photo. It also retains only one union representative per perceptual-hash/aspect-ratio bucket, preventing thousands of blank thumbnails or near-identical screenshots from creating a quadratic cluster. Exact duplicate detection first groups by byte size and hashes only candidate groups. These choices avoid the quadratic comparison and unbounded-GUI-state behavior that can make desktop duplicate tools appear frozen.
 

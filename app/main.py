@@ -18,8 +18,8 @@ curator = Curator(
     quarantine=Path(os.environ.get("QUARANTINE_ROOT", "/quarantine")),
     db_path=Path(os.environ.get("DATA_DIR", "/config")) / "catalog.sqlite3",
     allow_actions=env_bool("ALLOW_ACTIONS", False),
-    analysis_workers=int(os.environ.get("ANALYSIS_WORKERS", "2")),
-    hash_workers=int(os.environ.get("HASH_WORKERS", "2")),
+    analysis_workers=int(os.environ.get("ANALYSIS_WORKERS", "1")),
+    hash_workers=int(os.environ.get("HASH_WORKERS", "1")),
     batch_size=int(os.environ.get("SCAN_BATCH_SIZE", "64")),
     similarity_radius=int(os.environ.get("SIMILARITY_DISTANCE", "6")),
 )
