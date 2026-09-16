@@ -664,7 +664,9 @@ class Curator:
             total = db.execute("SELECT COUNT(*) FROM files WHERE phash IS NOT NULL AND validation='valid'").fetchone()[0]
             self._begin_phase("similarity", total, "Indexing visually similar images without all-pairs comparisons")
             tree = BKTree()
-            hash_to_ids: dict[int, list[int]] = defaultdict(list)
+            # One representative per pHash/aspect bucket prevents huge groups of blank or
+            # near-identical thumbnails from degenerating into repeated all-member comparisons.
+            hash_representatives: dict[int, dict[int, int]] = defaultdict(dict)
             dimensions: dict[int, tuple[int, int]] = {}
             union = UnionFind()
             member_ids: list[int] = []
@@ -676,8 +678,14 @@ class Curator:
                     value = int(row["phash"], 16)
                     member_ids.append(row["id"])
                     dimensions[row["id"]] = (row["width"] or 1, row["height"] or 1)
+                    current_ratio = dimensions[row["id"]][0] / max(dimensions[row["id"]][1], 1)
+                    ratio_bucket = round(math.log(max(current_ratio, 0.001)) / 0.06)
                     for neighbor in tree.search(value, radius):
-                        for other_id in hash_to_ids[neighbor]:
+                        candidates = hash_representatives[neighbor]
+                        for bucket in range(ratio_bucket - 2, ratio_bucket + 3):
+                            other_id = candidates.get(bucket)
+                            if other_id is None:
+                                continue
                             left = dimensions[row["id"]]
                             right = dimensions[other_id]
                             left_ratio = left[0] / max(left[1], 1)
@@ -685,7 +693,7 @@ class Curator:
                             if abs(math.log(max(left_ratio, 0.001) / max(right_ratio, 0.001))) <= 0.12:
                                 union.union(row["id"], other_id)
                     tree.add(value)
-                    hash_to_ids[value].append(row["id"])
+                    hash_representatives[value].setdefault(ratio_bucket, row["id"])
                 processed += len(batch)
                 self._progress(processed, total)
             groups: dict[int, list[int]] = defaultdict(list)

@@ -78,7 +78,7 @@ The defaults are intentionally conservative for an Unraid array:
 
 For recovery data concentrated on one spinning disk, set both worker counts to `1`. For data genuinely spread across several disks, `2` is normally appropriate. Raising these values based only on CPU core count usually makes an HDD array slower because the heads must seek between concurrent files.
 
-The similar-photo stage uses a BK-tree rather than comparing every photo against every other photo. Exact duplicate detection first groups by byte size and hashes only candidate groups. These choices avoid the quadratic comparison and unbounded-GUI-state behavior that can make desktop duplicate tools appear frozen.
+The similar-photo stage uses a BK-tree rather than comparing every photo against every other photo. It also retains only one union representative per perceptual-hash/aspect-ratio bucket, preventing thousands of blank thumbnails or near-identical screenshots from creating a quadratic cluster. Exact duplicate detection first groups by byte size and hashes only candidate groups. These choices avoid the quadratic comparison and unbounded-GUI-state behavior that can make desktop duplicate tools appear frozen.
 
 The dashboard reports the current phase, completed records, throughput, and remains usable while the scan runs. **Stop after checkpoint** requests a clean stop between batches; starting again reuses completed inventory, metadata, and hashes.
 

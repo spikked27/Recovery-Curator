@@ -67,6 +67,24 @@ class CuratorTests(unittest.TestCase):
             self.assertEqual(curator.summary()["files"], 500)
             self.assertEqual(curator.summary()["zero_files"], 500)
 
+    def test_large_identical_visual_bucket_uses_one_group(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (root / name for name in ("source", "output", "quarantine", "config"))
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            sample = source / "sample.png"
+            Image.new("RGB", (64, 64), (40, 80, 120)).save(sample)
+            payload = sample.read_bytes()
+            for number in range(100):
+                (source / f"copy-{number:03d}.png").write_bytes(payload)
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3", batch_size=16)
+            curator.scan()
+            summary = curator.summary()
+            self.assertEqual(summary["files"], 101)
+            self.assertEqual(summary["exact_groups"], 1)
+            self.assertEqual(summary["similar_groups"], 1)
+
 
 if __name__ == "__main__":
     unittest.main()
