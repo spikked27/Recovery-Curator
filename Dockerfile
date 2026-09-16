@@ -1,5 +1,8 @@
 FROM python:3.12-slim
 
+LABEL org.opencontainers.image.source="https://github.com/spikked27/Recovery-Curator" \
+      org.opencontainers.image.description="Non-destructive recovery triage and curation for Unraid"
+
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     SOURCE_ROOT=/source \

@@ -1,18 +1,18 @@
 <?xml version="1.0"?>
 <Container version="2">
   <Name>Recovery-Curator</Name>
-  <Repository>recovery-curator:local</Repository>
-  <Registry/>
+  <Repository>ghcr.io/spikked27/recovery-curator:latest</Repository>
+  <Registry>https://github.com/spikked27/Recovery-Curator/pkgs/container/recovery-curator</Registry>
   <Network>bridge</Network>
   <MyIP/>
   <Shell>sh</Shell>
   <Privileged>false</Privileged>
-  <Support/>
-  <Project/>
+  <Support>https://github.com/spikked27/Recovery-Curator/issues</Support>
+  <Project>https://github.com/spikked27/Recovery-Curator</Project>
   <Overview>Non-destructive recovery triage for exact duplicates, similar photos, corrupt/zero-byte files, filename-derived photo dates, categorized exports, and AI-ready catalogs.</Overview>
   <Category>Tools: Backup:</Category>
   <WebUI>http://[IP]:[PORT:8188]/</WebUI>
-  <TemplateURL/>
+  <TemplateURL>https://raw.githubusercontent.com/spikked27/Recovery-Curator/main/unraid-template.xml</TemplateURL>
   <Icon/>
   <ExtraParams>--memory=4g</ExtraParams>
   <PostArgs/>
@@ -20,7 +20,7 @@
   <DateInstalled/>
   <DonateText/>
   <DonateLink/>
-  <Requires>Build the included image once with install-unraid.sh. Keep Source Access read-only and ALLOW_ACTIONS=false for the first scan.</Requires>
+  <Requires>Keep Source Access read-only and ALLOW_ACTIONS=false for the first scan. Store appdata on a non-array pool.</Requires>
   <Config Name="Web UI Port" Target="8188" Default="8188" Mode="tcp" Description="Recovery Curator web interface" Type="Port" Display="always" Required="true" Mask="false">8188</Config>
   <Config Name="Recovered Source" Target="/source" Default="/mnt/user/Recovered" Mode="ro" Description="Top-level directory containing recovered files. Do not map both /mnt/user and individual /mnt/disk paths for the same files." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/Recovered</Config>
   <Config Name="Curated Output" Target="/output" Default="/mnt/user/Recovered_Curated" Mode="rw" Description="New categorized library. Source files are copied here; filename-derived metadata is applied only to these copies." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/Recovered_Curated</Config>

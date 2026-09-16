@@ -35,16 +35,16 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
 
 ## Install on Unraid
 
-1. From the Unraid terminal, download the public repository to a non-array pool. Replace `cache` if your pool has a different name:
+1. From the Unraid terminal, install the template:
 
    ```bash
-   curator_src=/mnt/cache/appdata/recovery-curator-src
-   mkdir -p "$curator_src"
-   curl -fsSL https://github.com/spikked27/Recovery-Curator/archive/refs/heads/main.tar.gz \
-     | tar -xz --strip-components=1 -C "$curator_src"
-   cd "$curator_src"
-   bash install-unraid.sh
+   mkdir -p /boot/config/plugins/dockerMan/templates-user
+   curl -fsSL \
+     https://raw.githubusercontent.com/spikked27/Recovery-Curator/main/unraid-template.xml \
+     -o /boot/config/plugins/dockerMan/templates-user/my-recovery-curator.xml
    ```
+
+   The template pulls the published image from `ghcr.io/spikked27/recovery-curator:latest`; no local build is required.
 
 3. In Unraid, open **Docker > Add Container** and select **Recovery-Curator** from the template list.
 
