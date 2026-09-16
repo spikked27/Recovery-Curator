@@ -13,7 +13,9 @@
     .card,.group { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px } .metric { font-size:28px; font-weight:700 }
     .muted { color:var(--muted) } .good { color:var(--accent) } .warn { color:var(--warn) } .bad { color:var(--bad) }
     button,.button { background:#2563eb; color:white; border:0; border-radius:8px; padding:9px 13px; cursor:pointer; text-decoration:none; display:inline-block }
-    button.secondary,.button.secondary { background:#334155 } button.danger { background:#be123c } form { display:inline }
+    button.secondary,.button.secondary { background:#334155 } button.danger { background:#be123c }
+    button:disabled { opacity:.45; cursor:not-allowed } form { display:inline }
+    .scan-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:12px }
     table { width:100%; border-collapse:collapse; margin-top:16px } th,td { text-align:left; border-bottom:1px solid var(--line); padding:9px; vertical-align:top }
     th { color:#a8bbce; position:sticky; top:0; background:var(--panel) } .path { overflow-wrap:anywhere; max-width:580px }
     .thumb { width:180px; height:140px; object-fit:contain; background:#0b0e11; border-radius:8px }
@@ -28,4 +30,3 @@
 <main>{% block content %}{% endblock %}</main>
 </body>
 </html>
-

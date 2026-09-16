@@ -12,22 +12,52 @@
 </div>
 
 <section class="card" style="margin-top:18px">
-  <h2>Scanner</h2><p id="scan-message">{{ status.message }}</p><progress id="progress" max="{{ status.total or 1 }}" value="{{ status.processed or 0 }}"></progress>
+  <h2>Scanner</h2>
+  <p id="scan-message">{{ status.message }}</p>
+  <progress id="progress" max="{{ status.total or 1 }}" value="{{ status.processed or 0 }}"></progress>
   <p class="muted" id="scan-detail">{{ status.phase }} — {{ status.processed }}/{{ status.total }} — {{ status.rate or 0 }} files/s</p>
-  <form method="post" action="/scan"><button {% if status.running %}disabled{% endif %}>Start or resume scan</button></form>
-  <form method="post" action="/scan/stop"><button class="secondary" {% if not status.running %}disabled{% endif %}>Stop after checkpoint</button></form>
-  <form method="post" action="/build-library"><button class="secondary">Build curated library</button></form>
+  <div class="scan-actions">
+    <form method="post" action="/scan">
+      <button id="start-scan" {% if status.running %}disabled{% endif %}>Start or resume scan</button>
+    </form>
+    <form id="cancel-scan-form" method="post" action="/scan/stop">
+      <button id="cancel-scan" class="danger" {% if not status.running %}disabled{% endif %}>Cancel Scan</button>
+    </form>
+    <form method="post" action="/build-library">
+      <button class="secondary">Build curated library</button>
+    </form>
+  </div>
+  <p class="muted">Cancel Scan safely stops after the current checkpoint. Completed catalog work is retained, so the scan can be resumed later.</p>
 </section>
 
 <section class="card" style="margin-top:18px"><h2>Categories</h2><table><tr><th>Category</th><th>Files</th></tr>
 {% for item in summary.categories %}<tr><td><a href="/files?category={{ item.category|urlencode }}">{{ item.category or "Pending scan" }}</a></td><td>{{ item.count }}</td></tr>{% endfor %}</table></section>
 
 <script>
-async function refresh(){const r=await fetch('/api/status');const d=await r.json();const s=d.status;
- document.getElementById('scan-message').textContent=s.message+(s.error?' — '+s.error:'');
- const p=document.getElementById('progress');p.max=Math.max(s.total,1);p.value=s.processed;
- document.getElementById('scan-detail').textContent=`${s.phase} — ${s.processed}/${s.total} — ${s.rate || 0} files/s`;
- if(s.running)setTimeout(refresh,1500);}
+const startButton = document.getElementById('start-scan');
+const cancelButton = document.getElementById('cancel-scan');
+const cancelForm = document.getElementById('cancel-scan-form');
+
+cancelForm.addEventListener('submit', () => {
+  cancelButton.disabled = true;
+  cancelButton.textContent = 'Cancellation requested…';
+  document.getElementById('scan-message').textContent = 'Cancellation requested — finishing the current checkpoint…';
+});
+
+async function refresh(){
+  const r=await fetch('/api/status');
+  const d=await r.json();
+  const s=d.status;
+  document.getElementById('scan-message').textContent=s.message+(s.error?' — '+s.error:'');
+  const p=document.getElementById('progress');
+  p.max=Math.max(s.total,1);
+  p.value=s.processed;
+  document.getElementById('scan-detail').textContent=`${s.phase} — ${s.processed}/${s.total} — ${s.rate || 0} files/s`;
+  startButton.disabled=s.running;
+  cancelButton.disabled=!s.running;
+  if(!s.running)cancelButton.textContent='Cancel Scan';
+  if(s.running)setTimeout(refresh,1500);
+}
 refresh();
 </script>
 {% endblock %}
