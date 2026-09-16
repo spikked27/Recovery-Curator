@@ -12,7 +12,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     UMASK=002
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-      exiftool libmagic1 qpdf tini gosu \
+      libimage-exiftool-perl libmagic1 qpdf tini gosu \
     && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /opt/recovery-curator
