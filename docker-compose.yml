@@ -1,0 +1,23 @@
+services:
+  recovery-curator:
+    build: .
+    image: recovery-curator:local
+    container_name: recovery-curator
+    ports:
+      - "8188:8188"
+    environment:
+      PUID: "99"
+      PGID: "100"
+      UMASK: "002"
+      ALLOW_ACTIONS: "false"
+      ANALYSIS_WORKERS: "2"
+      HASH_WORKERS: "2"
+      SCAN_BATCH_SIZE: "64"
+      SIMILARITY_DISTANCE: "6"
+    volumes:
+      - /mnt/user/Recovered:/source:ro
+      - /mnt/user/Recovered_Curated:/output:rw
+      - /mnt/user/Recovered_Quarantine:/quarantine:rw
+      - /mnt/user/appdata/recovery-curator:/config:rw
+    mem_limit: 4g
+    restart: unless-stopped

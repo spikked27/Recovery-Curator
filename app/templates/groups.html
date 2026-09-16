@@ -1,0 +1,14 @@
+{% extends "base.html" %}{% block title %}{{ kind|title }} groups — Recovery Curator{% endblock %}{% block content %}
+<h2>{{ "Exact duplicate" if kind == "exact" else "Visually similar photo" }} groups</h2>
+{% if kind == "exact" %}<p>Exact groups are byte-for-byte identical. Automatic selection keeps one clean-path copy and marks the others rejected; it does not move or delete anything.</p><form method="post" action="/auto-decide-exact"><button>Mark exact duplicate keepers</button></form>{% else %}<p>These images are visually related, not necessarily interchangeable. Review crops, edits, screenshots, and higher-resolution versions manually.</p>{% endif %}
+{% for group in groups %}<section class="group" style="margin-top:18px"><strong>Group {{ group.id }}</strong><div class="items">
+{% for item in group.items %}<article class="item {% if item.id == group.recommended_id %}recommended{% endif %}">
+{% if item.is_image %}<a href="/preview/{{ item.id }}" target="_blank"><img class="thumb" loading="lazy" src="/preview/{{ item.id }}"></a>{% endif %}
+<p class="path"><strong>{{ item.name }}</strong><br><span class="muted">{{ item.relative_path }}</span></p>
+<span class="pill">{{ item.width or "?" }}×{{ item.height or "?" }}</span><span class="pill">{{ item.size|human_bytes }}</span><span class="pill">score {{ item.quality_score }}</span>
+{% if item.id == group.recommended_id %}<span class="pill good">recommended</span>{% endif %}<p>{{ item.category }} · {{ item.validation }} · {{ item.decision }}</p>
+<form method="post" action="/decision/{{ item.id }}"><input type="hidden" name="decision" value="keep"><button>Keep</button></form>
+<form method="post" action="/decision/{{ item.id }}"><input type="hidden" name="decision" value="reject"><button class="secondary">Reject</button></form>
+</article>{% endfor %}</div></section>{% else %}<p>No groups yet. Run a scan first.</p>{% endfor %}
+{% endblock %}
+

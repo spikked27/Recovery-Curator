@@ -1,0 +1,33 @@
+{% extends "base.html" %}{% block content %}
+{% if not summary.allow_actions %}<div class="notice"><strong>Safe review mode:</strong> recovered files are read-only. Scanning and decisions work; quarantine and curated export remain blocked until explicitly enabled.</div>{% endif %}
+<div class="grid">
+  <div class="card"><div class="metric">{{ summary.files or 0 }}</div><div class="muted">files cataloged</div></div>
+  <div class="card"><div class="metric">{{ summary.bytes_human }}</div><div class="muted">source data</div></div>
+  <div class="card"><div class="metric">{{ summary.images or 0 }}</div><div class="muted">images</div></div>
+  <div class="card"><div class="metric">{{ summary.exact_groups or 0 }}</div><div class="muted">exact groups</div></div>
+  <div class="card"><div class="metric">{{ summary.similar_groups or 0 }}</div><div class="muted">similar-photo groups</div></div>
+  <div class="card"><div class="metric">{{ summary.date_proposals or 0 }}</div><div class="muted">filename date repairs</div></div>
+  <div class="card"><div class="metric warn">{{ summary.zero_files or 0 }}</div><div class="muted">zero-byte files</div></div>
+  <div class="card"><div class="metric bad">{{ summary.corrupt_files or 0 }}</div><div class="muted">corrupt files</div></div>
+</div>
+
+<section class="card" style="margin-top:18px">
+  <h2>Scanner</h2><p id="scan-message">{{ status.message }}</p><progress id="progress" max="{{ status.total or 1 }}" value="{{ status.processed or 0 }}"></progress>
+  <p class="muted" id="scan-detail">{{ status.phase }} — {{ status.processed }}/{{ status.total }} — {{ status.rate or 0 }} files/s</p>
+  <form method="post" action="/scan"><button {% if status.running %}disabled{% endif %}>Start or resume scan</button></form>
+  <form method="post" action="/scan/stop"><button class="secondary" {% if not status.running %}disabled{% endif %}>Stop after checkpoint</button></form>
+  <form method="post" action="/build-library"><button class="secondary">Build curated library</button></form>
+</section>
+
+<section class="card" style="margin-top:18px"><h2>Categories</h2><table><tr><th>Category</th><th>Files</th></tr>
+{% for item in summary.categories %}<tr><td><a href="/files?category={{ item.category|urlencode }}">{{ item.category or "Pending scan" }}</a></td><td>{{ item.count }}</td></tr>{% endfor %}</table></section>
+
+<script>
+async function refresh(){const r=await fetch('/api/status');const d=await r.json();const s=d.status;
+ document.getElementById('scan-message').textContent=s.message+(s.error?' — '+s.error:'');
+ const p=document.getElementById('progress');p.max=Math.max(s.total,1);p.value=s.processed;
+ document.getElementById('scan-detail').textContent=`${s.phase} — ${s.processed}/${s.total} — ${s.rate || 0} files/s`;
+ if(s.running)setTimeout(refresh,1500);}
+refresh();
+</script>
+{% endblock %}

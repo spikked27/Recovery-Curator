@@ -1,0 +1,10 @@
+Flask==3.1.2
+Pillow==11.3.0
+pillow-heif==1.1.0
+ImageHash==4.3.2
+blake3==1.0.5
+pypdf==6.0.0
+olefile==0.47
+python-magic==0.4.27
+gunicorn==23.0.0
+

@@ -1,0 +1,37 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>Recovery-Curator</Name>
+  <Repository>recovery-curator:local</Repository>
+  <Registry/>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>sh</Shell>
+  <Privileged>false</Privileged>
+  <Support/>
+  <Project/>
+  <Overview>Non-destructive recovery triage for exact duplicates, similar photos, corrupt/zero-byte files, filename-derived photo dates, categorized exports, and AI-ready catalogs.</Overview>
+  <Category>Tools: Backup:</Category>
+  <WebUI>http://[IP]:[PORT:8188]/</WebUI>
+  <TemplateURL/>
+  <Icon/>
+  <ExtraParams>--memory=4g</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires>Build the included image once with install-unraid.sh. Keep Source Access read-only and ALLOW_ACTIONS=false for the first scan.</Requires>
+  <Config Name="Web UI Port" Target="8188" Default="8188" Mode="tcp" Description="Recovery Curator web interface" Type="Port" Display="always" Required="true" Mask="false">8188</Config>
+  <Config Name="Recovered Source" Target="/source" Default="/mnt/user/Recovered" Mode="ro" Description="Top-level directory containing recovered files. Do not map both /mnt/user and individual /mnt/disk paths for the same files." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/Recovered</Config>
+  <Config Name="Curated Output" Target="/output" Default="/mnt/user/Recovered_Curated" Mode="rw" Description="New categorized library. Source files are copied here; filename-derived metadata is applied only to these copies." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/Recovered_Curated</Config>
+  <Config Name="Quarantine" Target="/quarantine" Default="/mnt/user/Recovered_Quarantine" Mode="rw" Description="Reversible holding area for files explicitly quarantined after review." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/Recovered_Quarantine</Config>
+  <Config Name="Appdata" Target="/config" Default="/mnt/user/appdata/recovery-curator" Mode="rw" Description="SQLite catalog, scan state, and reports. Prefer cache storage." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/recovery-curator</Config>
+  <Config Name="Allow Write Actions" Target="ALLOW_ACTIONS" Default="false" Mode="" Description="Leave false for scanning/review. Set true only when ready to build the curated output or quarantine files." Type="Variable" Display="always" Required="true" Mask="false">false</Config>
+  <Config Name="Analysis Workers" Target="ANALYSIS_WORKERS" Default="2" Mode="" Description="Concurrent validation/image-analysis workers. Use 1-2 for HDD arrays; more may cause disk thrashing." Type="Variable" Display="advanced" Required="true" Mask="false">2</Config>
+  <Config Name="Hash Workers" Target="HASH_WORKERS" Default="2" Mode="" Description="Concurrent full-file hashing workers. Use 1 for one HDD and 2 for data spread across drives." Type="Variable" Display="advanced" Required="true" Mask="false">2</Config>
+  <Config Name="Checkpoint Batch" Target="SCAN_BATCH_SIZE" Default="64" Mode="" Description="Maximum in-memory work batch and checkpoint interval. 64 is recommended." Type="Variable" Display="advanced" Required="true" Mask="false">64</Config>
+  <Config Name="Photo Similarity Distance" Target="SIMILARITY_DISTANCE" Default="6" Mode="" Description="Perceptual hash distance from 0-16. Six is conservative; higher creates broader groups." Type="Variable" Display="advanced" Required="true" Mask="false">6</Config>
+  <Config Name="User ID" Target="PUID" Default="99" Mode="" Description="Unraid nobody user" Type="Variable" Display="advanced" Required="true" Mask="false">99</Config>
+  <Config Name="Group ID" Target="PGID" Default="100" Mode="" Description="Unraid users group" Type="Variable" Display="advanced" Required="true" Mask="false">100</Config>
+  <Config Name="Umask" Target="UMASK" Default="002" Mode="" Description="Permissions mask for created files" Type="Variable" Display="advanced" Required="true" Mask="false">002</Config>
+</Container>
