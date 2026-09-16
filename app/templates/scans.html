@@ -1,0 +1,39 @@
+{% extends "base.html" %}{% block content %}
+<h2>Saved scans</h2>
+<p>Each saved scan has its own catalog, progress, decisions, selected known-good folders, hashes, and generated reports. Source and backup files are never copied into the saved scan.</p>
+
+{% if status.running %}<div class="notice">Cancel the active scan and wait for it to stop before creating or switching saved scans.</div>{% endif %}
+
+<div class="grid">
+  <section class="card">
+    <h3>Create a blank scan</h3>
+    <form method="post" action="/scans/create">
+      <label>Scan name<br><input name="name" required maxlength="80" placeholder="Recovery pass 2"></label><br><br>
+      <button {% if status.running %}disabled{% endif %}>Create and switch</button>
+    </form>
+    <p class="muted">The new scan starts with no catalog records or known-good folder selections.</p>
+  </section>
+
+  <section class="card">
+    <h3>Available scans</h3>
+    <table><tr><th>Name</th><th>Created</th><th></th></tr>
+    {% for item in profiles %}
+      <tr>
+        <td><strong>{{ item.name }}</strong>{% if item.active %}<br><span class="pill good">Active</span>{% endif %}</td>
+        <td>{{ item.created_at }}</td>
+        <td>
+          {% if not item.active %}
+            <form method="post" action="/scans/switch">
+              <input type="hidden" name="profile_id" value="{{ item.id }}">
+              <button class="secondary" {% if status.running %}disabled{% endif %}>Switch to scan</button>
+            </form>
+          {% else %}
+            <a class="button" href="/">Open dashboard</a>
+          {% endif %}
+        </td>
+      </tr>
+    {% endfor %}
+    </table>
+  </section>
+</div>
+{% endblock %}

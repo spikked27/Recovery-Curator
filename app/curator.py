@@ -104,6 +104,10 @@ def initialize(db_path: Path) -> None:
               quality_score REAL DEFAULT 0,
               exact_group TEXT,
               similar_group INTEGER,
+              known_good_match INTEGER DEFAULT 0,
+              known_good_count INTEGER DEFAULT 0,
+              known_good_library TEXT,
+              known_good_path TEXT,
               decision TEXT DEFAULT 'undecided',
               exported_path TEXT,
               ai_caption TEXT,
@@ -117,9 +121,26 @@ def initialize(db_path: Path) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_files_size ON files(size);
             CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash);
+            CREATE INDEX IF NOT EXISTS idx_files_size_hash ON files(size,content_hash);
             CREATE INDEX IF NOT EXISTS idx_files_exact ON files(exact_group);
             CREATE INDEX IF NOT EXISTS idx_files_similar ON files(similar_group);
             CREATE INDEX IF NOT EXISTS idx_files_category ON files(category);
+            CREATE TABLE IF NOT EXISTS reference_files (
+              id INTEGER PRIMARY KEY,
+              library TEXT NOT NULL,
+              path TEXT NOT NULL UNIQUE,
+              relative_path TEXT NOT NULL,
+              size INTEGER NOT NULL,
+              mtime_ns INTEGER NOT NULL,
+              seen_scan TEXT,
+              content_hash TEXT,
+              hash_error TEXT,
+              updated_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_reference_size ON reference_files(size);
+            CREATE INDEX IF NOT EXISTS idx_reference_hash ON reference_files(content_hash);
+            CREATE INDEX IF NOT EXISTS idx_reference_size_hash ON reference_files(size,content_hash);
+            CREATE INDEX IF NOT EXISTS idx_reference_library ON reference_files(library);
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS actions (
               id INTEGER PRIMARY KEY,
@@ -134,9 +155,16 @@ def initialize(db_path: Path) -> None:
             """
         )
         existing_columns = {row[1] for row in db.execute("PRAGMA table_info(files)")}
-        for column in ("ai_caption", "ai_people", "ai_objects", "ai_ocr_text", "ai_tags", "ai_model", "ai_updated_at"):
+        migrations = {
+            "ai_caption": "TEXT", "ai_people": "TEXT", "ai_objects": "TEXT", "ai_ocr_text": "TEXT",
+            "ai_tags": "TEXT", "ai_model": "TEXT", "ai_updated_at": "TEXT",
+            "known_good_match": "INTEGER DEFAULT 0", "known_good_count": "INTEGER DEFAULT 0",
+            "known_good_library": "TEXT", "known_good_path": "TEXT",
+        }
+        for column, definition in migrations.items():
             if column not in existing_columns:
-                db.execute(f"ALTER TABLE files ADD COLUMN {column} TEXT")
+                db.execute(f"ALTER TABLE files ADD COLUMN {column} {definition}")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_files_known_good ON files(known_good_match)")
 
 
 def file_blake3(path: Path, chunk_size: int = 8 * 1024 * 1024) -> str:
@@ -451,11 +479,13 @@ class Curator:
         self, source: Path, output: Path, quarantine: Path, db_path: Path,
         allow_actions: bool = False, analysis_workers: int = 2, hash_workers: int = 2,
         batch_size: int = 64, similarity_radius: int = 6,
+        reference_root: Path | None = None,
     ):
         self.source = source.resolve()
         self.output = output.resolve()
         self.quarantine = quarantine.resolve()
         self.db_path = db_path
+        self.reference_root = reference_root.resolve() if reference_root else None
         self.allow_actions = allow_actions
         self.analysis_workers = max(1, min(int(analysis_workers), 8))
         self.hash_workers = max(1, min(int(hash_workers), 8))
@@ -473,6 +503,18 @@ class Curator:
     def status(self) -> dict:
         with self.lock:
             return dict(self.state)
+
+    def switch_database(self, db_path: Path) -> None:
+        with self.lock:
+            if self.state["running"]:
+                raise RuntimeError("Cancel the active scan and wait for it to stop before switching saved scans.")
+            self.db_path = db_path
+            initialize(self.db_path)
+            self.stop_event.clear()
+            self.state.update(
+                running=False, phase="idle", processed=0, total=0, rate=0.0,
+                message="Saved scan loaded", error=None,
+            )
 
     def _set_state(self, **values) -> None:
         with self.lock:
@@ -511,6 +553,160 @@ class Curator:
         self._set_state(message="Stopping after the current batch checkpoint…")
         return True
 
+    def reset_catalog(self) -> dict:
+        """Remove scan state and generated reports without touching any library files."""
+        with self.lock:
+            if self.state["running"]:
+                raise RuntimeError("Cancel the active scan and wait for it to stop before clearing the catalog.")
+        with connect(self.db_path) as db:
+            file_count = db.execute("SELECT COUNT(*) FROM files").fetchone()[0]
+            reference_count = db.execute("SELECT COUNT(*) FROM reference_files").fetchone()[0]
+            db.execute("DELETE FROM actions")
+            db.execute("DELETE FROM files")
+            db.execute("DELETE FROM reference_files")
+            db.execute("DELETE FROM settings")
+            db.commit()
+        removed_reports = 0
+        for name in ("recovery_catalog.csv", "recovery_catalog.jsonl"):
+            report = self.db_path.parent / name
+            try:
+                report.unlink()
+                removed_reports += 1
+            except FileNotFoundError:
+                pass
+        self.stop_event.clear()
+        self._set_state(
+            running=False, phase="idle", processed=0, total=0, rate=0.0,
+            message="Catalog cleared. Ready for a new scan.", error=None,
+        )
+        return {"files": file_count, "reference_files": reference_count, "reports": removed_reports}
+
+    @staticmethod
+    def _paths_overlap(left: Path, right: Path) -> bool:
+        return left == right or left in right.parents or right in left.parents
+
+    def _selected_reference_values(self, db: sqlite3.Connection | None = None) -> list[str]:
+        owns_connection = db is None
+        connection = db or connect(self.db_path)
+        try:
+            row = connection.execute("SELECT value FROM settings WHERE key='reference_selections'").fetchone()
+            if not row:
+                return []
+            values = json.loads(row["value"])
+            return sorted({str(value) for value in values if isinstance(value, str)})
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        finally:
+            if owns_connection:
+                connection.close()
+
+    def _normalize_reference_relative(self, relative: str, require_exists: bool = True) -> tuple[str, Path]:
+        if self.reference_root is None:
+            raise ValueError("Configure the Known-Good Root path in the Unraid container first.")
+        requested = Path(relative or ".")
+        if requested.is_absolute():
+            raise ValueError("Known-good selections must stay inside the configured root.")
+        candidate = (self.reference_root / requested).resolve()
+        if candidate != self.reference_root and self.reference_root not in candidate.parents:
+            raise ValueError("Known-good selections must stay inside the configured root.")
+        if require_exists and (not candidate.exists() or not candidate.is_dir()):
+            raise FileNotFoundError("The selected known-good folder does not exist or is not a directory.")
+        normalized = "." if candidate == self.reference_root else candidate.relative_to(self.reference_root).as_posix()
+        return normalized, candidate
+
+    def selected_references(self) -> list[dict]:
+        selections = []
+        for relative in self._selected_reference_values():
+            try:
+                normalized, path = self._normalize_reference_relative(relative, require_exists=False)
+            except ValueError:
+                continue
+            selections.append({"relative": normalized, "path": str(path), "available": path.is_dir()})
+        return selections
+
+    def browse_reference_directories(self, relative: str = ".") -> dict:
+        current_relative, current = self._normalize_reference_relative(relative)
+        directories = []
+        try:
+            with os.scandir(current) as entries:
+                for entry in entries:
+                    try:
+                        if not entry.is_dir(follow_symlinks=False):
+                            continue
+                        child = Path(entry.path).resolve()
+                        if child != self.reference_root and self.reference_root not in child.parents:
+                            continue
+                        directories.append({
+                            "name": entry.name,
+                            "relative": child.relative_to(self.reference_root).as_posix(),
+                        })
+                    except OSError:
+                        continue
+        except OSError as exc:
+            raise OSError(f"Unable to browse known-good folder: {exc}") from exc
+        directories.sort(key=lambda item: item["name"].casefold())
+        if current == self.reference_root:
+            parent = None
+        else:
+            parent_path = current.parent
+            parent = "." if parent_path == self.reference_root else parent_path.relative_to(self.reference_root).as_posix()
+        return {
+            "current": current_relative, "current_path": str(current), "parent": parent,
+            "directories": directories, "selected": self.selected_references(),
+        }
+
+    def add_reference_selection(self, relative: str) -> str:
+        normalized, candidate = self._normalize_reference_relative(relative)
+        selections = self._selected_reference_values()
+        for existing in selections:
+            existing_normalized, existing_path = self._normalize_reference_relative(existing, require_exists=False)
+            if existing_normalized == normalized:
+                return normalized
+            if self._paths_overlap(existing_path, candidate):
+                raise ValueError("That folder overlaps an existing selection. Remove the existing selection first.")
+        selections.append(normalized)
+        with connect(self.db_path) as db:
+            db.execute(
+                "INSERT INTO settings(key,value) VALUES('reference_selections',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (json.dumps(sorted(selections)),),
+            )
+            db.commit()
+        return normalized
+
+    def remove_reference_selection(self, relative: str) -> None:
+        normalized, _ = self._normalize_reference_relative(relative, require_exists=False)
+        selections = [value for value in self._selected_reference_values() if value != normalized]
+        with connect(self.db_path) as db:
+            db.execute(
+                "INSERT INTO settings(key,value) VALUES('reference_selections',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (json.dumps(selections),),
+            )
+            db.execute("DELETE FROM reference_files WHERE library=?", (normalized,))
+            self._mark_known_good_matches(db, update_progress=False)
+            db.commit()
+
+    def _configured_reference_roots(self, db: sqlite3.Connection | None = None) -> list[tuple[str, Path]]:
+        configured = []
+        for relative in self._selected_reference_values(db):
+            try:
+                normalized, path = self._normalize_reference_relative(relative, require_exists=False)
+            except ValueError:
+                continue
+            configured.append((normalized, path))
+        return configured
+
+    def _validate_reference_roots(self) -> None:
+        existing = [(label, root) for label, root in self._configured_reference_roots() if root.exists()]
+        for label, root in existing:
+            if self._paths_overlap(self.source, root):
+                raise ValueError(f"{label} overlaps the recovered source; reference libraries must be separate read-only folders.")
+        for index, (left_label, left_root) in enumerate(existing):
+            for right_label, right_root in existing[index + 1:]:
+                if self._paths_overlap(left_root, right_root):
+                    raise ValueError(f"{left_label} and {right_label} overlap; mount each known-good library only once.")
+
     def _scan_wrapper(self) -> None:
         try:
             self.scan()
@@ -523,6 +719,7 @@ class Curator:
     def scan(self) -> None:
         if not self.source.exists():
             raise FileNotFoundError(f"Source path does not exist: {self.source}")
+        self._validate_reference_roots()
         scan_token = utcnow() + "-" + os.urandom(4).hex()
         self._begin_phase("inventory", 0, "Inventorying files with bounded memory")
         with connect(self.db_path) as db:
@@ -550,7 +747,8 @@ class Curator:
                            content_hash=NULL,is_image=0,width=NULL,height=NULL,megapixels=NULL,phash=NULL,exif_date=NULL,
                            exif_make=NULL,exif_model=NULL,filename_date=NULL,date_confidence=0,date_reason=NULL,
                            category=NULL,category_confidence=0,category_reason=NULL,quality_score=0,exact_group=NULL,
-                           similar_group=NULL,decision='undecided',exported_path=NULL,ai_caption=NULL,ai_people=NULL,
+                           similar_group=NULL,known_good_match=0,known_good_count=0,known_good_library=NULL,
+                           known_good_path=NULL,decision='undecided',exported_path=NULL,ai_caption=NULL,ai_people=NULL,
                            ai_objects=NULL,ai_ocr_text=NULL,ai_tags=NULL,ai_model=NULL,ai_updated_at=NULL WHERE path=?""", (str(path),)
                     )
                 if index % self.batch_size == 0:
@@ -562,7 +760,10 @@ class Curator:
             self._progress(inventory_count, inventory_count, f"Inventory complete — {inventory_count:,} files")
 
             self._analyze_pending(db)
+            self._inventory_references(db)
+            self._hash_reference_candidates(db)
             self._hash_candidates(db)
+            self._mark_known_good_matches(db)
             db.execute("UPDATE files SET exact_group=NULL")
             db.execute(
                 """UPDATE files SET exact_group=content_hash WHERE content_hash IN
@@ -618,9 +819,106 @@ class Curator:
             processed += len(rows)
             self._progress(processed, total)
 
+    def _inventory_references(self, db: sqlite3.Connection) -> None:
+        configured_roots = self._configured_reference_roots(db)
+        configured_labels = {label for label, _ in configured_roots}
+        if configured_labels:
+            placeholders = ",".join("?" for _ in configured_labels)
+            db.execute(f"DELETE FROM reference_files WHERE library NOT IN ({placeholders})", tuple(configured_labels))
+        else:
+            db.execute("DELETE FROM reference_files")
+            db.execute(
+                "UPDATE files SET known_good_match=0,known_good_count=0,known_good_library=NULL,known_good_path=NULL"
+            )
+            db.commit()
+            return
+
+        for label, root in configured_roots:
+            if not root.exists() or not root.is_dir():
+                db.execute("DELETE FROM reference_files WHERE library=?", (label,))
+                db.commit()
+                continue
+            scan_token = utcnow() + "-" + os.urandom(4).hex()
+            self._begin_phase("reference_inventory", 0, f"Inventorying {label}")
+            inventory_count = 0
+            for index, path in enumerate(iter_source_files(root), 1):
+                try:
+                    stat = path.stat()
+                except OSError:
+                    continue
+                inventory_count = index
+                relative = str(path.relative_to(root))
+                existing = db.execute(
+                    "SELECT size,mtime_ns,library FROM reference_files WHERE path=?", (str(path),)
+                ).fetchone()
+                changed = (
+                    not existing or existing["size"] != stat.st_size or
+                    existing["mtime_ns"] != stat.st_mtime_ns or existing["library"] != label
+                )
+                db.execute(
+                    """INSERT INTO reference_files(library,path,relative_path,size,mtime_ns,seen_scan,updated_at)
+                       VALUES(?,?,?,?,?,?,?)
+                       ON CONFLICT(path) DO UPDATE SET library=excluded.library,relative_path=excluded.relative_path,
+                         size=excluded.size,mtime_ns=excluded.mtime_ns,seen_scan=excluded.seen_scan,
+                         updated_at=excluded.updated_at""",
+                    (label, str(path), relative, stat.st_size, stat.st_mtime_ns, scan_token, utcnow()),
+                )
+                if changed:
+                    db.execute(
+                        "UPDATE reference_files SET content_hash=NULL,hash_error=NULL WHERE path=?", (str(path),)
+                    )
+                if index % self.batch_size == 0:
+                    db.commit()
+                    self._progress(index, index, f"Inventorying {label} — {index:,} files found")
+                    self._check_cancel()
+            db.execute(
+                "DELETE FROM reference_files WHERE library=? AND (seen_scan IS NULL OR seen_scan != ?)",
+                (label, scan_token),
+            )
+            db.commit()
+            self._progress(inventory_count, inventory_count, f"{label} inventory complete — {inventory_count:,} files")
+
+    def _hash_reference_candidates(self, db: sqlite3.Connection) -> None:
+        candidate_where = """r.size>0 AND r.content_hash IS NULL AND r.hash_error IS NULL AND
+                             EXISTS(SELECT 1 FROM files f WHERE f.size=r.size)"""
+        total = db.execute(f"SELECT COUNT(*) FROM reference_files r WHERE {candidate_where}").fetchone()[0]
+        self._begin_phase(
+            "reference_hashing", total,
+            f"Hashing known-good files with recovery size matches using {self.hash_workers} worker(s)",
+        )
+        processed = 0
+        while True:
+            self._check_cancel()
+            rows = [dict(row) for row in db.execute(
+                f"SELECT r.id,r.path FROM reference_files r WHERE {candidate_where} ORDER BY r.id LIMIT ?",
+                (self.batch_size,),
+            ).fetchall()]
+            if not rows:
+                break
+            with ThreadPoolExecutor(max_workers=self.hash_workers, thread_name_prefix="reference-hash") as pool:
+                futures = {pool.submit(file_blake3, Path(row["path"])): row for row in rows}
+                for future in as_completed(futures):
+                    row = futures[future]
+                    try:
+                        digest = future.result()
+                    except Exception as exc:
+                        db.execute(
+                            "UPDATE reference_files SET hash_error=? WHERE id=?", (str(exc)[:300], row["id"])
+                        )
+                    else:
+                        db.execute(
+                            "UPDATE reference_files SET content_hash=?,hash_error=NULL WHERE id=?", (digest, row["id"])
+                        )
+            db.commit()
+            processed += len(rows)
+            self._progress(processed, total)
+
     def _hash_candidates(self, db: sqlite3.Connection) -> None:
-        candidate_join = """JOIN (SELECT size FROM files WHERE size>0 GROUP BY size HAVING COUNT(*)>1) d
-                            ON d.size=f.size"""
+        candidate_join = """JOIN (
+                              SELECT size FROM files WHERE size>0 GROUP BY size HAVING COUNT(*)>1
+                              UNION
+                              SELECT DISTINCT size FROM reference_files WHERE size>0 AND content_hash IS NOT NULL
+                            ) d ON d.size=f.size"""
         total = db.execute(
             f"SELECT COUNT(*) FROM files f {candidate_join} WHERE f.content_hash IS NULL"
         ).fetchone()[0]
@@ -658,6 +956,32 @@ class Curator:
             db.commit()
             processed += len(rows)
             self._progress(processed, total)
+
+    def _mark_known_good_matches(self, db: sqlite3.Connection, update_progress: bool = True) -> None:
+        if update_progress:
+            self._begin_phase("known_good_matching", 1, "Matching recovery hashes against known-good libraries")
+        db.execute(
+            "UPDATE files SET known_good_match=0,known_good_count=0,known_good_library=NULL,known_good_path=NULL"
+        )
+        db.execute(
+            """UPDATE files SET
+                 known_good_match=1,
+                 known_good_count=(SELECT COUNT(*) FROM reference_files r
+                                   WHERE r.size=files.size AND r.content_hash=files.content_hash),
+                 known_good_library=(SELECT r.library FROM reference_files r
+                                     WHERE r.size=files.size AND r.content_hash=files.content_hash
+                                     ORDER BY r.library,r.path LIMIT 1),
+                 known_good_path=(SELECT r.path FROM reference_files r
+                                  WHERE r.size=files.size AND r.content_hash=files.content_hash
+                                  ORDER BY r.library,r.path LIMIT 1)
+               WHERE files.content_hash IS NOT NULL AND files.content_hash NOT LIKE 'ERROR:%'
+                 AND EXISTS(SELECT 1 FROM reference_files r
+                            WHERE r.size=files.size AND r.content_hash=files.content_hash)"""
+        )
+        db.commit()
+        matches = db.execute("SELECT COUNT(*) FROM files WHERE known_good_match=1").fetchone()[0]
+        if update_progress:
+            self._progress(1, 1, f"Known-good comparison complete — {matches:,} exact matches")
 
     def _build_similar_groups(self, radius: int = 6) -> None:
         with connect(self.db_path) as db:
@@ -715,12 +1039,21 @@ class Curator:
                    SUM(validation='zero') zero_files,SUM(validation='corrupt') corrupt_files,
                    SUM(is_image=1) images,SUM(exact_group IS NOT NULL) exact_members,
                    COUNT(DISTINCT exact_group) exact_groups,COUNT(DISTINCT similar_group) similar_groups,
-                   SUM(filename_date IS NOT NULL AND exif_date IS NULL) date_proposals
+                   SUM(filename_date IS NOT NULL AND exif_date IS NULL) date_proposals,
+                   SUM(known_good_match=1) known_good_matches
                    FROM files"""
             ).fetchone()
             categories = [dict(item) for item in db.execute("SELECT category,COUNT(*) count FROM files GROUP BY category ORDER BY count DESC")]
+            reference_files = db.execute("SELECT COUNT(*) FROM reference_files").fetchone()[0]
+            reference_libraries = [dict(item) for item in db.execute(
+                "SELECT library,COUNT(*) files,SUM(content_hash IS NOT NULL) hashed FROM reference_files GROUP BY library ORDER BY library"
+            )]
         result = dict(row)
         result["categories"] = categories
+        result["reference_files"] = reference_files
+        result["reference_libraries"] = reference_libraries
+        result["reference_selections"] = self.selected_references()
+        result["reference_root_available"] = bool(self.reference_root and self.reference_root.is_dir())
         result["bytes_human"] = human_bytes(result["bytes"])
         result["allow_actions"] = self.allow_actions
         return result
@@ -739,7 +1072,10 @@ class Curator:
                 groups.append({"id": group_id, "items": items, "recommended_id": items[0]["id"] if items else None})
             return groups
 
-    def list_files(self, category: str | None = None, validation: str | None = None, limit: int = 500) -> list[dict]:
+    def list_files(
+        self, category: str | None = None, validation: str | None = None,
+        known_good: bool | None = None, limit: int = 500,
+    ) -> list[dict]:
         clauses, params = [], []
         if category:
             clauses.append("category=?")
@@ -747,6 +1083,9 @@ class Curator:
         if validation:
             clauses.append("validation=?")
             params.append(validation)
+        if known_good is not None:
+            clauses.append("known_good_match=?")
+            params.append(1 if known_good else 0)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
         params.append(limit)
         with connect(self.db_path) as db:
@@ -817,11 +1156,17 @@ class Curator:
         with connect(self.db_path) as db:
             review_skipped = db.execute(
                 """SELECT COUNT(*) FROM files WHERE validation NOT IN ('zero','corrupt','unreadable')
-                   AND decision='undecided' AND (exact_group IS NOT NULL OR similar_group IS NOT NULL)"""
+                   AND decision='undecided' AND known_good_match=0
+                   AND (exact_group IS NOT NULL OR similar_group IS NOT NULL)"""
+            ).fetchone()[0]
+            known_good_skipped = db.execute(
+                """SELECT COUNT(*) FROM files WHERE validation NOT IN ('zero','corrupt','unreadable')
+                   AND decision!='keep' AND known_good_match=1"""
             ).fetchone()[0]
             rows = db.execute(
                 """SELECT * FROM files WHERE validation NOT IN ('zero','corrupt','unreadable')
-                   AND (decision='keep' OR (decision='undecided' AND exact_group IS NULL AND similar_group IS NULL))
+                   AND (decision='keep' OR (decision='undecided' AND known_good_match=0
+                        AND exact_group IS NULL AND similar_group IS NULL))
                    ORDER BY id"""
             ).fetchall()
             exported, failed = 0, 0
@@ -857,7 +1202,10 @@ class Curator:
                     db.commit()
             db.commit()
         catalog = self.export_catalog(self.output)
-        return {"exported": exported, "failed": failed, "review_skipped": review_skipped, "catalog": str(catalog)}
+        return {
+            "exported": exported, "failed": failed, "review_skipped": review_skipped,
+            "known_good_skipped": known_good_skipped, "catalog": str(catalog),
+        }
 
     def export_catalog(self, root: Path | None = None) -> Path:
         root = root or self.db_path.parent
@@ -868,7 +1216,8 @@ class Curator:
             "id", "relative_path", "name", "extension", "size", "mime", "validation", "validation_detail",
             "content_hash", "width", "height", "megapixels", "phash", "exif_date", "filename_date",
             "date_confidence", "date_reason", "category", "category_confidence", "category_reason",
-            "quality_score", "exact_group", "similar_group", "decision", "exported_path",
+            "quality_score", "exact_group", "similar_group", "known_good_match", "known_good_count",
+            "known_good_library", "known_good_path", "decision", "exported_path",
             "ai_caption", "ai_people", "ai_objects", "ai_ocr_text", "ai_tags", "ai_model", "ai_updated_at",
         ]
         with connect(self.db_path) as db, csv_path.open("w", newline="", encoding="utf-8") as csv_file, jsonl_path.open("w", encoding="utf-8") as json_file:

@@ -14,8 +14,10 @@ services:
       HASH_WORKERS: "1"
       SCAN_BATCH_SIZE: "64"
       SIMILARITY_DISTANCE: "6"
+      REFERENCE_ROOT: "/known-good"
     volumes:
       - /mnt/user/Recovered:/source:ro
+      - /mnt/user/Backups:/known-good:ro
       - /mnt/user/Recovered_Curated:/output:rw
       - /mnt/user/Recovered_Quarantine:/quarantine:rw
       - /mnt/user/appdata/recovery-curator:/config:rw

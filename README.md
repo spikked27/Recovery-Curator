@@ -5,10 +5,13 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
 ## What this version does
 
 - Incremental/resumable SQLite inventory suitable for multi-terabyte sources.
+- Multiple saved scans with isolated progress, decisions, selected known-good folders, hashes, and reports; switch between them from the Web UI.
 - Bounded-memory directory traversal and fixed-size work batches; file counts are not loaded into RAM as giant Python lists.
 - Checkpoint commits after every batch, with a safe stop button and restart from the last completed checkpoint.
 - Separate, configurable concurrency limits for validation and full-file hashing to prevent HDD thrashing.
 - Full BLAKE3 hashing only for files that share a byte size, avoiding unnecessary reads.
+- Read-only comparison against user-selected folders beneath one mounted known-good backup root. Only reference files whose sizes occur in the recovery set are hashed.
+- Exact known-good matches are identified by full content hash and omitted from curated output unless explicitly marked Keep.
 - Byte-for-byte duplicate groups with a recommended keeper.
 - Perceptual-hash groups for resized, recompressed, rotated, or lightly edited images.
 - Decoding/validation for common images, PDF, DOCX, XLSX, PPTX, ZIP, EML, and MSG containers.
@@ -52,6 +55,8 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
 
    For a recovery set located entirely on one array disk, prefer the direct read-only path, such as `/mnt/disk3/Recovered`, rather than the `/mnt/user` view.
 
+   Optionally set **Known-Good Root** to the common parent folder containing trusted backups. For example, if the two backups are `/mnt/user/Backups/Laptop` and `/mnt/user/Backups/Old-PC`, map `/mnt/user/Backups`. The container mounts it read-only; choose the individual folders later in the Web UI.
+
    Keep **Appdata**, the initial **Curated Output**, and initial **Quarantine** paths on a non-array pool so catalog checkpoints and directory creation do not cause parity writes. For a pool named `cache`, use:
 
    - `/mnt/cache/appdata/recovery-curator`
@@ -67,13 +72,20 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
 
 ## Safe operating sequence
 
-1. Start the first scan. A couple of terabytes can take many hours because candidate duplicates must be read and images decoded. The database lives in appdata, so later scans reuse unchanged results.
-2. Review exact duplicate groups. The automatic exact-keeper action only records decisions.
-3. Review similar-photo groups manually. Similar does not mean interchangeable.
-4. Review date proposals and low-confidence categories in the catalog.
-5. To create a clean library, stop the container, set **Allow Write Actions** to `true`, and restart it. The source can remain read-only because export only reads it.
-6. Select **Build curated library**. Explicit keepers and files that are not members of any duplicate/similar group are copied to `Recovered_Curated`. Undecided grouped files are skipped for safety, and recovered originals remain unchanged.
-7. Keep the original recovery set until the curated output has been backed up and manually spot-checked.
+1. Open **Saved scans** in the Web UI. Use the automatically imported **Original Scan**, or create a new blank named scan. An existing `/config/catalog.sqlite3` is adopted automatically during upgrade.
+2. Open **Known-good folders**. Browse below the mounted root and select each trusted backup folder for the active saved scan.
+3. Start the scan. A couple of terabytes can take many hours because candidate duplicates must be read and images decoded. Later runs of the same saved scan reuse unchanged results.
+4. Recovery Curator inventories the selected trusted folders after source analysis. It hashes only known-good files whose sizes occur in the recovery set, then hashes the corresponding recovery candidates and records byte-for-byte matches.
+5. Review known-good matches, exact duplicate groups, similar-photo groups, date proposals, and low-confidence categories. The automatic exact-keeper action only records decisions.
+6. To create a clean library, stop the container, set **Allow Write Actions** to `true`, and restart it. The source can remain read-only because export only reads it.
+7. Select **Build curated library**. Explicit keepers and ungrouped files are copied to `Recovered_Curated`. Undecided known-good matches and undecided duplicate/similar group members are skipped, and recovered originals remain unchanged.
+8. Keep the original recovery set until the curated output has been backed up and manually spot-checked.
+
+## Clearing a scan
+
+The dashboard includes **Clear Scan & Catalog**. The action is blocked while a scan is running and requires typing `RESET`. It clears only the active saved scan: recovery records, selected known-good folders, cached reference index, decisions, action history, and generated catalog reports. It does not delete source, backup, curated-output, or quarantine files, and it does not affect other saved scans.
+
+Use **Saved scans** to create a blank catalog or return to an earlier scan. Switching is blocked while scanning so a background worker can never write into the wrong saved catalog.
 
 ## Performance settings
 
@@ -88,7 +100,7 @@ Keep both worker counts at `1` while the source remains on one drive. If the rec
 
 The similar-photo stage uses a BK-tree rather than comparing every photo against every other photo. It also retains only one union representative per perceptual-hash/aspect-ratio bucket, preventing thousands of blank thumbnails or near-identical screenshots from creating a quadratic cluster. Exact duplicate detection first groups by byte size and hashes only candidate groups. These choices avoid the quadratic comparison and unbounded-GUI-state behavior that can make desktop duplicate tools appear frozen.
 
-The dashboard reports the current phase, completed records, throughput, and remains usable while the scan runs. **Stop after checkpoint** requests a clean stop between batches; starting again reuses completed inventory, metadata, and hashes.
+The dashboard reports the current phase, completed records, throughput, and remains usable while the scan runs. **Cancel Scan** requests a clean stop between batches; starting again reuses completed inventory, metadata, and hashes.
 
 ## Quarantine mode
 
@@ -129,7 +141,7 @@ Run **Start or resume scan** again. Files whose size and nanosecond modification
 - Recovery tools may restore partial files that pass basic container validation but still contain damaged content.
 - Rule-based categories are an initial triage, not final semantic organization.
 - Legacy binary Office formats receive only basic type detection in this release.
-- The local image is named `recovery-curator:local`; rerun `install-unraid.sh` after replacing the source bundle with an updated version.
+- Known-good comparison is exact-content matching. A resized, recompressed, or metadata-edited version will not be treated as an identical trusted copy; it may still appear in similar-photo review.
 
 ## Development checks
 

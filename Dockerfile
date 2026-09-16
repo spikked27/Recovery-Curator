@@ -6,6 +6,7 @@ LABEL org.opencontainers.image.source="https://github.com/spikked27/Recovery-Cur
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     SOURCE_ROOT=/source \
+    REFERENCE_ROOT=/known-good \
     OUTPUT_ROOT=/output \
     QUARANTINE_ROOT=/quarantine \
     DATA_DIR=/config \

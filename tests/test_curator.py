@@ -6,7 +6,7 @@ from unittest.mock import patch
 
 from PIL import Image
 
-from app.curator import Curator, parse_filename_date
+from app.curator import Curator, connect, parse_filename_date
 
 
 class CuratorTests(unittest.TestCase):
@@ -84,6 +84,108 @@ class CuratorTests(unittest.TestCase):
             self.assertEqual(summary["files"], 101)
             self.assertEqual(summary["exact_groups"], 1)
             self.assertEqual(summary["similar_groups"], 1)
+
+    def test_known_good_folder_selection_and_exact_matching(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config, known_good = (
+                root / name for name in ("source", "output", "quarantine", "config", "known-good")
+            )
+            for directory in (source, output, quarantine, config, known_good):
+                directory.mkdir()
+            backup_one = known_good / "Backup One"
+            backup_two = known_good / "Backup Two"
+            backup_one.mkdir()
+            backup_two.mkdir()
+
+            first_payload = b"trusted-photo-one" * 17
+            second_payload = b"trusted-document-two" * 23
+            unmatched_payload = b"recovered-only" * 31
+            (source / "recovered-photo-copy.bin").write_bytes(first_payload)
+            (source / "recovered-document-copy.bin").write_bytes(second_payload)
+            (source / "recovered-only.txt").write_bytes(unmatched_payload)
+            (backup_one / "original-photo.bin").write_bytes(first_payload)
+            (backup_two / "original-document.bin").write_bytes(second_payload)
+            (backup_two / "no-recovery-counterpart.bin").write_bytes(b"unique-known-good-size")
+
+            curator = Curator(
+                source, output, quarantine, config / "catalog.sqlite3",
+                allow_actions=True, reference_root=known_good,
+            )
+            curator.add_reference_selection("Backup One")
+            curator.add_reference_selection("Backup Two")
+            curator.scan()
+
+            summary = curator.summary()
+            self.assertEqual(summary["known_good_matches"], 2)
+            self.assertEqual(summary["reference_files"], 3)
+            self.assertEqual(len(summary["reference_selections"]), 2)
+            matches = curator.list_files(known_good=True)
+            self.assertEqual(
+                {item["name"] for item in matches},
+                {"recovered-photo-copy.bin", "recovered-document-copy.bin"},
+            )
+            self.assertTrue(all(item["known_good_path"] for item in matches))
+
+            with connect(config / "catalog.sqlite3") as db:
+                decoy = db.execute(
+                    "SELECT content_hash FROM reference_files WHERE path LIKE '%no-recovery-counterpart.bin'"
+                ).fetchone()
+                self.assertIsNone(decoy["content_hash"])
+
+            result = curator.build_curated_library()
+            self.assertEqual(result["known_good_skipped"], 2)
+            self.assertEqual(result["exported"], 1)
+            self.assertTrue(any(path.name == "recovered-only.txt" for path in output.rglob("*")))
+
+            curator.decide(matches[0]["id"], "keep")
+            result = curator.build_curated_library()
+            self.assertEqual(result["exported"], 1)
+
+    def test_reset_catalog_preserves_library_files_but_clears_active_scan_settings(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config, known_good = (
+                root / name for name in ("source", "output", "quarantine", "config", "known-good")
+            )
+            for directory in (source, output, quarantine, config, known_good):
+                directory.mkdir()
+            backup = known_good / "Trusted"
+            backup.mkdir()
+            source_file = source / "recovered.txt"
+            reference_file = backup / "trusted.txt"
+            source_file.write_bytes(b"same bytes")
+            reference_file.write_bytes(b"same bytes")
+
+            curator = Curator(
+                source, output, quarantine, config / "catalog.sqlite3", reference_root=known_good,
+            )
+            curator.add_reference_selection("Trusted")
+            curator.scan()
+            self.assertEqual(curator.summary()["known_good_matches"], 1)
+
+            result = curator.reset_catalog()
+            self.assertEqual(result["files"], 1)
+            self.assertEqual(curator.summary()["files"], 0)
+            self.assertEqual(curator.summary()["reference_files"], 0)
+            self.assertEqual(curator.selected_references(), [])
+            self.assertTrue(source_file.exists())
+            self.assertTrue(reference_file.exists())
+            self.assertFalse((config / "recovery_catalog.csv").exists())
+
+    def test_known_good_browser_cannot_escape_root(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config, known_good = (
+                root / name for name in ("source", "output", "quarantine", "config", "known-good")
+            )
+            for directory in (source, output, quarantine, config, known_good):
+                directory.mkdir()
+            curator = Curator(
+                source, output, quarantine, config / "catalog.sqlite3", reference_root=known_good,
+            )
+            with self.assertRaises(ValueError):
+                curator.add_reference_selection("../source")
 
 
 if __name__ == "__main__":

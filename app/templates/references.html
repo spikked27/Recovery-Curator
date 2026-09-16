@@ -1,0 +1,50 @@
+{% extends "base.html" %}{% block content %}
+<h2>Known-good backup folders</h2>
+<div class="notice">
+  These folders are used only as read-only reference libraries. Recovery Curator compares exact file hashes and never modifies anything below the Known-Good Root.
+</div>
+
+{% if error %}
+  <section class="card"><p class="bad">{{ error }}</p><p>Edit the container and map a host parent folder to <code>/known-good</code> as read-only.</p></section>
+{% elif browser %}
+  <div class="grid">
+    <section class="card">
+      <h3>Folder browser</h3>
+      <p class="path"><strong>Current:</strong> /{{ '' if browser.current == '.' else browser.current }}</p>
+      <div class="scan-actions">
+        {% if browser.parent is not none %}<a class="button secondary" href="/references?path={{ browser.parent|urlencode }}">Up one folder</a>{% endif %}
+        <form method="post" action="/references/add">
+          <input type="hidden" name="path" value="{{ browser.current }}">
+          <button>Use this folder</button>
+        </form>
+      </div>
+      <table><tr><th>Subfolder</th><th></th></tr>
+      {% for item in browser.directories %}
+        <tr><td>📁 {{ item.name }}</td><td><a class="button secondary" href="/references?path={{ item.relative|urlencode }}">Open</a></td></tr>
+      {% else %}
+        <tr><td colspan="2" class="muted">No subfolders are visible here.</td></tr>
+      {% endfor %}
+      </table>
+    </section>
+
+    <section class="card">
+      <h3>Selected for comparison</h3>
+      {% if browser.selected %}
+        <table><tr><th>Folder</th><th>Status</th><th></th></tr>
+        {% for item in browser.selected %}
+          <tr>
+            <td class="path">/{{ '' if item.relative == '.' else item.relative }}</td>
+            <td class="{{ 'good' if item.available else 'bad' }}">{{ 'Available' if item.available else 'Missing' }}</td>
+            <td><form method="post" action="/references/remove"><input type="hidden" name="path" value="{{ item.relative }}"><button class="danger">Remove</button></form></td>
+          </tr>
+        {% endfor %}
+        </table>
+      {% else %}
+        <p class="muted">No folders selected. Browse to each trusted backup folder and choose “Use this folder.”</p>
+      {% endif %}
+      <p>After choosing folders, return to the dashboard and start a new scan. Files are considered known-good matches only when their full BLAKE3 hashes are identical.</p>
+      <a class="button" href="/">Return to dashboard</a>
+    </section>
+  </div>
+{% endif %}
+{% endblock %}

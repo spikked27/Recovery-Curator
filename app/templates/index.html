@@ -1,4 +1,9 @@
 {% extends "base.html" %}{% block content %}
+<section class="card" style="margin-bottom:18px">
+  <span class="muted">Active saved scan</span>
+  <h2 style="margin:4px 0">{{ active_profile.name }}</h2>
+  <a class="button secondary" href="/scans">Create or switch saved scans</a>
+</section>
 {% if not summary.allow_actions %}<div class="notice"><strong>Safe review mode:</strong> recovered files are read-only. Scanning and decisions work; quarantine and curated export remain blocked until explicitly enabled.</div>{% endif %}
 <div class="grid">
   <div class="card"><div class="metric">{{ summary.files or 0 }}</div><div class="muted">files cataloged</div></div>
@@ -6,6 +11,7 @@
   <div class="card"><div class="metric">{{ summary.images or 0 }}</div><div class="muted">images</div></div>
   <div class="card"><div class="metric">{{ summary.exact_groups or 0 }}</div><div class="muted">exact groups</div></div>
   <div class="card"><div class="metric">{{ summary.similar_groups or 0 }}</div><div class="muted">similar-photo groups</div></div>
+  <div class="card"><div class="metric good">{{ summary.known_good_matches or 0 }}</div><div class="muted"><a href="/files?known_good=1">known-good exact matches</a></div></div>
   <div class="card"><div class="metric">{{ summary.date_proposals or 0 }}</div><div class="muted">filename date repairs</div></div>
   <div class="card"><div class="metric warn">{{ summary.zero_files or 0 }}</div><div class="muted">zero-byte files</div></div>
   <div class="card"><div class="metric bad">{{ summary.corrupt_files or 0 }}</div><div class="muted">corrupt files</div></div>
@@ -30,6 +36,29 @@
   <p class="muted">Cancel Scan safely stops after the current checkpoint. Completed catalog work is retained, so the scan can be resumed later.</p>
 </section>
 
+<section class="card" style="margin-top:18px">
+  <h2>Known-good comparison</h2>
+  {% if not summary.reference_root_available %}
+    <p class="warn">The Known-Good Root is not mounted. Edit the Unraid container and map the parent folder containing your trusted backups.</p>
+  {% elif summary.reference_selections %}
+    <p>{{ summary.reference_selections|length }} folder(s) selected beneath the read-only known-good root; {{ summary.reference_files or 0 }} reference files are currently indexed.</p>
+  {% else %}
+    <p>The root is mounted, but no backup folders are selected yet.</p>
+  {% endif %}
+  <a class="button secondary" href="/references">Choose known-good folders</a>
+  <p class="muted">The next scan compares exact content hashes. Matching recovered files remain untouched but are excluded from curated output unless you explicitly mark one Keep.</p>
+</section>
+
+<section class="card" style="margin-top:18px">
+  <h2>Clear current scan</h2>
+  <p>Clears the active saved scan—including its recovery catalog, selected known-good folders, cached reference index, decisions, and generated reports. It does not modify library files or any other saved scan.</p>
+  <form method="post" action="/reset-catalog" onsubmit="return confirm('Clear the entire Recovery Curator scan catalog? Library files will not be deleted.');">
+    <label>Type <strong>RESET</strong> to confirm: <input name="confirmation" required autocomplete="off" pattern="RESET"></label>
+    <button id="reset-catalog" class="danger" {% if status.running %}disabled{% endif %}>Clear Scan &amp; Catalog</button>
+  </form>
+  {% if status.running %}<p class="muted">Cancel the scan and wait for it to stop before clearing.</p>{% endif %}
+</section>
+
 <section class="card" style="margin-top:18px"><h2>Categories</h2><table><tr><th>Category</th><th>Files</th></tr>
 {% for item in summary.categories %}<tr><td><a href="/files?category={{ item.category|urlencode }}">{{ item.category or "Pending scan" }}</a></td><td>{{ item.count }}</td></tr>{% endfor %}</table></section>
 
@@ -37,6 +66,7 @@
 const startButton = document.getElementById('start-scan');
 const cancelButton = document.getElementById('cancel-scan');
 const cancelForm = document.getElementById('cancel-scan-form');
+const resetButton = document.getElementById('reset-catalog');
 
 cancelForm.addEventListener('submit', () => {
   cancelButton.disabled = true;
@@ -55,6 +85,7 @@ async function refresh(){
   document.getElementById('scan-detail').textContent=`${s.phase} — ${s.processed}/${s.total} — ${s.rate || 0} files/s`;
   startButton.disabled=s.running;
   cancelButton.disabled=!s.running;
+  resetButton.disabled=s.running;
   if(!s.running)cancelButton.textContent='Cancel Scan';
   if(s.running)setTimeout(refresh,1500);
 }
