@@ -35,20 +35,28 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
 
 ## Install on Unraid
 
-1. Download and extract this bundle somewhere persistent on the server, for example:
-
-   `/mnt/user/appdata/recovery-curator-build`
-
-2. Open the Unraid terminal, change into the extracted directory, and run:
+1. From the Unraid terminal, download the public repository to a non-array pool. Replace `cache` if your pool has a different name:
 
    ```bash
-   chmod +x install-unraid.sh
-   ./install-unraid.sh
+   curator_src=/mnt/cache/appdata/recovery-curator-src
+   mkdir -p "$curator_src"
+   curl -fsSL https://github.com/spikked27/Recovery-Curator/archive/refs/heads/main.tar.gz \
+     | tar -xz --strip-components=1 -C "$curator_src"
+   cd "$curator_src"
+   bash install-unraid.sh
    ```
 
 3. In Unraid, open **Docker > Add Container** and select **Recovery-Curator** from the template list.
 
 4. Set **Recovered Source** to the one top-level folder containing the Hetman output. Do not scan both `/mnt/user/...` and `/mnt/diskN/...` representations of the same files.
+
+   For a recovery set located entirely on one array disk, prefer the direct read-only path, such as `/mnt/disk3/Recovered`, rather than the `/mnt/user` view.
+
+   Keep **Appdata**, the initial **Curated Output**, and initial **Quarantine** paths on a non-array pool so catalog checkpoints and directory creation do not cause parity writes. For a pool named `cache`, use:
+
+   - `/mnt/cache/appdata/recovery-curator`
+   - `/mnt/cache/appdata/recovery-curator/staging-output`
+   - `/mnt/cache/appdata/recovery-curator/staging-quarantine`
 
 5. Leave these initial settings unchanged:
 
