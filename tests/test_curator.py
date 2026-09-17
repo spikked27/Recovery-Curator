@@ -219,6 +219,51 @@ class CuratorTests(unittest.TestCase):
             self.assertTrue(diagnostic["readable"])
             self.assertFalse(diagnostic["has_entries"])
 
+    def test_windows_system_volume_information_is_skipped(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            (source / "photo.jpg").write_bytes(b"not really a photo")
+            system_folder = source / "System Volume Information"
+            system_folder.mkdir()
+            (system_folder / "tracking.log").write_bytes(b"system metadata")
+
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+            result = curator.scan()
+
+            self.assertEqual(curator.summary()["files"], 1)
+            self.assertEqual(result["ignored_system_directories"], 1)
+            self.assertEqual(result["source_read_errors"], 0)
+
+    def test_partial_source_read_errors_warn_without_aborting_or_pruning(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            visible = source / "visible.txt"
+            visible.write_text("readable", encoding="utf-8")
+
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+
+            def incomplete_traversal(_root, diagnostics=None):
+                diagnostics.record_error(source / "restricted", PermissionError("permission denied"))
+                yield visible
+
+            with patch("app.curator.iter_source_files", side_effect=incomplete_traversal):
+                result = curator.scan()
+
+            self.assertEqual(result["source_read_errors"], 1)
+            self.assertEqual(curator.summary()["files"], 1)
+            self.assertFalse(result["removed_missing_records"])
+            self.assertIn("restricted", curator.summary()["last_source_inventory"]["first_source_error"])
+
 
 if __name__ == "__main__":
     unittest.main()

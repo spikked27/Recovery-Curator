@@ -26,6 +26,11 @@
   {% else %}
     <p class="muted">Recovered Source mount is readable at <code>{{ summary.source.path }}</code>.</p>
   {% endif %}
+  {% if summary.last_source_inventory and summary.last_source_inventory.source_read_errors %}
+    <div class="notice warn"><strong>Last source inventory had {{ summary.last_source_inventory.source_read_errors }} read warning(s).</strong> Readable files were processed, but unseen older catalog records were retained for safety. First warning: <code>{{ summary.last_source_inventory.first_source_error }}</code></div>
+  {% elif summary.last_source_inventory and summary.last_source_inventory.ignored_system_directories %}
+    <p class="muted">The last inventory safely ignored {{ summary.last_source_inventory.ignored_system_directories }} Windows <code>System Volume Information</code> folder(s).</p>
+  {% endif %}
   <p id="scan-message">{{ status.message }}</p>
   <progress id="progress" max="{{ status.total or 1 }}" value="{{ status.processed or 0 }}"></progress>
   <p class="muted" id="scan-detail">{{ status.phase }} — {{ status.processed }}/{{ status.total }} — {{ status.rate or 0 }} files/s</p>

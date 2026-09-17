@@ -102,7 +102,7 @@ The similar-photo stage uses a BK-tree rather than comparing every photo against
 
 The dashboard reports the current phase, completed records, throughput, and remains usable while the scan runs. **Cancel Scan** requests a clean stop between batches; starting again reuses completed inventory, metadata, and hashes.
 
-“Resume” re-traverses the recovered-source directory so additions, removals, and changed files can be detected, but it does not repeat expensive analysis or hashing for unchanged files. If `/source` is empty, missing, unreadable, or traversal encounters a read error, the scan now fails before known-good indexing and retains the prior catalog. This prevents a broken bind mount from being mistaken for an intentionally empty recovery set.
+“Resume” re-traverses the recovered-source directory so additions, removals, and changed files can be detected, but it does not repeat expensive analysis or hashing for unchanged files. If `/source` is empty, missing, or wholly unreadable, the scan fails before known-good indexing and retains the prior catalog. Windows `System Volume Information` folders are intentionally ignored. Other isolated read errors are reported as warnings: readable files continue through analysis, while unseen older catalog records are retained so an inaccessible file is never mistaken for a deleted one.
 
 If the dashboard reports zero recovered files while known-good folders contain files, verify the Unraid bind mount from a terminal:
 

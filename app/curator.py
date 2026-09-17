@@ -46,6 +46,7 @@ CAMERA_PREFIXES = ("img_", "dsc_", "dscf", "pxl_", "mvimg_", "100_", "sam_")
 SCREENSHOT_WORDS = ("screenshot", "screen shot", "screencap", "snip", "capture")
 DOWNLOAD_WORDS = ("download", "received", "messenger", "whatsapp", "telegram")
 THUMB_WORDS = ("thumb", "thumbnail", "preview", "cache", "tmp", "temp")
+IGNORED_SYSTEM_DIRECTORIES = {"system volume information"}
 
 
 @dataclass
@@ -61,6 +62,7 @@ class TraversalDiagnostics:
     directories_scanned: int = 0
     errors: int = 0
     first_error: str | None = None
+    ignored_system_directories: int = 0
 
     def record_error(self, path: Path | str, exc: OSError) -> None:
         self.errors += 1
@@ -391,6 +393,10 @@ def iter_source_files(root: Path, diagnostics: TraversalDiagnostics | None = Non
                     diagnostics.directories_scanned += 1
                 for entry in entries:
                     try:
+                        if entry.name.casefold() in IGNORED_SYSTEM_DIRECTORIES:
+                            if diagnostics is not None:
+                                diagnostics.ignored_system_directories += 1
+                            continue
                         if entry.is_dir(follow_symlinks=False):
                             stack.append(Path(entry.path))
                         elif entry.is_file(follow_symlinks=False):
@@ -744,14 +750,21 @@ class Curator:
 
     def _scan_wrapper(self) -> None:
         try:
-            self.scan()
-            self._set_state(running=False, phase="complete", message="Scan complete")
+            result = self.scan()
+            warning_count = result.get("source_read_errors", 0)
+            message = "Scan complete"
+            if warning_count:
+                message = (
+                    f"Scan complete with {warning_count:,} recovered-source read warning(s). "
+                    "Readable files were processed and older unseen catalog entries were retained."
+                )
+            self._set_state(running=False, phase="complete", message=message)
         except ScanCancelled as exc:
             self._set_state(running=False, phase="stopped", message=str(exc), error=None)
         except Exception as exc:
             self._set_state(running=False, phase="failed", message="Scan failed", error=str(exc))
 
-    def scan(self) -> None:
+    def scan(self) -> dict:
         source_diagnostic = self.source_diagnostic()
         if not source_diagnostic["is_directory"]:
             raise FileNotFoundError(
@@ -807,15 +820,29 @@ class Curator:
                     "known-good indexing and the existing catalog was retained. Check the Recovered Source "
                     "host path in the Unraid container; Recovery Curator does not follow directory symlinks."
                 )
-            if traversal.errors:
-                raise RuntimeError(
-                    f"Recovered-source traversal was incomplete ({traversal.errors} read error(s); first: "
-                    f"{traversal.first_error}). The existing catalog was retained so inaccessible files are "
-                    "not mistaken for deleted files. Correct the mount or permissions and resume the scan."
-                )
-            db.execute("DELETE FROM files WHERE seen_scan IS NULL OR seen_scan != ?", (scan_token,))
+            inventory_result = {
+                "completed_at": utcnow(),
+                "files_seen": inventory_count,
+                "directories_scanned": traversal.directories_scanned,
+                "source_read_errors": traversal.errors,
+                "first_source_error": traversal.first_error,
+                "ignored_system_directories": traversal.ignored_system_directories,
+                "removed_missing_records": traversal.errors == 0,
+            }
+            db.execute(
+                "INSERT INTO settings(key,value) VALUES('last_source_inventory',?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (json.dumps(inventory_result),),
+            )
+            if traversal.errors == 0:
+                db.execute("DELETE FROM files WHERE seen_scan IS NULL OR seen_scan != ?", (scan_token,))
             db.commit()
-            self._progress(inventory_count, inventory_count, f"Inventory complete — {inventory_count:,} files")
+            inventory_message = f"Inventory complete — {inventory_count:,} files"
+            if traversal.ignored_system_directories:
+                inventory_message += f"; skipped {traversal.ignored_system_directories:,} Windows system folder(s)"
+            if traversal.errors:
+                inventory_message += f"; {traversal.errors:,} read warning(s)"
+            self._progress(inventory_count, inventory_count, inventory_message)
 
             self._analyze_pending(db)
             self._inventory_references(db)
@@ -831,6 +858,7 @@ class Curator:
 
         self._build_similar_groups(self.similarity_radius)
         self.export_catalog()
+        return inventory_result
 
     def _analyze_pending(self, db: sqlite3.Connection) -> None:
         total = db.execute("SELECT COUNT(*) FROM files WHERE mime IS NULL").fetchone()[0]
@@ -1113,6 +1141,14 @@ class Curator:
         result["reference_selections"] = self.selected_references()
         result["reference_root_available"] = bool(self.reference_root and self.reference_root.is_dir())
         result["source"] = self.source_diagnostic()
+        result["last_source_inventory"] = None
+        with connect(self.db_path) as db:
+            inventory_row = db.execute("SELECT value FROM settings WHERE key='last_source_inventory'").fetchone()
+        if inventory_row:
+            try:
+                result["last_source_inventory"] = json.loads(inventory_row["value"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                pass
         result["bytes_human"] = human_bytes(result["bytes"])
         result["allow_actions"] = self.allow_actions
         return result
