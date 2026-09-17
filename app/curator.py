@@ -56,6 +56,18 @@ class DateProposal:
     reason: str | None = None
 
 
+@dataclass
+class TraversalDiagnostics:
+    directories_scanned: int = 0
+    errors: int = 0
+    first_error: str | None = None
+
+    def record_error(self, path: Path | str, exc: OSError) -> None:
+        self.errors += 1
+        if self.first_error is None:
+            self.first_error = f"{path}: {exc}"
+
+
 def utcnow() -> str:
     return dt.datetime.now(dt.timezone.utc).isoformat(timespec="seconds")
 
@@ -368,22 +380,28 @@ def quality_score(path: Path, metadata: dict) -> float:
     return round(score, 2)
 
 
-def iter_source_files(root: Path):
+def iter_source_files(root: Path, diagnostics: TraversalDiagnostics | None = None):
     """Traverse without materializing every pathname or following directory symlinks."""
     stack = [root]
     while stack:
         directory = stack.pop()
         try:
             with os.scandir(directory) as entries:
+                if diagnostics is not None:
+                    diagnostics.directories_scanned += 1
                 for entry in entries:
                     try:
                         if entry.is_dir(follow_symlinks=False):
                             stack.append(Path(entry.path))
                         elif entry.is_file(follow_symlinks=False):
                             yield Path(entry.path)
-                    except OSError:
+                    except OSError as exc:
+                        if diagnostics is not None:
+                            diagnostics.record_error(entry.path, exc)
                         continue
-        except OSError:
+        except OSError as exc:
+            if diagnostics is not None:
+                diagnostics.record_error(directory, exc)
             continue
 
 
@@ -503,6 +521,23 @@ class Curator:
     def status(self) -> dict:
         with self.lock:
             return dict(self.state)
+
+    def source_diagnostic(self) -> dict:
+        result = {
+            "path": str(self.source), "exists": self.source.exists(),
+            "is_directory": self.source.is_dir(), "readable": False,
+            "has_entries": False, "error": None,
+        }
+        if not result["is_directory"]:
+            result["error"] = "The recovered-source mount is missing or is not a directory."
+            return result
+        try:
+            with os.scandir(self.source) as entries:
+                result["has_entries"] = next(entries, None) is not None
+            result["readable"] = True
+        except OSError as exc:
+            result["error"] = str(exc)
+        return result
 
     def switch_database(self, db_path: Path) -> None:
         with self.lock:
@@ -717,17 +752,28 @@ class Curator:
             self._set_state(running=False, phase="failed", message="Scan failed", error=str(exc))
 
     def scan(self) -> None:
-        if not self.source.exists():
-            raise FileNotFoundError(f"Source path does not exist: {self.source}")
+        source_diagnostic = self.source_diagnostic()
+        if not source_diagnostic["is_directory"]:
+            raise FileNotFoundError(
+                f"Recovered Source is not mounted as a directory at {self.source}. "
+                "Check the Recovered Source host-path mapping in the Unraid container."
+            )
+        if not source_diagnostic["readable"]:
+            raise PermissionError(
+                f"Recovered Source cannot be read at {self.source}: {source_diagnostic['error']}. "
+                "Check the container path permissions."
+            )
         self._validate_reference_roots()
         scan_token = utcnow() + "-" + os.urandom(4).hex()
         self._begin_phase("inventory", 0, "Inventorying files with bounded memory")
         with connect(self.db_path) as db:
             inventory_count = 0
-            for index, path in enumerate(iter_source_files(self.source), 1):
+            traversal = TraversalDiagnostics()
+            for index, path in enumerate(iter_source_files(self.source, traversal), 1):
                 try:
                     stat = path.stat()
-                except OSError:
+                except OSError as exc:
+                    traversal.record_error(path, exc)
                     continue
                 inventory_count = index
                 relative = str(path.relative_to(self.source))
@@ -755,6 +801,18 @@ class Curator:
                     db.commit()
                     self._progress(index, index, f"Inventorying files — {index:,} found")
                     self._check_cancel()
+            if inventory_count == 0:
+                raise RuntimeError(
+                    f"No recovered files are visible under {self.source}. The scan was stopped before "
+                    "known-good indexing and the existing catalog was retained. Check the Recovered Source "
+                    "host path in the Unraid container; Recovery Curator does not follow directory symlinks."
+                )
+            if traversal.errors:
+                raise RuntimeError(
+                    f"Recovered-source traversal was incomplete ({traversal.errors} read error(s); first: "
+                    f"{traversal.first_error}). The existing catalog was retained so inaccessible files are "
+                    "not mistaken for deleted files. Correct the mount or permissions and resume the scan."
+                )
             db.execute("DELETE FROM files WHERE seen_scan IS NULL OR seen_scan != ?", (scan_token,))
             db.commit()
             self._progress(inventory_count, inventory_count, f"Inventory complete — {inventory_count:,} files")
@@ -1054,6 +1112,7 @@ class Curator:
         result["reference_libraries"] = reference_libraries
         result["reference_selections"] = self.selected_references()
         result["reference_root_available"] = bool(self.reference_root and self.reference_root.is_dir())
+        result["source"] = self.source_diagnostic()
         result["bytes_human"] = human_bytes(result["bytes"])
         result["allow_actions"] = self.allow_actions
         return result

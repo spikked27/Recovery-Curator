@@ -187,6 +187,38 @@ class CuratorTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 curator.add_reference_selection("../source")
 
+    def test_empty_source_stops_before_known_good_and_preserves_catalog(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config, known_good = (
+                root / name for name in ("source", "output", "quarantine", "config", "known-good")
+            )
+            for directory in (source, output, quarantine, config, known_good):
+                directory.mkdir()
+            trusted = known_good / "Trusted"
+            trusted.mkdir()
+            recovered = source / "recovered.bin"
+            recovered.write_bytes(b"recovered file")
+
+            curator = Curator(
+                source, output, quarantine, config / "catalog.sqlite3", reference_root=known_good,
+            )
+            curator.add_reference_selection("Trusted")
+            curator.scan()
+            self.assertEqual(curator.summary()["files"], 1)
+            self.assertEqual(curator.summary()["reference_files"], 0)
+
+            recovered.unlink()
+            (trusted / "new-reference.bin").write_bytes(b"known good")
+            with self.assertRaisesRegex(RuntimeError, "No recovered files are visible"):
+                curator.scan()
+
+            self.assertEqual(curator.summary()["files"], 1)
+            self.assertEqual(curator.summary()["reference_files"], 0)
+            diagnostic = curator.source_diagnostic()
+            self.assertTrue(diagnostic["readable"])
+            self.assertFalse(diagnostic["has_entries"])
+
 
 if __name__ == "__main__":
     unittest.main()

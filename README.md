@@ -102,6 +102,17 @@ The similar-photo stage uses a BK-tree rather than comparing every photo against
 
 The dashboard reports the current phase, completed records, throughput, and remains usable while the scan runs. **Cancel Scan** requests a clean stop between batches; starting again reuses completed inventory, metadata, and hashes.
 
+“Resume” re-traverses the recovered-source directory so additions, removals, and changed files can be detected, but it does not repeat expensive analysis or hashing for unchanged files. If `/source` is empty, missing, unreadable, or traversal encounters a read error, the scan now fails before known-good indexing and retains the prior catalog. This prevents a broken bind mount from being mistaken for an intentionally empty recovery set.
+
+If the dashboard reports zero recovered files while known-good folders contain files, verify the Unraid bind mount from a terminal:
+
+```sh
+docker inspect Recovery-Curator --format '{{range .Mounts}}{{println .Source "->" .Destination "(" .Mode ")"}}{{end}}'
+docker exec Recovery-Curator sh -c 'find /source -type f -print -quit'
+```
+
+The first command should show the intended host recovery folder mapped to `/source` with read-only mode. The second should print one recovered file. If it prints nothing, correct the **Recovered Source** host path in the container settings before scanning again.
+
 ## Quarantine mode
 
 Quarantine physically moves a source file, so it requires both:

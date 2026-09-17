@@ -19,6 +19,13 @@
 
 <section class="card" style="margin-top:18px">
   <h2>Scanner</h2>
+  {% if not summary.source.is_directory or not summary.source.readable %}
+    <div class="notice bad"><strong>Recovered Source problem:</strong> {{ summary.source.error }} Check the host path mapped to <code>/source</code> in the Unraid container.</div>
+  {% elif not summary.source.has_entries %}
+    <div class="notice bad"><strong>Recovered Source appears empty.</strong> The app can read <code>{{ summary.source.path }}</code>, but it contains no entries. A scan will stop without changing the existing catalog or indexing known-good folders.</div>
+  {% else %}
+    <p class="muted">Recovered Source mount is readable at <code>{{ summary.source.path }}</code>.</p>
+  {% endif %}
   <p id="scan-message">{{ status.message }}</p>
   <progress id="progress" max="{{ status.total or 1 }}" value="{{ status.processed or 0 }}"></progress>
   <p class="muted" id="scan-detail">{{ status.phase }} — {{ status.processed }}/{{ status.total }} — {{ status.rate or 0 }} files/s</p>
@@ -33,7 +40,7 @@
       <button class="secondary">Build curated library</button>
     </form>
   </div>
-  <p class="muted">Cancel Scan safely stops after the current checkpoint. Completed catalog work is retained, so the scan can be resumed later.</p>
+  <p class="muted">Cancel Scan safely stops after the current checkpoint. Completed catalog work is retained. Resume always rechecks the source directory from the beginning, but unchanged files reuse their saved analysis and hashes.</p>
 </section>
 
 <section class="card" style="margin-top:18px">
