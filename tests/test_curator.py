@@ -1,10 +1,11 @@
 import os
 import csv
+import json
 import stat
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from PIL import Image
 
@@ -122,6 +123,7 @@ class CuratorTests(unittest.TestCase):
             (source / "recovered-document-copy.bin").write_bytes(second_payload)
             (source / "recovered-only.txt").write_bytes(unmatched_payload)
             (backup_one / "original-photo.bin").write_bytes(first_payload)
+            (backup_two / "second-trusted-photo.bin").write_bytes(first_payload)
             (backup_two / "original-document.bin").write_bytes(second_payload)
             (backup_two / "no-recovery-counterpart.bin").write_bytes(b"unique-known-good-size")
 
@@ -135,7 +137,7 @@ class CuratorTests(unittest.TestCase):
 
             summary = curator.summary()
             self.assertEqual(summary["known_good_matches"], 2)
-            self.assertEqual(summary["reference_files"], 3)
+            self.assertEqual(summary["reference_files"], 4)
             self.assertEqual(len(summary["reference_selections"]), 2)
             matches = curator.list_files(known_good=True)
             self.assertEqual(
@@ -143,12 +145,18 @@ class CuratorTests(unittest.TestCase):
                 {"recovered-photo-copy.bin", "recovered-document-copy.bin"},
             )
             self.assertTrue(all(item["known_good_path"] for item in matches))
+            photo_match = next(item for item in matches if item["name"] == "recovered-photo-copy.bin")
+            self.assertEqual(photo_match["known_good_count"], 2)
 
             with connect(config / "catalog.sqlite3") as db:
                 decoy = db.execute(
                     "SELECT content_hash FROM reference_files WHERE path LIKE '%no-recovery-counterpart.bin'"
                 ).fetchone()
                 self.assertIsNone(decoy["content_hash"])
+                path_matches = db.execute(
+                    "SELECT COUNT(*) FROM known_good_matches WHERE file_id=?", (photo_match["id"],)
+                ).fetchone()[0]
+                self.assertEqual(path_matches, 2)
 
             result = curator.build_curated_library()
             self.assertEqual(result["known_good_skipped"], 2)
@@ -306,6 +314,85 @@ class CuratorTests(unittest.TestCase):
 
             chown.assert_called_once_with(destination, 99, 100)
             self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o664)
+
+    def test_video_metadata_and_discovered_folder_reconstruction(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            trip = source / "Aruba 2012"
+            trip.mkdir()
+            (source / "Old Engineering Projects").mkdir()
+            video = trip / "VID_20120504_120000.mp4"
+            video.write_bytes(b"fake-video-container")
+            (source / "zero-video.mp4").touch()
+            ffprobe_payload = {
+                "streams": [
+                    {"codec_type": "video", "codec_name": "h264", "width": 1920, "height": 1080,
+                     "avg_frame_rate": "30000/1001", "tags": {"creation_time": "2012-05-04T12:00:00Z"}},
+                    {"codec_type": "audio", "codec_name": "aac"},
+                ],
+                "format": {"duration": "12.5"},
+            }
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+            with patch(
+                "app.curator.subprocess.run",
+                return_value=Mock(returncode=0, stdout=json.dumps(ffprobe_payload), stderr=""),
+            ):
+                curator.scan()
+
+            videos = curator.list_files(media_kind="video")
+            self.assertEqual(len(videos), 2)
+            analyzed = next(item for item in videos if item["size"] > 0)
+            self.assertEqual(analyzed["category"], "Videos")
+            self.assertEqual(analyzed["video_codec"], "h264")
+            self.assertAlmostEqual(analyzed["video_duration"], 12.5)
+
+            result = curator.build_reconstruction_foundation()
+            self.assertEqual(result["videos"], 2)
+            aruba = curator.list_folder_context("Aruba")
+            self.assertEqual(len(aruba), 1)
+            self.assertEqual(aruba[0]["descendant_files"], 1)
+            empty = curator.list_folder_context("Old Engineering")
+            self.assertEqual(len(empty), 1)
+            self.assertEqual(empty[0]["descendant_files"], 0)
+
+            curator.review_folder_context(aruba[0]["directory_id"], "recognized", "Aruba vacation")
+            curator.build_reconstruction_foundation()
+            proposal = next(item for item in curator.list_reconstruction_proposals() if item["file_id"] == analyzed["id"])
+            self.assertIn("Recovered Structure", proposal["proposed_path"])
+            self.assertIn("Aruba vacation", proposal["proposed_path"])
+
+    def test_recovery_context_and_ai_provider_settings_are_scan_local(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+            curator.add_recovery_context("device", "Galaxy phone", "Used for personal photos")
+            self.assertEqual(curator.list_recovery_context()[0]["label"], "Galaxy phone")
+            settings = curator.save_ai_provider_settings({
+                "provider_name": "Local vision", "endpoint": "http://ollama:11434", "model": "vision-model",
+                "enabled": True, "allow_cloud_media": False, "allow_sensitive_media": False,
+            })
+            self.assertTrue(settings["enabled"])
+            self.assertTrue(settings["is_local"])
+            self.assertFalse(settings["allow_cloud_media"])
+            with connect(config / "catalog.sqlite3") as db:
+                question_id = db.execute(
+                    """INSERT INTO review_questions(source,question,status,created_at,updated_at)
+                       VALUES('test','Do you recognize this folder?','open','now','now')"""
+                ).lastrowid
+                db.commit()
+            curator.answer_review_question(question_id, "It came from my old laptop.")
+            self.assertEqual(curator.list_review_questions(), [])
+            self.assertEqual(len(curator.list_recovery_context()), 2)
 
 
 if __name__ == "__main__":

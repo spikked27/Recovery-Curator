@@ -9,6 +9,7 @@
   <div class="card"><div class="metric">{{ summary.files or 0 }}</div><div class="muted">files cataloged</div></div>
   <div class="card"><div class="metric">{{ summary.bytes_human }}</div><div class="muted">source data</div></div>
   <div class="card"><div class="metric">{{ summary.images or 0 }}</div><div class="muted">images</div></div>
+  <div class="card"><div class="metric">{{ summary.videos or 0 }}</div><div class="muted"><a href="/files?media_kind=video">videos</a></div></div>
   <div class="card"><div class="metric">{{ summary.directories or 0 }}</div><div class="muted">directories preserved</div></div>
   <div class="card"><div class="metric">{{ summary.exact_groups or 0 }}</div><div class="muted">exact groups</div></div>
   <div class="card"><div class="metric">{{ summary.similar_groups or 0 }}</div><div class="muted">similar-photo groups</div></div>
@@ -47,6 +48,12 @@
     </form>
   </div>
   <p class="muted">Cancel Scan safely stops after the current checkpoint. Completed catalog work is retained. Resume always rechecks the source directory from the beginning, but unchanged files reuse their saved analysis and hashes.</p>
+</section>
+
+<section class="card" style="margin-top:18px">
+  <h2>Reconstruction and media analysis</h2>
+  <p>Classify photos and videos with multiple facets, review folder names found in the recovery, add context clues, and build a non-destructive proposed folder tree.</p>
+  <a class="button" href="/reconstruction">Open reconstruction workspace</a>
 </section>
 
 <section class="card" style="margin-top:18px">

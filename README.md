@@ -14,6 +14,8 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
 - Exact known-good matches are identified by full content hash and omitted from curated output unless explicitly marked Keep.
 - Byte-for-byte duplicate groups with a recommended keeper.
 - Perceptual-hash groups for resized, recompressed, rotated, or lightly edited images.
+- First-class video detection and FFprobe metadata: duration, dimensions, frame rate, codecs, and embedded creation date.
+- On-demand reduced photo previews and four-frame video contact sheets cached under the active saved scan.
 - Decoding/validation for common images, PDF, DOCX, XLSX, PPTX, ZIP, EML, and MSG containers.
 - Separate views for zero-byte and corrupt files.
 - Directory evidence inventory, including empty folders, parent relationships, filesystem timestamps, ownership, permissions, ignored system folders, and read failures.
@@ -32,7 +34,13 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
   - Uncategorized Images
   - Documents
   - Emails
+  - Videos
   - Other Files
+- Independent media facets for media type, origin, sensitivity, topic, people, event, and source application. A file can carry several facets instead of being forced into one category.
+- A non-destructive reconstruction workspace that preserves every known-good path match, links zero-byte placeholders to possible surviving content, and generates destination proposals with confidence and reasons.
+- Discovered-folder review generated from the surviving hierarchy—including empty and zero-byte-only branches—so the user can recognize names shown by the application instead of recalling them unaided.
+- Saved recovery context for devices, people, events, applications, folders, and privacy rules.
+- Optional OpenAI-compatible local or cloud vision provider. The provider receives only reduced previews/contact sheets and structured evidence, never filesystem access or action permissions.
 - Non-destructive curated export. Selected files are copied into category/year/month folders.
 - Filename-derived dates are written with ExifTool only to the curated copy, never the recovered source.
 - File and directory CSV/JSONL catalogs containing paths, filesystem evidence, hashes, dates, validation, classifications, decisions, provenance, and blank AI enrichment columns.
@@ -81,9 +89,12 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
 3. Start the scan. A couple of terabytes can take many hours because candidate duplicates must be read and images decoded. Later runs of the same saved scan reuse unchanged results.
 4. Recovery Curator inventories the selected trusted folders after source analysis. It hashes only known-good files whose sizes occur in the recovery set, then hashes the corresponding recovery candidates and records byte-for-byte matches.
 5. Review known-good matches, exact duplicate groups, similar-photo groups, date proposals, and low-confidence categories. The automatic exact-keeper action only records decisions.
-6. To create a clean library, stop the container, set **Allow Write Actions** to `true`, and restart it. The source can remain read-only because export only reads it. If PUID `0` is required to read restricted source files, exported files are still assigned to the configured Curated Output Owner UID/GID (`99:100` by default) with writable Unraid-friendly permissions.
-7. Select **Build curated library**. Explicit keepers and ungrouped files are copied to `Recovered_Curated`. Undecided known-good matches and undecided duplicate/similar group members are skipped, and recovered originals remain unchanged.
-8. Keep the original recovery set until the curated output has been backed up and manually spot-checked.
+6. Open **Reconstruction** and select **Analyze media & build plan**. Existing file hashes and image analysis are reused; pending videos receive FFprobe metadata without another source inventory.
+7. Review folder names the application found. Mark useful original folders, recovery-generated noise, system folders, and private branches. Add remembered devices, events, applications, people, and privacy context as it becomes recognizable.
+8. Optionally configure a local/private vision endpoint. Cloud media transmission and sensitive-media transmission are separate opt-in controls and default to disabled.
+9. Review destination proposals. Rebuild the plan after folder/context changes. The reconstruction plan remains advisory and performs no file actions.
+10. To create a clean library with the existing category export, stop the container, set **Allow Write Actions** to `true`, and restart it. The source can remain read-only because export only reads it. If PUID `0` is required to read restricted source files, exported files are still assigned to the configured Curated Output Owner UID/GID (`99:100` by default) with writable Unraid-friendly permissions.
+11. Keep the original recovery set until the curated output has been backed up and manually spot-checked.
 
 ## Clearing a scan
 
@@ -110,6 +121,8 @@ The dashboard reports the current phase, completed records, throughput, and rema
 
 Each successful inventory also writes `directory_catalog.csv` and `directory_catalog.jsonl`. These preserve empty directories and the surviving hierarchy independently from file content. The file catalog includes nanosecond modification/change timestamps, original mode/UID/GID, and an `evidence_role` that distinguishes zero-byte placeholders from content-bearing files.
 
+The reconstruction analysis additionally writes CSV and JSONL reports for the proposed tree, discovered-folder context, every known-good path match, file relationships, multi-valued facets, and user-supplied recovery context. These reports are generated from the saved SQLite catalog and do not modify library files.
+
 If the dashboard reports zero recovered files while known-good folders contain files, verify the Unraid bind mount from a terminal:
 
 ```sh
@@ -134,19 +147,15 @@ The program never overwrites a valid existing EXIF capture date. It proposes a f
 
 During curated export, a proposal with at least 85% confidence is applied to `DateTimeOriginal`, `CreateDate`, and `ModifyDate` on the copied image. Every export and repair is recorded in the action log and catalog.
 
-## AI-ready follow-up
+## Optional AI provider and privacy
 
-`recovery_catalog.csv` and `recovery_catalog.jsonl`, together with the directory catalog, form the handoff for later reconstruction and AI analysis. The file catalog includes placeholder fields for:
+The Reconstruction page accepts an OpenAI-compatible endpoint and vision-model name. A LAN hostname, private IP, localhost, or `.local` hostname is treated as local/private. Public endpoints cannot receive previews unless **Allow previews to leave the local/private network** is explicitly enabled. Files already marked adult, intimate, or possibly sensitive require the separate sensitive-media opt-in.
 
-- `ai_caption`
-- `ai_people`
-- `ai_objects`
-- `ai_ocr_text`
-- `ai_tags`
-- `ai_model`
-- `ai_updated_at`
+API keys are not stored in the scan database. Enter only the name of an environment variable supplied to the container. AI analysis is advisory: responses are stored as source-attributed facets and an audit record. The AI cannot move, rename, quarantine, delete, or export files. Filenames, OCR, metadata, and visible text are treated as untrusted evidence rather than model instructions.
 
-This makes it possible to add a later local-AI pass for semantic categories, screenshot OCR, document subjects, face grouping, and natural-language search without changing the recovery workflow.
+The Unraid template includes an optional masked `RECOVERY_AI_API_KEY` variable. If the provider requires a credential, set that variable in the container and enter `RECOVERY_AI_API_KEY` as the environment-variable name on the Reconstruction page. Local providers commonly leave it empty.
+
+Use the Catalog's **Ask configured AI** action to analyze one reduced image preview or video contact sheet. The request includes the recovery context saved for the active scan. Any questions returned by the provider are displayed for human review rather than silently treated as facts.
 
 ## Updating after source changes
 
@@ -155,10 +164,12 @@ Run **Start or resume scan** again. Files whose size and nanosecond modification
 ## Important limitations
 
 - Similar-image groups are candidates for human review; perceptual hashes can produce false matches.
+- Video similarity grouping is not yet automatic; the current release provides exact hashing, FFprobe metadata, and representative contact sheets.
 - Recovery tools may restore partial files that pass basic container validation but still contain damaged content.
 - Rule-based categories are an initial triage, not final semantic organization.
 - Legacy binary Office formats receive only basic type detection in this release.
 - Known-good comparison is exact-content matching. A resized, recompressed, or metadata-edited version will not be treated as an identical trusted copy; it may still appear in similar-photo review.
+- Reconstruction proposals are review artifacts. **Build curated library** continues to use the established category/date export until a proposal has been explicitly accepted and the reconstruction exporter is enabled in a later safety-gated update.
 
 ## Development checks
 

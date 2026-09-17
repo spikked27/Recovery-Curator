@@ -114,9 +114,10 @@ def files():
     validation = request.args.get("validation") or None
     known_good_value = request.args.get("known_good")
     known_good = None if known_good_value is None else known_good_value == "1"
+    media_kind = request.args.get("media_kind") or None
     return render_template(
-        "files.html", files=curator.list_files(category, validation, known_good), category=category,
-        validation=validation, known_good=known_good, summary=curator.summary(),
+        "files.html", files=curator.list_files(category, validation, known_good, media_kind), category=category,
+        validation=validation, known_good=known_good, media_kind=media_kind, summary=curator.summary(),
     )
 
 
@@ -173,13 +174,120 @@ def reset_catalog():
 
 @app.get("/preview/<int:file_id>")
 def preview(file_id: int):
-    row = curator.get_file(file_id)
-    if not row or not row["is_image"]:
-        abort(404)
-    path = Path(row["path"])
-    if not path.exists():
+    try:
+        path = curator.ensure_media_preview(file_id)
+    except (FileNotFoundError, ValueError):
         abort(404)
     return send_file(path, conditional=True, max_age=3600)
+
+
+@app.get("/reconstruction")
+def reconstruction():
+    query = request.args.get("q", "").strip()
+    return render_template(
+        "reconstruction.html", summary=curator.summary(), status=curator.status(),
+        reconstruction=curator.reconstruction_summary(),
+        folders=curator.list_folder_context(query=query or None), folder_query=query,
+        context_items=curator.list_recovery_context(),
+        review_questions=curator.list_review_questions(),
+        proposals=curator.list_reconstruction_proposals(),
+        ai_settings=curator.ai_provider_settings(), ai_runs=curator.recent_ai_runs(),
+    )
+
+
+@app.post("/reconstruction/start")
+def start_reconstruction():
+    curator.start_reconstruction()
+    return redirect(url_for("reconstruction"))
+
+
+@app.post("/folders/review")
+def review_folder():
+    try:
+        curator.review_folder_context(
+            int(request.form.get("directory_id", "0")), request.form.get("review_status", "unreviewed"),
+            request.form.get("user_label", ""), request.form.get("notes", ""),
+        )
+    except Exception as exc:
+        return render_template("message.html", title="Folder context not saved", message=str(exc)), 400
+    return redirect(request.referrer or url_for("reconstruction"))
+
+
+@app.post("/context/add")
+def add_context():
+    try:
+        curator.add_recovery_context(
+            request.form.get("context_type", "general"), request.form.get("label", ""),
+            request.form.get("details", ""),
+        )
+    except Exception as exc:
+        return render_template("message.html", title="Recovery context not saved", message=str(exc)), 400
+    return redirect(url_for("reconstruction") + "#recovery-context")
+
+
+@app.post("/questions/answer")
+def answer_question():
+    try:
+        curator.answer_review_question(
+            int(request.form.get("question_id", "0")), request.form.get("answer", ""),
+            request.form.get("dismiss") == "1",
+        )
+    except Exception as exc:
+        return render_template("message.html", title="Answer not saved", message=str(exc)), 400
+    return redirect(url_for("reconstruction") + "#review-questions")
+
+
+@app.post("/facet/<int:file_id>")
+def set_facet(file_id: int):
+    try:
+        curator.set_file_facet(
+            file_id, request.form.get("facet_type", "topic"), request.form.get("value", ""),
+            request.form.get("reason", ""),
+        )
+    except Exception as exc:
+        return render_template("message.html", title="Classification not saved", message=str(exc)), 400
+    return redirect(request.referrer or url_for("files"))
+
+
+@app.post("/ai/provider")
+def save_ai_provider():
+    try:
+        curator.save_ai_provider_settings({
+            "provider_name": request.form.get("provider_name", "Local AI"),
+            "endpoint": request.form.get("endpoint", ""),
+            "model": request.form.get("model", ""),
+            "api_key_env": request.form.get("api_key_env", ""),
+            "enabled": request.form.get("enabled") == "1",
+            "allow_cloud_media": request.form.get("allow_cloud_media") == "1",
+            "allow_sensitive_media": request.form.get("allow_sensitive_media") == "1",
+        })
+    except Exception as exc:
+        return render_template("message.html", title="AI provider not saved", message=str(exc)), 400
+    return redirect(url_for("reconstruction") + "#ai-provider")
+
+
+@app.post("/ai/test")
+def test_ai_provider():
+    try:
+        result = curator.test_ai_provider()
+        models = ", ".join(result.get("models", [])[:10]) or "provider returned no model list"
+        message = f"Connection succeeded. Endpoint is {'local/private' if result.get('local') else 'remote/public'}. Models: {models}"
+    except Exception as exc:
+        return render_template("message.html", title="AI connection failed", message=str(exc)), 400
+    return render_template("message.html", title="AI connection succeeded", message=message)
+
+
+@app.post("/ai/analyze/<int:file_id>")
+def analyze_with_ai(file_id: int):
+    try:
+        result = curator.analyze_file_with_ai(file_id)
+    except Exception as exc:
+        return render_template("message.html", title="AI analysis failed", message=str(exc)), 400
+    questions = result.get("questions") if isinstance(result.get("questions"), list) else []
+    message = str(result.get("caption") or "Analysis completed.")
+    if questions:
+        message += " Questions for review: " + " | ".join(str(item) for item in questions[:5])
+    return render_template("message.html", title="AI analysis saved as suggestions", message=message)
 
 
 @app.post("/decision/<int:file_id>")

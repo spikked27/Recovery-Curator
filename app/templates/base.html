@@ -15,10 +15,15 @@
     button,.button { background:#2563eb; color:white; border:0; border-radius:8px; padding:9px 13px; cursor:pointer; text-decoration:none; display:inline-block }
     button.secondary,.button.secondary { background:#334155 } button.danger { background:#be123c }
     button:disabled { opacity:.45; cursor:not-allowed } form { display:inline }
+    input,select,textarea { background:#0f1720; color:#e5edf5; border:1px solid var(--line); border-radius:7px; padding:8px }
+    textarea { min-height:70px; resize:vertical } label { display:inline-block; color:#cbd5e1 }
+    .form-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; align-items:end }
+    .form-grid label { display:flex; flex-direction:column; gap:5px }
     .scan-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:12px }
     table { width:100%; border-collapse:collapse; margin-top:16px } th,td { text-align:left; border-bottom:1px solid var(--line); padding:9px; vertical-align:top }
     th { color:#a8bbce; position:sticky; top:0; background:var(--panel) } .path { overflow-wrap:anywhere; max-width:580px }
     .thumb { width:180px; height:140px; object-fit:contain; background:#0b0e11; border-radius:8px }
+    .thumb.sensitive { filter:blur(18px) }
     .items { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:12px; margin-top:12px }
     .item { padding:12px; background:#111820; border:1px solid var(--line); border-radius:10px } .recommended { border-color:var(--accent) }
     .pill { display:inline-block; padding:3px 8px; border-radius:999px; background:#2b3947; font-size:12px; margin:2px }
@@ -26,7 +31,7 @@
   </style>
 </head>
 <body>
-<header><h1>Recovery Curator</h1><nav><a href="/">Dashboard</a><a href="/scans">Saved scans</a><a href="/groups/exact">Exact duplicates</a><a href="/groups/similar">Similar photos</a><a href="/files?known_good=1">Known-good matches</a><a href="/references">Known-good folders</a><a href="/files">Catalog</a></nav></header>
+<header><h1>Recovery Curator</h1><nav><a href="/">Dashboard</a><a href="/scans">Saved scans</a><a href="/reconstruction">Reconstruction</a><a href="/groups/exact">Exact duplicates</a><a href="/groups/similar">Similar photos</a><a href="/files?known_good=1">Known-good matches</a><a href="/references">Known-good folders</a><a href="/files">Catalog</a></nav></header>
 <main>{% block content %}{% endblock %}</main>
 </body>
 </html>

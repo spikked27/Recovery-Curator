@@ -9,7 +9,7 @@
   <Privileged>false</Privileged>
   <Support>https://github.com/spikked27/Recovery-Curator/issues</Support>
   <Project>https://github.com/spikked27/Recovery-Curator</Project>
-  <Overview>Non-destructive recovery triage with multiple saved scans, read-only known-good backup comparison, exact duplicates, similar photos, corrupt/zero-byte detection, filename-derived photo dates, categorized exports, and AI-ready catalogs.</Overview>
+  <Overview>Non-destructive recovery triage with saved scans, known-good comparison, photo/video analysis, folder-evidence review, reconstruction proposals, optional private AI assistance, and safe categorized exports.</Overview>
   <Category>Tools: Backup:</Category>
   <WebUI>http://[IP]:[PORT:8188]/</WebUI>
   <TemplateURL>https://raw.githubusercontent.com/spikked27/Recovery-Curator/main/unraid-template.xml</TemplateURL>
@@ -32,6 +32,7 @@
   <Config Name="Hash Workers" Target="HASH_WORKERS" Default="1" Mode="" Description="One sequential full-file reader prevents seek contention on the single source drive." Type="Variable" Display="advanced" Required="true" Mask="false">1</Config>
   <Config Name="Checkpoint Batch" Target="SCAN_BATCH_SIZE" Default="64" Mode="" Description="Maximum in-memory work batch and checkpoint interval. 64 is recommended." Type="Variable" Display="advanced" Required="true" Mask="false">64</Config>
   <Config Name="Photo Similarity Distance" Target="SIMILARITY_DISTANCE" Default="6" Mode="" Description="Perceptual hash distance from 0-16. Six is conservative; higher creates broader groups." Type="Variable" Display="advanced" Required="true" Mask="false">6</Config>
+  <Config Name="Optional AI API Key" Target="RECOVERY_AI_API_KEY" Default="" Mode="" Description="Optional credential for the configured AI provider. In the Web UI, use RECOVERY_AI_API_KEY as the environment-variable name. Local providers often leave this blank." Type="Variable" Display="advanced" Required="false" Mask="true"></Config>
   <Config Name="User ID" Target="PUID" Default="99" Mode="" Description="Unraid nobody user" Type="Variable" Display="advanced" Required="true" Mask="false">99</Config>
   <Config Name="Group ID" Target="PGID" Default="100" Mode="" Description="Unraid users group" Type="Variable" Display="advanced" Required="true" Mask="false">100</Config>
   <Config Name="Curated Output Owner UID" Target="OUTPUT_UID" Default="99" Mode="" Description="Ownership assigned to exported files even when the scanner runs as root to read restricted recovery files." Type="Variable" Display="advanced" Required="true" Mask="false">99</Config>
