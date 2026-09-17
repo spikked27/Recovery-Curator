@@ -9,6 +9,7 @@
   <div class="card"><div class="metric">{{ summary.files or 0 }}</div><div class="muted">files cataloged</div></div>
   <div class="card"><div class="metric">{{ summary.bytes_human }}</div><div class="muted">source data</div></div>
   <div class="card"><div class="metric">{{ summary.images or 0 }}</div><div class="muted">images</div></div>
+  <div class="card"><div class="metric">{{ summary.directories or 0 }}</div><div class="muted">directories preserved</div></div>
   <div class="card"><div class="metric">{{ summary.exact_groups or 0 }}</div><div class="muted">exact groups</div></div>
   <div class="card"><div class="metric">{{ summary.similar_groups or 0 }}</div><div class="muted">similar-photo groups</div></div>
   <div class="card"><div class="metric good">{{ summary.known_good_matches or 0 }}</div><div class="muted"><a href="/files?known_good=1">known-good exact matches</a></div></div>

@@ -26,6 +26,8 @@ curator = Curator(
     batch_size=int(os.environ.get("SCAN_BATCH_SIZE", "64")),
     similarity_radius=int(os.environ.get("SIMILARITY_DISTANCE", "6")),
     reference_root=Path(os.environ.get("REFERENCE_ROOT", "/known-good")),
+    output_uid=int(os.environ.get("OUTPUT_UID", "99")),
+    output_gid=int(os.environ.get("OUTPUT_GID", "100")),
 )
 
 app = Flask(__name__)
@@ -162,7 +164,8 @@ def reset_catalog():
         return render_template("message.html", title="Reset blocked", message=str(exc)), 400
     return render_template(
         "message.html", title="Catalog cleared",
-        message=(f"Removed {result['files']} recovery records, {result['reference_files']} cached reference records, "
+        message=(f"Removed {result['files']} recovery records, {result['directories']} directory evidence records, "
+                 f"{result['reference_files']} cached reference records, "
                  f"and {result['reports']} generated reports. No library files were changed. "
                  "The active saved scan is now blank; other saved scans were not changed."),
     )

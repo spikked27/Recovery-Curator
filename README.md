@@ -16,6 +16,8 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
 - Perceptual-hash groups for resized, recompressed, rotated, or lightly edited images.
 - Decoding/validation for common images, PDF, DOCX, XLSX, PPTX, ZIP, EML, and MSG containers.
 - Separate views for zero-byte and corrupt files.
+- Directory evidence inventory, including empty folders, parent relationships, filesystem timestamps, ownership, permissions, ignored system folders, and read failures.
+- Zero-byte files remain in the evidence catalog as named placeholders even though they have no content to hash or export.
 - Conservative filename date recognition for year-first patterns such as:
   - `IMG_20230517_142233.jpg`
   - `Screenshot_2023-05-17_14-22-33.png`
@@ -33,7 +35,7 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
   - Other Files
 - Non-destructive curated export. Selected files are copied into category/year/month folders.
 - Filename-derived dates are written with ExifTool only to the curated copy, never the recovered source.
-- CSV and JSONL catalogs containing hashes, dates, validation, classifications, decisions, provenance, and blank AI enrichment columns.
+- File and directory CSV/JSONL catalogs containing paths, filesystem evidence, hashes, dates, validation, classifications, decisions, provenance, and blank AI enrichment columns.
 - Manual category overrides in the catalog; overrides are retained for unchanged files on later scans.
 
 ## Install on Unraid
@@ -68,6 +70,8 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
    - Recovered Source access: **Read Only**
    - Allow Write Actions: **false**
 
+   If recovered permissions prevent UID 99 from reading parts of the source, temporarily set **User ID / PUID** to `0`. Keep the source read-only and write actions disabled. **Curated Output Owner UID/GID** remain `99`/`100`, so later exports are normalized to normal Unraid ownership even while the scanner runs as root.
+
 6. Apply the template and open the Web UI on port `8188`.
 
 ## Safe operating sequence
@@ -77,7 +81,7 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
 3. Start the scan. A couple of terabytes can take many hours because candidate duplicates must be read and images decoded. Later runs of the same saved scan reuse unchanged results.
 4. Recovery Curator inventories the selected trusted folders after source analysis. It hashes only known-good files whose sizes occur in the recovery set, then hashes the corresponding recovery candidates and records byte-for-byte matches.
 5. Review known-good matches, exact duplicate groups, similar-photo groups, date proposals, and low-confidence categories. The automatic exact-keeper action only records decisions.
-6. To create a clean library, stop the container, set **Allow Write Actions** to `true`, and restart it. The source can remain read-only because export only reads it.
+6. To create a clean library, stop the container, set **Allow Write Actions** to `true`, and restart it. The source can remain read-only because export only reads it. If PUID `0` is required to read restricted source files, exported files are still assigned to the configured Curated Output Owner UID/GID (`99:100` by default) with writable Unraid-friendly permissions.
 7. Select **Build curated library**. Explicit keepers and ungrouped files are copied to `Recovered_Curated`. Undecided known-good matches and undecided duplicate/similar group members are skipped, and recovered originals remain unchanged.
 8. Keep the original recovery set until the curated output has been backed up and manually spot-checked.
 
@@ -103,6 +107,8 @@ The similar-photo stage uses a BK-tree rather than comparing every photo against
 The dashboard reports the current phase, completed records, throughput, and remains usable while the scan runs. **Cancel Scan** requests a clean stop between batches; starting again reuses completed inventory, metadata, and hashes.
 
 “Resume” re-traverses the recovered-source directory so additions, removals, and changed files can be detected, but it does not repeat expensive analysis or hashing for unchanged files. If `/source` is empty, missing, or wholly unreadable, the scan fails before known-good indexing and retains the prior catalog. Windows `System Volume Information` folders are intentionally ignored. Other isolated read errors are reported as warnings: readable files continue through analysis, while unseen older catalog records are retained so an inaccessible file is never mistaken for a deleted one.
+
+Each successful inventory also writes `directory_catalog.csv` and `directory_catalog.jsonl`. These preserve empty directories and the surviving hierarchy independently from file content. The file catalog includes nanosecond modification/change timestamps, original mode/UID/GID, and an `evidence_role` that distinguishes zero-byte placeholders from content-bearing files.
 
 If the dashboard reports zero recovered files while known-good folders contain files, verify the Unraid bind mount from a terminal:
 
@@ -130,7 +136,7 @@ During curated export, a proposal with at least 85% confidence is applied to `Da
 
 ## AI-ready follow-up
 
-`recovery_catalog.csv` and `recovery_catalog.jsonl` include placeholder fields for:
+`recovery_catalog.csv` and `recovery_catalog.jsonl`, together with the directory catalog, form the handoff for later reconstruction and AI analysis. The file catalog includes placeholder fields for:
 
 - `ai_caption`
 - `ai_people`

@@ -12,6 +12,8 @@ services:
       ALLOW_ACTIONS: "false"
       ANALYSIS_WORKERS: "1"
       HASH_WORKERS: "1"
+      OUTPUT_UID: "99"
+      OUTPUT_GID: "100"
       SCAN_BATCH_SIZE: "64"
       SIMILARITY_DISTANCE: "6"
       REFERENCE_ROOT: "/known-good"

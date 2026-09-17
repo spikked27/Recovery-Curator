@@ -9,6 +9,7 @@ import os
 import re
 import shutil
 import sqlite3
+import stat as stat_module
 import subprocess
 import threading
 import time
@@ -139,6 +140,24 @@ def initialize(db_path: Path) -> None:
             CREATE INDEX IF NOT EXISTS idx_files_exact ON files(exact_group);
             CREATE INDEX IF NOT EXISTS idx_files_similar ON files(similar_group);
             CREATE INDEX IF NOT EXISTS idx_files_category ON files(category);
+            CREATE TABLE IF NOT EXISTS directories (
+              id INTEGER PRIMARY KEY,
+              path TEXT NOT NULL UNIQUE,
+              relative_path TEXT NOT NULL,
+              parent_relative_path TEXT,
+              name TEXT NOT NULL,
+              mtime_ns INTEGER,
+              ctime_ns INTEGER,
+              mode INTEGER,
+              uid INTEGER,
+              gid INTEGER,
+              status TEXT NOT NULL DEFAULT 'available',
+              read_error TEXT,
+              seen_scan TEXT,
+              updated_at TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_directories_parent ON directories(parent_relative_path);
+            CREATE INDEX IF NOT EXISTS idx_directories_status ON directories(status);
             CREATE TABLE IF NOT EXISTS reference_files (
               id INTEGER PRIMARY KEY,
               library TEXT NOT NULL,
@@ -174,6 +193,7 @@ def initialize(db_path: Path) -> None:
             "ai_tags": "TEXT", "ai_model": "TEXT", "ai_updated_at": "TEXT",
             "known_good_match": "INTEGER DEFAULT 0", "known_good_count": "INTEGER DEFAULT 0",
             "known_good_library": "TEXT", "known_good_path": "TEXT",
+            "ctime_ns": "INTEGER", "mode": "INTEGER", "uid": "INTEGER", "gid": "INTEGER",
         }
         for column, definition in migrations.items():
             if column not in existing_columns:
@@ -382,7 +402,10 @@ def quality_score(path: Path, metadata: dict) -> float:
     return round(score, 2)
 
 
-def iter_source_files(root: Path, diagnostics: TraversalDiagnostics | None = None):
+def iter_source_files(
+    root: Path, diagnostics: TraversalDiagnostics | None = None,
+    directory_callback=None,
+):
     """Traverse without materializing every pathname or following directory symlinks."""
     stack = [root]
     while stack:
@@ -391,11 +414,15 @@ def iter_source_files(root: Path, diagnostics: TraversalDiagnostics | None = Non
             with os.scandir(directory) as entries:
                 if diagnostics is not None:
                     diagnostics.directories_scanned += 1
+                if directory_callback is not None:
+                    directory_callback(directory, "available", None)
                 for entry in entries:
                     try:
                         if entry.name.casefold() in IGNORED_SYSTEM_DIRECTORIES:
                             if diagnostics is not None:
                                 diagnostics.ignored_system_directories += 1
+                            if directory_callback is not None:
+                                directory_callback(Path(entry.path), "ignored_system", None)
                             continue
                         if entry.is_dir(follow_symlinks=False):
                             stack.append(Path(entry.path))
@@ -408,6 +435,8 @@ def iter_source_files(root: Path, diagnostics: TraversalDiagnostics | None = Non
         except OSError as exc:
             if diagnostics is not None:
                 diagnostics.record_error(directory, exc)
+            if directory_callback is not None:
+                directory_callback(directory, "unreadable", exc)
             continue
 
 
@@ -504,12 +533,15 @@ class Curator:
         allow_actions: bool = False, analysis_workers: int = 2, hash_workers: int = 2,
         batch_size: int = 64, similarity_radius: int = 6,
         reference_root: Path | None = None,
+        output_uid: int | None = None, output_gid: int | None = None,
     ):
         self.source = source.resolve()
         self.output = output.resolve()
         self.quarantine = quarantine.resolve()
         self.db_path = db_path
         self.reference_root = reference_root.resolve() if reference_root else None
+        self.output_uid = os.geteuid() if output_uid is None else int(output_uid)
+        self.output_gid = os.getegid() if output_gid is None else int(output_gid)
         self.allow_actions = allow_actions
         self.analysis_workers = max(1, min(int(analysis_workers), 8))
         self.hash_workers = max(1, min(int(hash_workers), 8))
@@ -602,13 +634,18 @@ class Curator:
         with connect(self.db_path) as db:
             file_count = db.execute("SELECT COUNT(*) FROM files").fetchone()[0]
             reference_count = db.execute("SELECT COUNT(*) FROM reference_files").fetchone()[0]
+            directory_count = db.execute("SELECT COUNT(*) FROM directories").fetchone()[0]
             db.execute("DELETE FROM actions")
             db.execute("DELETE FROM files")
+            db.execute("DELETE FROM directories")
             db.execute("DELETE FROM reference_files")
             db.execute("DELETE FROM settings")
             db.commit()
         removed_reports = 0
-        for name in ("recovery_catalog.csv", "recovery_catalog.jsonl"):
+        for name in (
+            "recovery_catalog.csv", "recovery_catalog.jsonl",
+            "directory_catalog.csv", "directory_catalog.jsonl",
+        ):
             report = self.db_path.parent / name
             try:
                 report.unlink()
@@ -620,7 +657,10 @@ class Curator:
             running=False, phase="idle", processed=0, total=0, rate=0.0,
             message="Catalog cleared. Ready for a new scan.", error=None,
         )
-        return {"files": file_count, "reference_files": reference_count, "reports": removed_reports}
+        return {
+            "files": file_count, "directories": directory_count,
+            "reference_files": reference_count, "reports": removed_reports,
+        }
 
     @staticmethod
     def _paths_overlap(left: Path, right: Path) -> bool:
@@ -782,7 +822,36 @@ class Curator:
         with connect(self.db_path) as db:
             inventory_count = 0
             traversal = TraversalDiagnostics()
-            for index, path in enumerate(iter_source_files(self.source, traversal), 1):
+
+            def record_directory(path: Path, status: str, error: OSError | None) -> None:
+                try:
+                    stat = path.stat()
+                except OSError:
+                    stat = None
+                relative = "." if path == self.source else path.relative_to(self.source).as_posix()
+                parent = None if relative == "." else (Path(relative).parent.as_posix() or ".")
+                db.execute(
+                    """INSERT INTO directories(
+                         path,relative_path,parent_relative_path,name,mtime_ns,ctime_ns,mode,uid,gid,
+                         status,read_error,seen_scan,updated_at
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+                       ON CONFLICT(path) DO UPDATE SET
+                         relative_path=excluded.relative_path,parent_relative_path=excluded.parent_relative_path,
+                         name=excluded.name,mtime_ns=excluded.mtime_ns,ctime_ns=excluded.ctime_ns,
+                         mode=excluded.mode,uid=excluded.uid,gid=excluded.gid,status=excluded.status,
+                         read_error=excluded.read_error,seen_scan=excluded.seen_scan,updated_at=excluded.updated_at""",
+                    (
+                        str(path), relative, parent, path.name,
+                        stat.st_mtime_ns if stat else None, stat.st_ctime_ns if stat else None,
+                        stat_module.S_IMODE(stat.st_mode) if stat else None,
+                        stat.st_uid if stat else None, stat.st_gid if stat else None,
+                        status, str(error)[:500] if error else None, scan_token, utcnow(),
+                    ),
+                )
+
+            for index, path in enumerate(
+                iter_source_files(self.source, traversal, directory_callback=record_directory), 1
+            ):
                 try:
                     stat = path.stat()
                 except OSError as exc:
@@ -793,12 +862,18 @@ class Curator:
                 existing = db.execute("SELECT size,mtime_ns FROM files WHERE path=?", (str(path),)).fetchone()
                 changed = not existing or existing["size"] != stat.st_size or existing["mtime_ns"] != stat.st_mtime_ns
                 db.execute(
-                    """INSERT INTO files(path,relative_path,name,extension,size,mtime_ns,seen_scan,updated_at)
-                       VALUES(?,?,?,?,?,?,?,?)
+                    """INSERT INTO files(
+                         path,relative_path,name,extension,size,mtime_ns,ctime_ns,mode,uid,gid,seen_scan,updated_at
+                       ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
                        ON CONFLICT(path) DO UPDATE SET relative_path=excluded.relative_path,name=excluded.name,
                          extension=excluded.extension,size=excluded.size,mtime_ns=excluded.mtime_ns,
+                         ctime_ns=excluded.ctime_ns,mode=excluded.mode,uid=excluded.uid,gid=excluded.gid,
                          seen_scan=excluded.seen_scan,updated_at=excluded.updated_at""",
-                    (str(path), relative, path.name, path.suffix.lower(), stat.st_size, stat.st_mtime_ns, scan_token, utcnow()),
+                    (
+                        str(path), relative, path.name, path.suffix.lower(), stat.st_size, stat.st_mtime_ns,
+                        stat.st_ctime_ns, stat_module.S_IMODE(stat.st_mode), stat.st_uid, stat.st_gid,
+                        scan_token, utcnow(),
+                    ),
                 )
                 if changed:
                     db.execute(
@@ -836,6 +911,7 @@ class Curator:
             )
             if traversal.errors == 0:
                 db.execute("DELETE FROM files WHERE seen_scan IS NULL OR seen_scan != ?", (scan_token,))
+                db.execute("DELETE FROM directories WHERE seen_scan IS NULL OR seen_scan != ?", (scan_token,))
             db.commit()
             inventory_message = f"Inventory complete — {inventory_count:,} files"
             if traversal.ignored_system_directories:
@@ -858,6 +934,7 @@ class Curator:
 
         self._build_similar_groups(self.similarity_radius)
         self.export_catalog()
+        self.export_directory_catalog()
         return inventory_result
 
     def _analyze_pending(self, db: sqlite3.Connection) -> None:
@@ -1131,12 +1208,19 @@ class Curator:
             ).fetchone()
             categories = [dict(item) for item in db.execute("SELECT category,COUNT(*) count FROM files GROUP BY category ORDER BY count DESC")]
             reference_files = db.execute("SELECT COUNT(*) FROM reference_files").fetchone()[0]
+            directory_row = db.execute(
+                """SELECT COUNT(*) directories,
+                          SUM(status='unreadable') unreadable_directories,
+                          SUM(status='ignored_system') ignored_directories
+                   FROM directories"""
+            ).fetchone()
             reference_libraries = [dict(item) for item in db.execute(
                 "SELECT library,COUNT(*) files,SUM(content_hash IS NOT NULL) hashed FROM reference_files GROUP BY library ORDER BY library"
             )]
         result = dict(row)
         result["categories"] = categories
         result["reference_files"] = reference_files
+        result.update(dict(directory_row))
         result["reference_libraries"] = reference_libraries
         result["reference_selections"] = self.selected_references()
         result["reference_root_available"] = bool(self.reference_root and self.reference_root.is_dir())
@@ -1219,6 +1303,7 @@ class Curator:
     def _safe_destination(self, root: Path, relative: str) -> Path:
         destination = root / relative
         destination.parent.mkdir(parents=True, exist_ok=True)
+        self._normalize_output_directories(destination.parent, root)
         if not destination.exists():
             return destination
         stem, suffix = destination.stem, destination.suffix
@@ -1227,6 +1312,23 @@ class Curator:
             if not candidate.exists():
                 return candidate
         raise RuntimeError("too many destination name collisions")
+
+    def _normalize_output_directories(self, directory: Path, root: Path) -> None:
+        if os.geteuid() != 0:
+            return
+        current = directory
+        while current == root or root in current.parents:
+            os.chown(current, self.output_uid, self.output_gid)
+            os.chmod(current, 0o775)
+            if current == root:
+                break
+            current = current.parent
+
+    def _normalize_output_file(self, path: Path) -> None:
+        source_mode = stat_module.S_IMODE(path.stat().st_mode)
+        if os.geteuid() == 0:
+            os.chown(path, self.output_uid, self.output_gid)
+        os.chmod(path, 0o664 | (source_mode & 0o111))
 
     def quarantine_file(self, file_id: int) -> str:
         if not self.allow_actions:
@@ -1281,6 +1383,7 @@ class Curator:
                     metadata_fixed = False
                     if row["is_image"] and not row["exif_date"] and row["filename_date"] and row["date_confidence"] >= 85:
                         metadata_fixed = apply_date_metadata(destination, row["filename_date"])
+                    self._normalize_output_file(destination)
                     db.execute("UPDATE files SET exported_path=? WHERE id=?", (str(destination), row["id"]))
                     db.execute(
                         "INSERT INTO actions(created_at,action,file_id,source_path,destination_path,status,detail) VALUES(?,?,?,?,?,'complete',?)",
@@ -1297,6 +1400,7 @@ class Curator:
                     db.commit()
             db.commit()
         catalog = self.export_catalog(self.output)
+        self.export_directory_catalog(self.output)
         return {
             "exported": exported, "failed": failed, "review_skipped": review_skipped,
             "known_good_skipped": known_good_skipped, "catalog": str(catalog),
@@ -1308,7 +1412,8 @@ class Curator:
         csv_path = root / "recovery_catalog.csv"
         jsonl_path = root / "recovery_catalog.jsonl"
         fields = [
-            "id", "relative_path", "name", "extension", "size", "mime", "validation", "validation_detail",
+            "id", "relative_path", "name", "extension", "size", "mtime_ns", "ctime_ns", "mode", "uid", "gid",
+            "evidence_role", "mime", "validation", "validation_detail",
             "content_hash", "width", "height", "megapixels", "phash", "exif_date", "filename_date",
             "date_confidence", "date_reason", "category", "category_confidence", "category_reason",
             "quality_score", "exact_group", "similar_group", "known_good_match", "known_good_count",
@@ -1320,8 +1425,33 @@ class Curator:
             writer.writeheader()
             for row in db.execute("SELECT * FROM files ORDER BY id"):
                 item = {field: row[field] if field in row.keys() else "" for field in fields}
+                item["evidence_role"] = "zero_byte_placeholder" if row["size"] == 0 else "content_file"
                 writer.writerow(item)
                 json_file.write(json.dumps(item, ensure_ascii=False) + "\n")
+        if root.resolve() == self.output:
+            self._normalize_output_file(csv_path)
+            self._normalize_output_file(jsonl_path)
+        return csv_path
+
+    def export_directory_catalog(self, root: Path | None = None) -> Path:
+        root = root or self.db_path.parent
+        root.mkdir(parents=True, exist_ok=True)
+        csv_path = root / "directory_catalog.csv"
+        jsonl_path = root / "directory_catalog.jsonl"
+        fields = [
+            "id", "relative_path", "parent_relative_path", "name", "mtime_ns", "ctime_ns",
+            "mode", "uid", "gid", "status", "read_error", "updated_at",
+        ]
+        with connect(self.db_path) as db, csv_path.open("w", newline="", encoding="utf-8") as csv_file, jsonl_path.open("w", encoding="utf-8") as json_file:
+            writer = csv.DictWriter(csv_file, fieldnames=fields)
+            writer.writeheader()
+            for row in db.execute("SELECT * FROM directories ORDER BY relative_path"):
+                item = {field: row[field] if field in row.keys() else "" for field in fields}
+                writer.writerow(item)
+                json_file.write(json.dumps(item, ensure_ascii=False) + "\n")
+        if root.resolve() == self.output:
+            self._normalize_output_file(csv_path)
+            self._normalize_output_file(jsonl_path)
         return csv_path
 
 

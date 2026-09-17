@@ -13,6 +13,8 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     ALLOW_ACTIONS=false \
     PUID=99 \
     PGID=100 \
+    OUTPUT_UID=99 \
+    OUTPUT_GID=100 \
     UMASK=002
 
 RUN apt-get update && apt-get install -y --no-install-recommends \

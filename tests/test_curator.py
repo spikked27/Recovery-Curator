@@ -1,4 +1,6 @@
 import os
+import csv
+import stat
 import tempfile
 import unittest
 from pathlib import Path
@@ -29,6 +31,7 @@ class CuratorTests(unittest.TestCase):
             image.resize((300, 200)).save(source / "thumbnail_20230517.jpg", quality=70)
             (source / "empty.pdf").write_bytes(b"")
             (source / "broken.jpg").write_bytes(b"not an image")
+            (source / "Original Empty Folder").mkdir()
 
             curator = Curator(source, output, quarantine, config / "catalog.sqlite3", allow_actions=True)
             curator.scan()
@@ -39,13 +42,27 @@ class CuratorTests(unittest.TestCase):
             self.assertEqual(summary["exact_groups"], 1)
             self.assertGreaterEqual(summary["similar_groups"], 1)
             self.assertGreaterEqual(summary["date_proposals"], 1)
+            self.assertEqual(summary["directories"], 2)
             self.assertTrue((config / "recovery_catalog.csv").exists())
+            self.assertTrue((config / "directory_catalog.csv").exists())
+
+            with (config / "recovery_catalog.csv").open(newline="", encoding="utf-8") as stream:
+                rows = list(csv.DictReader(stream))
+            zero_row = next(row for row in rows if row["name"] == "empty.pdf")
+            self.assertEqual(zero_row["evidence_role"], "zero_byte_placeholder")
+            self.assertTrue(zero_row["mtime_ns"])
 
             curator.auto_decide_exact()
             result = curator.build_curated_library()
             self.assertGreaterEqual(result["exported"], 1)
             self.assertGreaterEqual(result["review_skipped"], 1)
             self.assertTrue((output / "recovery_catalog.jsonl").exists())
+            self.assertTrue((output / "directory_catalog.jsonl").exists())
+            if os.geteuid() == 0:
+                exported = next(path for path in output.rglob("*") if path.is_file() and path.suffix == ".jpg")
+                exported_stat = exported.stat()
+                self.assertEqual((exported_stat.st_uid, exported_stat.st_gid), (os.geteuid(), os.getegid()))
+                self.assertEqual(stat.S_IMODE(exported_stat.st_mode) & 0o664, 0o664)
 
             # Unchanged records must resume from SQLite without repeating expensive analysis.
             with patch("app.curator.analyze_record", side_effect=AssertionError("unchanged file was re-analyzed")):
@@ -166,7 +183,9 @@ class CuratorTests(unittest.TestCase):
 
             result = curator.reset_catalog()
             self.assertEqual(result["files"], 1)
+            self.assertEqual(result["directories"], 1)
             self.assertEqual(curator.summary()["files"], 0)
+            self.assertEqual(curator.summary()["directories"], 0)
             self.assertEqual(curator.summary()["reference_files"], 0)
             self.assertEqual(curator.selected_references(), [])
             self.assertTrue(source_file.exists())
@@ -252,7 +271,9 @@ class CuratorTests(unittest.TestCase):
 
             curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
 
-            def incomplete_traversal(_root, diagnostics=None):
+            def incomplete_traversal(_root, diagnostics=None, directory_callback=None):
+                if directory_callback:
+                    directory_callback(source, "available", None)
                 diagnostics.record_error(source / "restricted", PermissionError("permission denied"))
                 yield visible
 
@@ -263,6 +284,28 @@ class CuratorTests(unittest.TestCase):
             self.assertEqual(curator.summary()["files"], 1)
             self.assertFalse(result["removed_missing_records"])
             self.assertIn("restricted", curator.summary()["last_source_inventory"]["first_source_error"])
+
+    def test_root_scan_assigns_configured_output_ownership(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            destination = output / "photo.jpg"
+            destination.write_bytes(b"photo")
+            destination.chmod(0o600)
+            curator = Curator(
+                source, output, quarantine, config / "catalog.sqlite3",
+                output_uid=99, output_gid=100,
+            )
+
+            with patch("app.curator.os.geteuid", return_value=0), patch("app.curator.os.chown") as chown:
+                curator._normalize_output_file(destination)
+
+            chown.assert_called_once_with(destination, 99, 100)
+            self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o664)
 
 
 if __name__ == "__main__":

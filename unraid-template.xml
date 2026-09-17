@@ -34,5 +34,7 @@
   <Config Name="Photo Similarity Distance" Target="SIMILARITY_DISTANCE" Default="6" Mode="" Description="Perceptual hash distance from 0-16. Six is conservative; higher creates broader groups." Type="Variable" Display="advanced" Required="true" Mask="false">6</Config>
   <Config Name="User ID" Target="PUID" Default="99" Mode="" Description="Unraid nobody user" Type="Variable" Display="advanced" Required="true" Mask="false">99</Config>
   <Config Name="Group ID" Target="PGID" Default="100" Mode="" Description="Unraid users group" Type="Variable" Display="advanced" Required="true" Mask="false">100</Config>
+  <Config Name="Curated Output Owner UID" Target="OUTPUT_UID" Default="99" Mode="" Description="Ownership assigned to exported files even when the scanner runs as root to read restricted recovery files." Type="Variable" Display="advanced" Required="true" Mask="false">99</Config>
+  <Config Name="Curated Output Owner GID" Target="OUTPUT_GID" Default="100" Mode="" Description="Group ownership assigned to exported files." Type="Variable" Display="advanced" Required="true" Mask="false">100</Config>
   <Config Name="Umask" Target="UMASK" Default="002" Mode="" Description="Permissions mask for created files" Type="Variable" Display="advanced" Required="true" Mask="false">002</Config>
 </Container>
