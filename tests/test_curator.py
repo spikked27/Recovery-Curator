@@ -315,6 +315,58 @@ class CuratorTests(unittest.TestCase):
             chown.assert_called_once_with(destination, 99, 100)
             self.assertEqual(stat.S_IMODE(destination.stat().st_mode), 0o664)
 
+    def test_existing_catalog_migrates_media_columns_before_indexes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            db_path = config / "catalog.sqlite3"
+            with connect(db_path) as db:
+                db.execute(
+                    """CREATE TABLE files (
+                         id INTEGER PRIMARY KEY,
+                         path TEXT NOT NULL UNIQUE,
+                         relative_path TEXT NOT NULL,
+                         name TEXT NOT NULL,
+                         extension TEXT,
+                         size INTEGER NOT NULL,
+                         mtime_ns INTEGER NOT NULL,
+                         seen_scan TEXT,
+                         mime TEXT,
+                         content_hash TEXT,
+                         exact_group TEXT,
+                         similar_group INTEGER,
+                         category TEXT,
+                         category_confidence INTEGER DEFAULT 0,
+                         category_reason TEXT
+                       )"""
+                )
+                db.execute(
+                    """INSERT INTO files(
+                         path,relative_path,name,extension,size,mtime_ns,mime,category
+                       ) VALUES(?,?,?,?,?,?,?,?)""",
+                    (str(source / "old-video.mp4"), "old-video.mp4", "old-video.mp4",
+                     ".mp4", 123, 1, "video/mp4", "Other Files"),
+                )
+                db.commit()
+
+            Curator(source, output, quarantine, db_path)
+
+            with connect(db_path) as db:
+                columns = {row[1] for row in db.execute("PRAGMA table_info(files)")}
+                indexes = {row[1] for row in db.execute("PRAGMA index_list(files)")}
+                migrated = db.execute(
+                    "SELECT media_kind,media_origin,category FROM files WHERE name='old-video.mp4'"
+                ).fetchone()
+            self.assertIn("media_kind", columns)
+            self.assertIn("media_origin", columns)
+            self.assertIn("idx_files_media_kind", indexes)
+            self.assertIn("idx_files_media_origin", indexes)
+            self.assertEqual(tuple(migrated), ("video", "unknown", "Videos"))
+
     def test_video_metadata_and_discovered_folder_reconstruction(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

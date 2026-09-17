@@ -165,8 +165,6 @@ def initialize(db_path: Path) -> None:
             CREATE INDEX IF NOT EXISTS idx_files_exact ON files(exact_group);
             CREATE INDEX IF NOT EXISTS idx_files_similar ON files(similar_group);
             CREATE INDEX IF NOT EXISTS idx_files_category ON files(category);
-            CREATE INDEX IF NOT EXISTS idx_files_media_kind ON files(media_kind);
-            CREATE INDEX IF NOT EXISTS idx_files_media_origin ON files(media_origin);
             CREATE TABLE IF NOT EXISTS directories (
               id INTEGER PRIMARY KEY,
               path TEXT NOT NULL UNIQUE,
