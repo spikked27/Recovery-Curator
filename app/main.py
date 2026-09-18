@@ -183,21 +183,41 @@ def preview(file_id: int):
 
 @app.get("/reconstruction")
 def reconstruction():
-    query = request.args.get("q", "").strip()
+    folder_query = request.args.get("folder_q", "").strip()
+    proposal_query = request.args.get("proposal_q", "").strip()
+    review_state = request.args.get("review_state", "").strip() or None
+    proposal_status = request.args.get("status", "").strip() or None
+    basis = request.args.get("basis", "").strip() or None
+    ai_settings = curator.ai_provider_settings()
     return render_template(
         "reconstruction.html", summary=curator.summary(), status=curator.status(),
         reconstruction=curator.reconstruction_summary(),
-        folders=curator.list_folder_context(query=query or None), folder_query=query,
+        folders=curator.list_folder_context(query=folder_query or None), folder_query=folder_query,
         context_items=curator.list_recovery_context(),
         review_questions=curator.list_review_questions(),
-        proposals=curator.list_reconstruction_proposals(),
-        ai_settings=curator.ai_provider_settings(), ai_runs=curator.recent_ai_runs(),
+        proposals=curator.list_reconstruction_proposals(
+            query=proposal_query or None, review_state=review_state,
+            status=proposal_status, basis=basis,
+        ),
+        proposal_query=proposal_query, selected_review_state=review_state or "",
+        selected_status=proposal_status or "", selected_basis=basis or "",
+        proposal_options=curator.proposal_filter_options(),
+        proposal_tree=curator.reconstruction_tree(),
+        export_preview=curator.reconstruction_export_preview(),
+        ai_settings=ai_settings, ai_runs=curator.recent_ai_runs(),
+        ai_candidate_count=curator.ai_batch_candidate_count(),
     )
 
 
 @app.post("/reconstruction/start")
 def start_reconstruction():
     curator.start_reconstruction()
+    return redirect(url_for("reconstruction"))
+
+
+@app.post("/reconstruction/refresh")
+def refresh_reconstruction():
+    curator.start_reconstruction_plan_refresh()
     return redirect(url_for("reconstruction"))
 
 
@@ -218,11 +238,68 @@ def add_context():
     try:
         curator.add_recovery_context(
             request.form.get("context_type", "general"), request.form.get("label", ""),
-            request.form.get("details", ""),
+            request.form.get("details", ""), request.form.get("match_text", ""),
+            request.form.get("destination", ""),
         )
     except Exception as exc:
         return render_template("message.html", title="Recovery context not saved", message=str(exc)), 400
     return redirect(url_for("reconstruction") + "#recovery-context")
+
+
+@app.post("/context/<int:context_id>/delete")
+def delete_context(context_id: int):
+    try:
+        curator.delete_recovery_context(context_id)
+    except Exception as exc:
+        return render_template("message.html", title="Context clue not removed", message=str(exc)), 400
+    return redirect(url_for("reconstruction") + "#recovery-context")
+
+
+@app.post("/reconstruction/proposal/<int:file_id>")
+def review_reconstruction_proposal(file_id: int):
+    try:
+        curator.review_reconstruction_proposal(
+            file_id, request.form.get("review_state", "pending"),
+            request.form.get("user_path", ""), request.form.get("note", ""),
+        )
+    except Exception as exc:
+        return render_template("message.html", title="Proposal not updated", message=str(exc)), 400
+    return redirect(request.referrer or url_for("reconstruction"))
+
+
+@app.post("/reconstruction/proposals/accept-safe")
+def accept_safe_reconstruction_proposals():
+    try:
+        changed = curator.bulk_accept_reconstruction(request.form.get("minimum_confidence", "85"))
+    except Exception as exc:
+        return render_template("message.html", title="Proposals not accepted", message=str(exc)), 400
+    return render_template(
+        "message.html", title="Safe proposals accepted",
+        message=f"Accepted {changed:,} pending proposals. Generate a fresh dry run before export.",
+    )
+
+
+@app.post("/reconstruction/export/preview")
+def preview_reconstruction_export():
+    curator.reconstruction_export_preview(authorize=True)
+    return redirect(url_for("reconstruction") + "#export-plan")
+
+
+@app.post("/reconstruction/export")
+def export_reconstruction():
+    if request.form.get("confirmation") != "EXPORT":
+        return render_template(
+            "message.html", title="Export blocked", message="Type EXPORT exactly to confirm the accepted plan."
+        ), 400
+    try:
+        result = curator.export_reconstruction(request.form.get("token", ""))
+    except Exception as exc:
+        return render_template("message.html", title="Export blocked", message=str(exc)), 400
+    return render_template(
+        "message.html", title="Accepted reconstruction exported",
+        message=(f"Exported {result['exported']:,} files; {result['skipped']:,} skipped; "
+                 f"{result['failed']:,} failed. The recovered source was not modified."),
+    )
 
 
 @app.post("/questions/answer")
@@ -275,6 +352,20 @@ def test_ai_provider():
     except Exception as exc:
         return render_template("message.html", title="AI connection failed", message=str(exc)), 400
     return render_template("message.html", title="AI connection succeeded", message=message)
+
+
+@app.post("/ai/batch")
+def start_ai_batch():
+    try:
+        curator.start_ai_batch(
+            request.form.get("media_kind", "all"),
+            request.form.get("pending_only") == "1",
+            request.form.get("uncertain_only") == "1",
+            int(request.form.get("limit", "100")),
+        )
+    except Exception as exc:
+        return render_template("message.html", title="AI batch not started", message=str(exc)), 400
+    return redirect(url_for("reconstruction") + "#ai-batch")
 
 
 @app.post("/ai/analyze/<int:file_id>")

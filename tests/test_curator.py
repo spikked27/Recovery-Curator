@@ -367,6 +367,40 @@ class CuratorTests(unittest.TestCase):
             self.assertIn("idx_files_media_origin", indexes)
             self.assertEqual(tuple(migrated), ("video", "unknown", "Videos"))
 
+    def test_existing_reconstruction_tables_migrate_before_new_indexes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            db_path = config / "catalog.sqlite3"
+            with connect(db_path) as db:
+                db.execute(
+                    """CREATE TABLE reconstruction_proposals(
+                         file_id INTEGER PRIMARY KEY,proposed_path TEXT NOT NULL,
+                         confidence INTEGER NOT NULL DEFAULT 0,basis TEXT NOT NULL,
+                         reason TEXT,status TEXT NOT NULL DEFAULT 'proposed',updated_at TEXT NOT NULL
+                       )"""
+                )
+                db.execute(
+                    """CREATE TABLE recovery_context(
+                         id INTEGER PRIMARY KEY,context_type TEXT NOT NULL,label TEXT NOT NULL,
+                         details TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL
+                       )"""
+                )
+                db.commit()
+
+            Curator(source, output, quarantine, db_path)
+            with connect(db_path) as db:
+                proposal_columns = {row[1] for row in db.execute("PRAGMA table_info(reconstruction_proposals)")}
+                context_columns = {row[1] for row in db.execute("PRAGMA table_info(recovery_context)")}
+                indexes = {row[1] for row in db.execute("PRAGMA index_list(reconstruction_proposals)")}
+            self.assertTrue({"review_state", "user_path", "review_note", "reviewed_at"} <= proposal_columns)
+            self.assertTrue({"match_text", "destination"} <= context_columns)
+            self.assertIn("idx_reconstruction_review", indexes)
+
     def test_video_metadata_and_discovered_folder_reconstruction(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -476,6 +510,116 @@ class CuratorTests(unittest.TestCase):
             curator.answer_review_question(question_id, "It came from my old laptop.")
             self.assertEqual(curator.list_review_questions(), [])
             self.assertEqual(len(curator.list_recovery_context()), 2)
+
+    def test_folder_feedback_context_rules_and_facets_change_reconstruction(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            noise = source / "Recovered Files"
+            private = source / "Private Shots"
+            system = source / "System Cache"
+            for directory in (noise, private, system):
+                directory.mkdir()
+            Image.new("RGB", (32, 32), (20, 40, 60)).save(noise / "snapsave-trip.png")
+            Image.new("RGB", (32, 32), (80, 20, 40)).save(private / "private.png")
+            (system / "cache.bin").write_bytes(b"application cache")
+            Image.new("RGB", (32, 32), (10, 10, 10)).save(source / "space.png")
+
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+            curator.scan()
+            curator.build_reconstruction_foundation()
+            noise_folder = curator.list_folder_context("Recovered Files")[0]
+            private_folder = curator.list_folder_context("Private Shots")[0]
+            system_folder = curator.list_folder_context("System Cache")[0]
+            curator.review_folder_context(noise_folder["directory_id"], "noise")
+            curator.review_folder_context(private_folder["directory_id"], "private", "Personal")
+            curator.review_folder_context(system_folder["directory_id"], "system")
+            curator.add_recovery_context(
+                "application", "SnapSave exports", "Saved Snapchat media",
+                "snapsave", "Media/Photos/Snapchat",
+            )
+            space = next(item for item in curator.list_files() if item["name"] == "space.png")
+            curator.set_file_facet(space["id"], "topic", "NASA")
+            with connect(config / "catalog.sqlite3") as db:
+                curator._build_reconstruction_proposals(db)
+                db.commit()
+
+            proposals = {item["name"]: item for item in curator.list_reconstruction_proposals(limit=100)}
+            self.assertTrue(proposals["snapsave-trip.png"]["effective_path"].startswith("Media/Photos/Snapchat/"))
+            self.assertTrue(proposals["private.png"]["effective_path"].startswith("Private/Recovered Structure/Personal/"))
+            self.assertEqual(proposals["cache.bin"]["status"], "excluded_system")
+            self.assertIn("NASA", proposals["space.png"]["effective_path"])
+
+    def test_reconstruction_review_dry_run_and_export_are_safety_gated(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            recovered = source / "report.txt"
+            recovered.write_text("important recovered document", encoding="utf-8")
+            curator = Curator(
+                source, output, quarantine, config / "catalog.sqlite3", allow_actions=True,
+            )
+            curator.scan()
+            curator.build_reconstruction_foundation()
+            proposal = curator.list_reconstruction_proposals()[0]
+            curator.review_reconstruction_proposal(
+                proposal["file_id"], "accepted", "Recovered Documents/report.txt", "verified",
+            )
+
+            unauthorized = curator.reconstruction_export_preview()
+            self.assertFalse(unauthorized["authorized"])
+            authorized = curator.reconstruction_export_preview(authorize=True)
+            self.assertTrue(authorized["authorized"])
+            self.assertEqual(authorized["ready"], 1)
+            result = curator.export_reconstruction(authorized["token"])
+            self.assertEqual(result["exported"], 1)
+            self.assertEqual((output / "Recovered Documents" / "report.txt").read_text(), recovered.read_text())
+            self.assertFalse(curator.reconstruction_export_preview()["authorized"])
+
+    def test_ai_batch_candidates_use_one_exact_duplicate_representative(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            sample = source / "one.png"
+            Image.new("RGB", (32, 32), (50, 70, 90)).save(sample)
+            (source / "two.png").write_bytes(sample.read_bytes())
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+            curator.scan()
+            candidates = curator._ai_batch_candidates(limit=100)
+            self.assertEqual(len(candidates), 1)
+            curator.save_ai_provider_settings({
+                "provider_name": "Local vision", "endpoint": "http://ollama:11434",
+                "model": "vision", "enabled": True, "allow_cloud_media": False,
+                "allow_sensitive_media": False,
+            })
+            ai_result = {
+                "caption": "A space image", "origin": "downloaded", "sensitivity": "normal",
+                "topics": ["NASA"], "people_labels": [], "confidence": 91,
+                "reason": "visual evidence", "questions": [],
+            }
+            with patch("app.ai.AIProviderClient.analyze_media", return_value=ai_result):
+                curator.analyze_file_with_ai(candidates[0])
+            with connect(config / "catalog.sqlite3") as db:
+                analyzed = db.execute(
+                    "SELECT COUNT(*) FROM files WHERE ai_updated_at IS NOT NULL AND media_origin='downloaded'"
+                ).fetchone()[0]
+                topic_facets = db.execute(
+                    "SELECT COUNT(*) FROM file_facets WHERE facet_type='topic' AND value='NASA'"
+                ).fetchone()[0]
+            self.assertEqual(analyzed, 2)
+            self.assertEqual(topic_facets, 2)
 
 
 if __name__ == "__main__":

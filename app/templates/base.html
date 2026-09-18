@@ -5,33 +5,57 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>{% block title %}Recovery Curator{% endblock %}</title>
   <style>
-    :root { color-scheme: dark; --bg:#101418; --panel:#182028; --muted:#94a3b8; --line:#2b3947; --accent:#4ade80; --warn:#fbbf24; --bad:#fb7185; }
-    * { box-sizing:border-box } body { margin:0; font:15px/1.45 system-ui,sans-serif; background:var(--bg); color:#e5edf5 }
-    header { padding:18px 24px; border-bottom:1px solid var(--line); display:flex; gap:24px; align-items:center; flex-wrap:wrap }
-    header h1 { font-size:20px; margin:0 } nav a { color:#b9c8d8; margin-right:18px; text-decoration:none } nav a:hover { color:white }
-    main { max-width:1500px; margin:auto; padding:24px } .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(190px,1fr)); gap:14px }
-    .card,.group { background:var(--panel); border:1px solid var(--line); border-radius:12px; padding:16px } .metric { font-size:28px; font-weight:700 }
+    :root { color-scheme:dark; --bg:#0b1117; --panel:#131c25; --panel-2:#0f1820; --muted:#91a3b7; --line:#263646; --accent:#4ade80; --warn:#fbbf24; --bad:#fb7185; --blue:#3b82f6; }
+    * { box-sizing:border-box } html { scroll-behavior:smooth } body { margin:0; font:15px/1.5 Inter,ui-sans-serif,system-ui,sans-serif; background:linear-gradient(180deg,#0b1117 0,#0e151c 420px); color:#e7eef6 }
+    .topbar { height:62px; padding:0 max(18px,calc((100vw - 1500px)/2)); border-bottom:1px solid var(--line); background:rgba(11,17,23,.96); backdrop-filter:blur(12px); display:flex; gap:22px; align-items:center; flex-wrap:nowrap; position:sticky; top:0; z-index:20 }
+    .brand { display:flex; align-items:center; gap:10px; color:white; text-decoration:none; flex:0 0 auto; font-weight:750; letter-spacing:-.02em }
+    .brand-mark { display:grid; place-items:center; width:30px; height:30px; border-radius:9px; background:linear-gradient(135deg,#2563eb,#4ade80); color:#061019; font-size:12px; font-weight:900 }
+    nav { display:flex; gap:4px; min-width:0; overflow-x:auto; scrollbar-width:none; white-space:nowrap; flex:1 }
+    nav::-webkit-scrollbar { display:none } nav a { color:#aebfd0; padding:7px 10px; border-radius:8px; text-decoration:none; font-size:13px; font-weight:600 }
+    nav a:hover { color:white; background:#172331 } nav a.active { color:white; background:#213247; box-shadow:inset 0 0 0 1px #30465d }
+    main { max-width:1500px; margin:auto; padding:26px 24px 60px } main>section+section { margin-top:18px }
+    .grid,.metric-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(150px,1fr)); gap:12px }
+    .card,.group { background:linear-gradient(180deg,var(--panel),#111a22); border:1px solid var(--line); border-radius:14px; padding:18px; box-shadow:0 10px 30px rgba(0,0,0,.12) } .metric { font-size:27px; font-weight:750; letter-spacing:-.03em }
     .muted { color:var(--muted) } .good { color:var(--accent) } .warn { color:var(--warn) } .bad { color:var(--bad) }
-    button,.button { background:#2563eb; color:white; border:0; border-radius:8px; padding:9px 13px; cursor:pointer; text-decoration:none; display:inline-block }
-    button.secondary,.button.secondary { background:#334155 } button.danger { background:#be123c }
+    a { color:#76a9ff } button,.button { background:#2563eb; color:white; border:1px solid transparent; border-radius:8px; padding:9px 13px; cursor:pointer; text-decoration:none; display:inline-block; font-weight:650 }
+    button.secondary,.button.secondary { background:#273749; border-color:#33475c } button.danger { background:#a9143d } button.ghost,.button.ghost { background:transparent; border-color:var(--line); color:#b9c8d8 }
     button:disabled { opacity:.45; cursor:not-allowed } form { display:inline }
-    input,select,textarea { background:#0f1720; color:#e5edf5; border:1px solid var(--line); border-radius:7px; padding:8px }
+    input,select,textarea { background:#0b131b; color:#e5edf5; border:1px solid #304356; border-radius:7px; padding:8px; min-width:0 }
+    input:focus,select:focus,textarea:focus { outline:2px solid rgba(59,130,246,.5); border-color:#4e8ce8 }
     textarea { min-height:70px; resize:vertical } label { display:inline-block; color:#cbd5e1 }
     .form-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(220px,1fr)); gap:12px; align-items:end }
     .form-grid label { display:flex; flex-direction:column; gap:5px }
     .scan-actions { display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-top:12px }
-    table { width:100%; border-collapse:collapse; margin-top:16px } th,td { text-align:left; border-bottom:1px solid var(--line); padding:9px; vertical-align:top }
+    table { width:100%; border-collapse:collapse; margin-top:16px } th,td { text-align:left; border-bottom:1px solid var(--line); padding:10px; vertical-align:top }
     th { color:#a8bbce; position:sticky; top:0; background:var(--panel) } .path { overflow-wrap:anywhere; max-width:580px }
     .thumb { width:180px; height:140px; object-fit:contain; background:#0b0e11; border-radius:8px }
     .thumb.sensitive { filter:blur(18px) }
     .items { display:grid; grid-template-columns:repeat(auto-fill,minmax(240px,1fr)); gap:12px; margin-top:12px }
     .item { padding:12px; background:#111820; border:1px solid var(--line); border-radius:10px } .recommended { border-color:var(--accent) }
     .pill { display:inline-block; padding:3px 8px; border-radius:999px; background:#2b3947; font-size:12px; margin:2px }
-    progress { width:100%; height:16px } .notice { border-left:4px solid var(--warn); padding:12px 16px; background:#2a2415; margin:14px 0 }
+    progress { width:100%; height:12px; accent-color:var(--blue) } .notice { border-left:4px solid var(--warn); padding:12px 16px; background:#2a2415; margin:14px 0 }.notice.good { border-color:var(--accent); background:#10251c }
+    code { background:#0a1219; border:1px solid #273746; border-radius:5px; padding:2px 5px; color:#c9e2fa }
+    h2,h3,h4 { letter-spacing:-.02em } h3 { margin:0 0 8px; font-size:20px } h4 { margin-bottom:8px }
+    .page-heading,.section-heading { display:flex; justify-content:space-between; align-items:flex-start; gap:18px; flex-wrap:wrap }.page-heading { margin-bottom:18px }.page-heading h2 { margin:2px 0 4px; font-size:30px }.page-heading p { margin:0; color:var(--muted) }
+    .eyebrow,.step-label { color:#79aaff; font-size:12px; text-transform:uppercase; letter-spacing:.11em; font-weight:800 }.safety-badge { border:1px solid #286544; background:#10291e; color:#6ee7a2; border-radius:999px; padding:6px 10px; font-size:12px; font-weight:750 }
+    .workflow-card { border-color:#304a66 }.workflow-steps { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; margin-bottom:18px }.workflow-steps a { display:flex; align-items:center; gap:8px; color:#c8d5e2; text-decoration:none; background:#0d151d; border:1px solid var(--line); padding:8px 10px; border-radius:10px }.workflow-steps strong { display:grid; place-items:center; width:24px; height:24px; border-radius:50%; background:#234164; color:#9cc5ff }.metric-grid.compact>div { background:#0e171f; border:1px solid #213242; border-radius:10px; padding:12px }.job-status { margin-top:16px }.job-status p { margin:8px 0 }
+    .stacked-form { display:block }.stacked-form>button { margin-top:10px }.full-label { display:flex; flex-direction:column; margin-top:10px }.check-row,.preset-row,.filter-bar { display:flex; gap:10px; align-items:end; flex-wrap:wrap; margin:12px 0 }.check-row label,.checkbox-label { display:flex; align-items:center; gap:6px }.check-row input,.checkbox-label input { min-width:auto }.filter-bar label { display:flex; flex-direction:column; gap:4px }.subcard { margin-top:16px; padding:15px; border:1px solid var(--line); border-radius:11px; background:var(--panel-2) }.inline-editor { display:grid; grid-template-columns:minmax(170px,1.25fr) minmax(150px,1fr) minmax(160px,1fr) auto; gap:7px }.table-wrap { overflow-x:auto }.empty-state { color:var(--muted); padding:24px; text-align:center; border:1px dashed #34475a; border-radius:10px }
+    .tree-grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(230px,1fr)); gap:8px; margin:14px 0 }.tree-branch { display:flex; flex-direction:column; background:#0d161e; border:1px solid var(--line); border-radius:9px; padding:10px }.tree-branch strong { overflow-wrap:anywhere }.proposal-list { display:grid; gap:10px; margin-top:14px }.proposal-card { display:grid; grid-template-columns:minmax(260px,.9fr) minmax(300px,1.2fr) minmax(260px,.9fr); gap:14px; padding:12px; background:#0e171f; border:1px solid var(--line); border-left:4px solid var(--warn); border-radius:10px }.proposal-card.accepted { border-left-color:var(--accent) }.proposal-card.excluded { border-left-color:var(--bad); opacity:.82 }.proposal-source { display:flex; gap:10px; min-width:0 }.proposal-source>div,.proposal-destination { display:flex; flex-direction:column; gap:3px; min-width:0 }.proposal-thumb { width:74px; height:64px; object-fit:cover; background:#080d12; border-radius:7px; flex:0 0 auto }.proposal-actions { display:grid; grid-template-columns:repeat(3,1fr); gap:6px; align-content:start }.proposal-actions input { grid-column:1/-1 }.compact-form,.confirm-form { display:flex; gap:8px; align-items:end; flex-wrap:wrap }.compact-form label,.confirm-form label { display:flex; flex-direction:column; gap:4px }.compact-form input { width:90px } details summary { cursor:pointer; color:#c7d7e7; margin-top:14px }
+    @media(max-width:1000px){.proposal-card{grid-template-columns:1fr 1fr}.proposal-actions{grid-column:1/-1}.inline-editor{grid-template-columns:1fr 1fr}.inline-editor button{width:max-content}}
+    @media(max-width:700px){.topbar{padding:0 12px;gap:10px}.brand span:last-child{display:none}nav a{padding:7px 8px}main{padding:18px 12px 40px}.workflow-steps span{display:none}.workflow-steps a{justify-content:center}.proposal-card{grid-template-columns:1fr}.proposal-actions{grid-column:auto}.inline-editor{grid-template-columns:1fr}.metric-grid{grid-template-columns:repeat(2,1fr)}.thumb{width:130px;height:100px}}
   </style>
 </head>
 <body>
-<header><h1>Recovery Curator</h1><nav><a href="/">Dashboard</a><a href="/scans">Saved scans</a><a href="/reconstruction">Reconstruction</a><a href="/groups/exact">Exact duplicates</a><a href="/groups/similar">Similar photos</a><a href="/files?known_good=1">Known-good matches</a><a href="/references">Known-good folders</a><a href="/files">Catalog</a></nav></header>
+<header class="topbar"><a class="brand" href="/"><span class="brand-mark">RC</span><span>Recovery Curator</span></a><nav aria-label="Primary">
+  <a class="{% if request.path=='/' %}active{% endif %}" href="/">Dashboard</a>
+  <a class="{% if request.path.startswith('/scans') %}active{% endif %}" href="/scans">Scans</a>
+  <a class="{% if request.path.startswith('/reconstruction') %}active{% endif %}" href="/reconstruction">Reconstruct</a>
+  <a class="{% if request.path=='/groups/exact' %}active{% endif %}" href="/groups/exact">Duplicates</a>
+  <a class="{% if request.path=='/groups/similar' %}active{% endif %}" href="/groups/similar">Similar</a>
+  <a class="{% if request.args.get('known_good')=='1' %}active{% endif %}" href="/files?known_good=1">Matches</a>
+  <a class="{% if request.path.startswith('/references') %}active{% endif %}" href="/references">Backups</a>
+  <a class="{% if request.path=='/files' and request.args.get('known_good')!='1' %}active{% endif %}" href="/files">Catalog</a>
+</nav></header>
 <main>{% block content %}{% endblock %}</main>
 </body>
 </html>

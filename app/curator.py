@@ -238,6 +238,10 @@ def initialize(db_path: Path) -> None:
               basis TEXT NOT NULL,
               reason TEXT,
               status TEXT NOT NULL DEFAULT 'proposed',
+              review_state TEXT NOT NULL DEFAULT 'pending',
+              user_path TEXT,
+              review_note TEXT,
+              reviewed_at TEXT,
               updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_reconstruction_status ON reconstruction_proposals(status);
@@ -260,6 +264,8 @@ def initialize(db_path: Path) -> None:
               context_type TEXT NOT NULL,
               label TEXT NOT NULL,
               details TEXT,
+              match_text TEXT,
+              destination TEXT,
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
@@ -326,9 +332,24 @@ def initialize(db_path: Path) -> None:
         for column, definition in migrations.items():
             if column not in existing_columns:
                 db.execute(f"ALTER TABLE files ADD COLUMN {column} {definition}")
+        proposal_columns = {row[1] for row in db.execute("PRAGMA table_info(reconstruction_proposals)")}
+        proposal_migrations = {
+            "review_state": "TEXT NOT NULL DEFAULT 'pending'",
+            "user_path": "TEXT",
+            "review_note": "TEXT",
+            "reviewed_at": "TEXT",
+        }
+        for column, definition in proposal_migrations.items():
+            if column not in proposal_columns:
+                db.execute(f"ALTER TABLE reconstruction_proposals ADD COLUMN {column} {definition}")
+        context_columns = {row[1] for row in db.execute("PRAGMA table_info(recovery_context)")}
+        for column in ("match_text", "destination"):
+            if column not in context_columns:
+                db.execute(f"ALTER TABLE recovery_context ADD COLUMN {column} TEXT")
         db.execute("CREATE INDEX IF NOT EXISTS idx_files_known_good ON files(known_good_match)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_files_media_kind ON files(media_kind)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_files_media_origin ON files(media_origin)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_reconstruction_review ON reconstruction_proposals(review_state)")
         video_extensions = tuple(sorted(VIDEO_EXTENSIONS))
         placeholders = ",".join("?" for _ in video_extensions)
         db.execute(
@@ -1729,21 +1750,64 @@ class Curator:
     def _clean_relative_path(value: str) -> str:
         return str(Path(*(sanitize_component(part) for part in PurePosixPath(value).parts if part not in ("", "."))))
 
+    def start_reconstruction_plan_refresh(self) -> bool:
+        """Rebuild only the proposal layer after user/AI feedback changes."""
+        with self.lock:
+            if self.state["running"]:
+                return False
+            self.state.update(
+                running=True, phase="reconstruction_plan", processed=0, total=0, rate=0.0,
+                message="Applying folder reviews, context rules, and classifications", error=None,
+            )
+        self.stop_event.clear()
+        threading.Thread(target=self._reconstruction_plan_wrapper, daemon=True).start()
+        return True
+
+    def _reconstruction_plan_wrapper(self) -> None:
+        try:
+            with connect(self.db_path) as db:
+                self._build_reconstruction_proposals(db)
+                db.commit()
+            self.export_reconstruction_catalogs()
+            result = self.reconstruction_summary()
+            self._set_state(
+                running=False, phase="complete",
+                message=f"Feedback applied — {result['proposals']:,} proposals refreshed",
+                error=None,
+            )
+        except ScanCancelled as exc:
+            self._set_state(running=False, phase="stopped", message=str(exc), error=None)
+        except Exception as exc:
+            self._set_state(running=False, phase="failed", message="Plan refresh failed", error=str(exc))
+
     def _build_reconstruction_proposals(self, db: sqlite3.Connection) -> None:
         total = db.execute("SELECT COUNT(*) FROM files").fetchone()[0]
-        self._begin_phase("reconstruction_plan", total, "Building non-destructive destination proposals")
+        self._begin_phase("reconstruction_plan", total, "Applying feedback and building destination proposals")
         known_good: dict[int, tuple[str, str]] = {}
         for row in db.execute(
             """SELECT file_id,library,relative_path FROM known_good_matches
                ORDER BY file_id,LENGTH(relative_path),relative_path"""
         ):
             known_good.setdefault(row["file_id"], (row["library"], row["relative_path"]))
-        recognized = [dict(row) for row in db.execute(
-            """SELECT relative_path,COALESCE(NULLIF(user_label,''),name) label
-               FROM folder_context WHERE review_status IN ('recognized','private')
+        folder_reviews = {row["relative_path"]: dict(row) for row in db.execute(
+            """SELECT relative_path,COALESCE(NULLIF(user_label,''),name) label,review_status,notes
+               FROM folder_context WHERE review_status!='unreviewed'
                ORDER BY LENGTH(relative_path) DESC"""
+        )}
+        context_rules = [dict(row) for row in db.execute(
+            """SELECT context_type,label,details,match_text,destination FROM recovery_context
+               WHERE COALESCE(TRIM(match_text),'')!='' AND COALESCE(TRIM(destination),'')!=''
+               ORDER BY id"""
         )]
-        db.execute("DELETE FROM reconstruction_proposals")
+        facets: dict[int, dict[str, dict]] = defaultdict(dict)
+        for item in db.execute(
+            """SELECT file_id,facet_type,value,confidence,source FROM file_facets
+               WHERE facet_type IN ('origin','sensitivity','topic','person','event','application')
+               ORDER BY file_id,
+                        CASE WHEN source='user' THEN 0 WHEN source LIKE 'ai:%' THEN 1 ELSE 2 END,
+                        confidence DESC"""
+        ):
+            facets[item["file_id"]].setdefault(item["facet_type"], dict(item))
         processed = 0
         cursor = db.execute(
             """SELECT id,relative_path,name,size,media_kind,media_origin,sensitivity,
@@ -1772,62 +1836,120 @@ class Curator:
                         "evidence_only",
                     )
                 else:
-                    matched_context = next(
-                        (
-                            item for item in recognized
-                            if row["relative_path"] == item["relative_path"]
-                            or row["relative_path"].startswith(item["relative_path"] + "/")
-                        ),
+                    matching_folders = []
+                    parent = PurePosixPath(row["relative_path"]).parent
+                    while str(parent) not in ("", ".", "/"):
+                        reviewed = folder_reviews.get(str(parent))
+                        if reviewed:
+                            matching_folders.append(reviewed)
+                        parent = parent.parent
+                    system_context = next((item for item in matching_folders if item["review_status"] == "system"), None)
+                    private_context = next((item for item in matching_folders if item["review_status"] == "private"), None)
+                    recognized_context = next((item for item in matching_folders if item["review_status"] == "recognized"), None)
+                    noise_context = next((item for item in matching_folders if item["review_status"] == "noise"), None)
+                    path_text = row["relative_path"].casefold()
+                    context_rule = next(
+                        (item for item in context_rules if item["match_text"].strip().casefold() in path_text),
                         None,
                     )
-                    if matched_context:
-                        suffix = row["relative_path"][len(matched_context["relative_path"]):].lstrip("/") or row["name"]
+                    if system_context:
                         proposed = self._clean_relative_path(
-                            str(Path("Recovered Structure") / sanitize_component(matched_context["label"]) / suffix)
+                            str(Path("Excluded") / "System and Application Files" / row["relative_path"])
+                        )
+                        basis, confidence, reason, status = (
+                            "system_folder", 100,
+                            f"inside folder marked system/application: {system_context['label']}",
+                            "excluded_system",
+                        )
+                    elif context_rule:
+                        proposed = self._clean_relative_path(
+                            str(Path(context_rule["destination"]) / row["name"])
                         )
                         basis, confidence, reason = (
-                            "recognized_folder", 92, "user-recognized surviving folder hierarchy",
+                            "user_context_rule", 96,
+                            f"matched user context rule: {context_rule['label']}",
+                        )
+                    elif recognized_context or private_context:
+                        matched_context = recognized_context or private_context
+                        suffix = row["relative_path"][len(matched_context["relative_path"]):].lstrip("/") or row["name"]
+                        prefix = Path("Private") if private_context else Path()
+                        proposed = self._clean_relative_path(
+                            str(prefix / "Recovered Structure" / sanitize_component(matched_context["label"]) / suffix)
+                        )
+                        basis, confidence, reason = (
+                            "private_folder" if private_context else "recognized_folder", 94,
+                            "user-recognized private hierarchy" if private_context else "user-recognized surviving folder hierarchy",
                         )
                     else:
                         media = row["media_kind"] or "other"
+                        file_facets = facets.get(file_id, {})
+                        origin = file_facets.get("origin", {}).get("value") or row["media_origin"]
+                        sensitivity = file_facets.get("sensitivity", {}).get("value") or row["sensitivity"]
                         base_names = {
                             "photo": "Photos", "video": "Videos", "audio": "Audio",
                             "document": "Documents", "email": "Email", "other": "Other Files",
                         }
-                        pieces = ["Media" if media in {"photo", "video", "audio"} else "Files", base_names.get(media, "Other Files")]
-                        if row["media_origin"] and row["media_origin"] != "unknown":
-                            pieces.append(sanitize_component(row["media_origin"].replace("_", " ").title()))
+                        pieces = []
+                        if sensitivity in {"adult", "intimate", "possibly_sensitive"}:
+                            pieces.append("Private")
+                        pieces.extend(["Media" if media in {"photo", "video", "audio"} else "Files", base_names.get(media, "Other Files")])
+                        if origin and origin != "unknown":
+                            pieces.append(sanitize_component(origin.replace("_", " ").title()))
+                        for facet_type in ("event", "topic", "application"):
+                            value = file_facets.get(facet_type, {}).get("value")
+                            if value:
+                                pieces.append(sanitize_component(value))
+                                break
                         date_text = row["exif_date"] or row["video_creation_date"] or row["filename_date"]
                         if date_text:
                             pieces.extend(date_text[:7].split("-"))
                             confidence = 82 if (row["exif_date"] or row["video_creation_date"]) else 74
-                            reason = "media type, origin, and strongest available capture date"
+                            reason = "media type, origin, classification, and strongest available capture date"
                         else:
                             pieces.append("Unknown Date")
                             confidence = 45
-                            reason = "media type and origin; no reliable capture date"
+                            reason = "media type, origin, and classification; no reliable capture date"
+                        if noise_context:
+                            reason += f"; ignored recovery-generated folder {noise_context['label']}"
                         pieces.append(row["name"])
                         proposed = self._clean_relative_path(str(Path(*pieces)))
-                        basis = "metadata_fallback"
-                    if row["decision"] == "reject":
-                        status = "excluded"
-                    elif row["validation"] in {"corrupt", "unreadable"}:
-                        status = "needs_review"
-                    elif row["decision"] == "undecided" and (row["exact_group"] or row["similar_group"]):
-                        status = "duplicate_review"
-                    else:
-                        status = "proposed"
+                        basis = "noise_removed" if noise_context else "metadata_fallback"
+                    if not system_context:
+                        if row["decision"] == "reject":
+                            status = "excluded"
+                        elif row["validation"] in {"corrupt", "unreadable"}:
+                            status = "needs_review"
+                        elif row["decision"] == "undecided" and (row["exact_group"] or row["similar_group"]):
+                            status = "duplicate_review"
+                        else:
+                            status = "proposed"
                 proposals.append((file_id, proposed, confidence, basis, reason, status, utcnow()))
             db.executemany(
                 """INSERT INTO reconstruction_proposals(
                      file_id,proposed_path,confidence,basis,reason,status,updated_at
-                   ) VALUES(?,?,?,?,?,?,?)""",
+                   ) VALUES(?,?,?,?,?,?,?)
+                   ON CONFLICT(file_id) DO UPDATE SET
+                     proposed_path=excluded.proposed_path,
+                     confidence=excluded.confidence,
+                     basis=excluded.basis,
+                     reason=excluded.reason,
+                     status=excluded.status,
+                     review_state=CASE
+                       WHEN reconstruction_proposals.proposed_path!=excluded.proposed_path
+                            AND reconstruction_proposals.user_path IS NULL THEN 'pending'
+                       ELSE reconstruction_proposals.review_state END,
+                     reviewed_at=CASE
+                       WHEN reconstruction_proposals.proposed_path!=excluded.proposed_path
+                            AND reconstruction_proposals.user_path IS NULL THEN NULL
+                       ELSE reconstruction_proposals.reviewed_at END,
+                     updated_at=excluded.updated_at""",
                 proposals,
             )
             db.commit()
             processed += len(rows)
             self._progress(processed, total)
             self._check_cancel()
+        db.execute("DELETE FROM reconstruction_proposals WHERE file_id NOT IN (SELECT id FROM files)")
 
     def reconstruction_summary(self) -> dict:
         with connect(self.db_path) as db:
@@ -1846,7 +1968,11 @@ class Curator:
                      (SELECT COUNT(*) FROM known_good_matches) known_good_path_matches,
                      (SELECT COUNT(*) FROM files WHERE media_kind='video') videos,
                      (SELECT COUNT(*) FROM files WHERE media_kind='video' AND COALESCE(video_analysis_version,0)<?) pending_videos,
-                     (SELECT COUNT(*) FROM recovery_context) context_items""",
+                     (SELECT COUNT(*) FROM recovery_context) context_items,
+                     (SELECT COUNT(*) FROM reconstruction_proposals WHERE review_state='accepted') accepted_proposals,
+                     (SELECT COUNT(*) FROM reconstruction_proposals WHERE review_state='pending') pending_proposals,
+                     (SELECT COUNT(*) FROM reconstruction_proposals WHERE review_state='excluded') excluded_proposals,
+                     (SELECT COUNT(*) FROM files WHERE media_kind IN ('photo','video') AND size>0 AND ai_updated_at IS NULL) ai_pending""",
                 (VIDEO_ANALYSIS_VERSION,),
             ).fetchone()
         result = dict(row)
@@ -1884,18 +2010,29 @@ class Curator:
             )
             db.commit()
 
-    def add_recovery_context(self, context_type: str, label: str, details: str = "") -> int:
+    def add_recovery_context(
+        self, context_type: str, label: str, details: str = "",
+        match_text: str = "", destination: str = "",
+    ) -> int:
         allowed = {"person", "device", "event", "application", "folder", "privacy", "general"}
         if context_type not in allowed:
             raise ValueError("invalid recovery context type")
         label = label.strip()[:150]
         if not label:
             raise ValueError("context label is required")
+        match_text = match_text.strip()[:300]
+        destination = self._clean_relative_path(destination.strip())[:500] if destination.strip() else ""
+        if bool(match_text) != bool(destination):
+            raise ValueError("A path match and destination are both required to create an automatic rule.")
         with connect(self.db_path) as db:
             cursor = db.execute(
-                """INSERT INTO recovery_context(context_type,label,details,created_at,updated_at)
-                   VALUES(?,?,?,?,?)""",
-                (context_type, label, details.strip()[:4000] or None, utcnow(), utcnow()),
+                """INSERT INTO recovery_context(
+                     context_type,label,details,match_text,destination,created_at,updated_at
+                   ) VALUES(?,?,?,?,?,?,?)""",
+                (
+                    context_type, label, details.strip()[:4000] or None,
+                    match_text or None, destination or None, utcnow(), utcnow(),
+                ),
             )
             db.commit()
             return int(cursor.lastrowid)
@@ -1906,15 +2043,223 @@ class Curator:
                 "SELECT * FROM recovery_context ORDER BY context_type,label"
             )]
 
-    def list_reconstruction_proposals(self, limit: int = 200) -> list[dict]:
+    def delete_recovery_context(self, context_id: int) -> None:
+        with connect(self.db_path) as db:
+            cursor = db.execute("DELETE FROM recovery_context WHERE id=?", (context_id,))
+            if cursor.rowcount == 0:
+                raise FileNotFoundError("context clue not found")
+            db.commit()
+
+    def list_reconstruction_proposals(
+        self, limit: int = 200, query: str | None = None, review_state: str | None = None,
+        status: str | None = None, basis: str | None = None,
+    ) -> list[dict]:
+        clauses, params = [], []
+        if query:
+            clauses.append(
+                "(lower(f.name) LIKE ? OR lower(f.relative_path) LIKE ? "
+                "OR lower(COALESCE(p.user_path,p.proposed_path)) LIKE ?)"
+            )
+            pattern = f"%{query.casefold()}%"
+            params.extend((pattern, pattern, pattern))
+        if review_state:
+            clauses.append("p.review_state=?")
+            params.append(review_state)
+        if status:
+            clauses.append("p.status=?")
+            params.append(status)
+        if basis:
+            clauses.append("p.basis=?")
+            params.append(basis)
+        where = " WHERE " + " AND ".join(clauses) if clauses else ""
+        params.append(max(1, min(int(limit), 1000)))
         with connect(self.db_path) as db:
             return [dict(row) for row in db.execute(
-                """SELECT p.*,f.name,f.relative_path,f.media_kind,f.media_origin,f.size
-                   FROM reconstruction_proposals p JOIN files f ON f.id=p.file_id
+                f"""SELECT p.*,COALESCE(p.user_path,p.proposed_path) effective_path,
+                            f.name,f.relative_path,f.media_kind,f.media_origin,f.sensitivity,
+                            f.size,f.validation,f.decision,f.exact_group,f.similar_group
+                   FROM reconstruction_proposals p JOIN files f ON f.id=p.file_id{where}
                    ORDER BY CASE p.status WHEN 'needs_review' THEN 0 WHEN 'duplicate_review' THEN 1 ELSE 2 END,
                             p.confidence ASC,f.id LIMIT ?""",
-                (max(1, min(int(limit), 1000)),),
+                params,
             )]
+
+    def proposal_filter_options(self) -> dict:
+        with connect(self.db_path) as db:
+            return {
+                "statuses": [row[0] for row in db.execute(
+                    "SELECT DISTINCT status FROM reconstruction_proposals ORDER BY status"
+                )],
+                "bases": [row[0] for row in db.execute(
+                    "SELECT DISTINCT basis FROM reconstruction_proposals ORDER BY basis"
+                )],
+            }
+
+    def review_reconstruction_proposal(
+        self, file_id: int, review_state: str, user_path: str = "", note: str = "",
+    ) -> None:
+        if review_state not in {"pending", "accepted", "excluded"}:
+            raise ValueError("invalid proposal review state")
+        cleaned = self._clean_relative_path(user_path.strip())[:1000] if user_path.strip() else None
+        if cleaned in {"", "."}:
+            cleaned = None
+        with connect(self.db_path) as db:
+            row = db.execute(
+                "SELECT proposed_path,status FROM reconstruction_proposals WHERE file_id=?", (file_id,)
+            ).fetchone()
+            if not row:
+                raise FileNotFoundError("reconstruction proposal not found")
+            if review_state == "accepted" and row["status"] != "proposed":
+                raise ValueError("Resolve the file's exclusion, corruption, or duplicate decision before accepting it.")
+            db.execute(
+                """UPDATE reconstruction_proposals
+                   SET review_state=?,user_path=?,review_note=?,reviewed_at=?,updated_at=? WHERE file_id=?""",
+                (review_state, cleaned, note.strip()[:1000] or None, utcnow(), utcnow(), file_id),
+            )
+            db.commit()
+
+    def bulk_accept_reconstruction(self, minimum_confidence: int = 85) -> int:
+        threshold = max(0, min(int(minimum_confidence), 100))
+        with connect(self.db_path) as db:
+            cursor = db.execute(
+                """UPDATE reconstruction_proposals SET review_state='accepted',reviewed_at=?,updated_at=?
+                   WHERE review_state='pending' AND status='proposed' AND confidence>=?""",
+                (utcnow(), utcnow(), threshold),
+            )
+            db.commit()
+            return max(0, cursor.rowcount)
+
+    def reconstruction_tree(self, limit: int = 100) -> list[dict]:
+        branches: dict[str, dict] = {}
+        with connect(self.db_path) as db:
+            rows = db.execute(
+                """SELECT COALESCE(p.user_path,p.proposed_path) path,p.review_state,p.status,p.confidence,f.size
+                   FROM reconstruction_proposals p JOIN files f ON f.id=p.file_id"""
+            )
+            for row in rows:
+                parts = PurePosixPath(row["path"]).parts
+                branch = "/".join(parts[:3]) if parts else "Other"
+                item = branches.setdefault(
+                    branch,
+                    {"path": branch, "files": 0, "bytes": 0, "accepted": 0, "pending": 0, "excluded": 0,
+                     "minimum_confidence": 100},
+                )
+                item["files"] += 1
+                item["bytes"] += int(row["size"] or 0)
+                state = row["review_state"] if row["review_state"] in {"accepted", "pending", "excluded"} else "pending"
+                item[state] += 1
+                item["minimum_confidence"] = min(item["minimum_confidence"], int(row["confidence"] or 0))
+        return sorted(branches.values(), key=lambda item: (-item["files"], item["path"]))[:limit]
+
+    def _current_reconstruction_export_preview(self) -> dict:
+        ready, blocked, unavailable, already_exported, collisions, total_bytes = 0, 0, 0, 0, 0, 0
+        signature = []
+        seen_destinations: set[str] = set()
+        with connect(self.db_path) as db:
+            rows = db.execute(
+                """SELECT p.file_id,p.status,p.review_state,p.proposed_path,p.user_path,p.updated_at,
+                          f.path,f.size,f.validation,f.exported_path
+                   FROM reconstruction_proposals p JOIN files f ON f.id=p.file_id
+                   WHERE p.review_state='accepted' ORDER BY p.file_id"""
+            ).fetchall()
+        for row in rows:
+            effective = row["user_path"] or row["proposed_path"]
+            signature.append((row["file_id"], effective, row["updated_at"]))
+            if row["exported_path"] and Path(row["exported_path"]).exists():
+                already_exported += 1
+                continue
+            if row["status"] != "proposed" or row["validation"] in {"zero", "corrupt", "unreadable"}:
+                blocked += 1
+                continue
+            if not Path(row["path"]).is_file():
+                unavailable += 1
+                continue
+            destination_key = effective.casefold()
+            destination = self.output / effective
+            if destination_key in seen_destinations or destination.exists():
+                collisions += 1
+            seen_destinations.add(destination_key)
+            ready += 1
+            total_bytes += int(row["size"] or 0)
+        token = blake3(json.dumps(signature, separators=(",", ":")).encode("utf-8")).hexdigest()
+        return {
+            "accepted": len(signature), "ready": ready, "blocked": blocked, "unavailable": unavailable,
+            "already_exported": already_exported, "collisions": collisions, "bytes": total_bytes,
+            "bytes_human": human_bytes(total_bytes), "token": token,
+        }
+
+    def reconstruction_export_preview(self, authorize: bool = False) -> dict:
+        preview = self._current_reconstruction_export_preview()
+        with connect(self.db_path) as db:
+            if authorize:
+                db.execute(
+                    "INSERT OR REPLACE INTO settings(key,value) VALUES('reconstruction_export_token',?)",
+                    (preview["token"],),
+                )
+                db.commit()
+            stored = db.execute(
+                "SELECT value FROM settings WHERE key='reconstruction_export_token'"
+            ).fetchone()
+        preview["authorized"] = bool(stored and stored["value"] == preview["token"])
+        return preview
+
+    def export_reconstruction(self, token: str) -> dict:
+        if not self.allow_actions:
+            raise PermissionError("Actions are disabled. Set ALLOW_ACTIONS=true before exporting.")
+        preview = self.reconstruction_export_preview(authorize=False)
+        if not preview["authorized"] or not token or token != preview["token"]:
+            raise RuntimeError("The plan changed or has not been previewed. Generate a fresh dry run first.")
+        exported, failed, skipped = 0, 0, 0
+        with connect(self.db_path) as db:
+            rows = db.execute(
+                """SELECT p.*,COALESCE(p.user_path,p.proposed_path) effective_path,f.*
+                   FROM reconstruction_proposals p JOIN files f ON f.id=p.file_id
+                   WHERE p.review_state='accepted' ORDER BY p.file_id"""
+            ).fetchall()
+            for row in rows:
+                if row["status"] != "proposed" or row["validation"] in {"zero", "corrupt", "unreadable"}:
+                    skipped += 1
+                    continue
+                if row["exported_path"] and Path(row["exported_path"]).exists():
+                    skipped += 1
+                    continue
+                source = Path(row["path"])
+                if not source.is_file():
+                    skipped += 1
+                    continue
+                destination = self._safe_destination(self.output, row["effective_path"])
+                try:
+                    shutil.copy2(source, destination)
+                    metadata_fixed = False
+                    if row["is_image"] and not row["exif_date"] and row["filename_date"] and row["date_confidence"] >= 85:
+                        metadata_fixed = apply_date_metadata(destination, row["filename_date"])
+                    self._normalize_output_file(destination)
+                    db.execute("UPDATE files SET exported_path=? WHERE id=?", (str(destination), row["file_id"]))
+                    db.execute(
+                        """INSERT INTO actions(
+                             created_at,action,file_id,source_path,destination_path,status,detail
+                           ) VALUES(?,?,?,?,?,'complete',?)""",
+                        (
+                            utcnow(), "reconstruction_export", row["file_id"], str(source), str(destination),
+                            "filename date applied" if metadata_fixed else "accepted reconstruction proposal",
+                        ),
+                    )
+                    exported += 1
+                except Exception as exc:
+                    failed += 1
+                    db.execute(
+                        """INSERT INTO actions(
+                             created_at,action,file_id,source_path,destination_path,status,detail
+                           ) VALUES(?,?,?,?,?,'failed',?)""",
+                        (utcnow(), "reconstruction_export", row["file_id"], str(source), str(destination), str(exc)[:500]),
+                    )
+                if (exported + failed) % 50 == 0:
+                    db.commit()
+            db.execute("DELETE FROM settings WHERE key='reconstruction_export_token'")
+            db.commit()
+        self.export_catalog(self.output)
+        self.export_reconstruction_catalogs(self.output)
+        return {"exported": exported, "failed": failed, "skipped": skipped}
 
     def set_file_facet(self, file_id: int, facet_type: str, value: str, reason: str = "") -> None:
         allowed = {"origin", "sensitivity", "topic", "person", "event", "application", "media_type"}
@@ -2052,6 +2397,18 @@ class Curator:
                     json.dumps(result, ensure_ascii=False), config.model, utcnow(), file_id,
                 ),
             )
+            origin = str(result.get("origin") or "").strip()[:150]
+            sensitivity = str(result.get("sensitivity") or "").strip()[:150]
+            if origin and origin != "unknown" and confidence >= 60:
+                db.execute(
+                    "UPDATE files SET media_origin=? WHERE id=? AND media_origin='unknown'",
+                    (origin, file_id),
+                )
+            if sensitivity and sensitivity != "unknown" and confidence >= 60:
+                db.execute(
+                    "UPDATE files SET sensitivity=? WHERE id=? AND sensitivity='unknown'",
+                    (sensitivity, file_id),
+                )
             db.execute(
                 """UPDATE ai_runs SET status='complete',response_json=?,completed_at=? WHERE id=?""",
                 (json.dumps(result, ensure_ascii=False), utcnow(), run_id),
@@ -2066,8 +2423,151 @@ class Curator:
                            ) VALUES(?,? ,?,'open',?,?)""",
                         (file_id, source, text, utcnow(), utcnow()),
                     )
+            exact_group = db.execute("SELECT exact_group FROM files WHERE id=?", (file_id,)).fetchone()[0]
+            if exact_group:
+                duplicate_ids = [row[0] for row in db.execute(
+                    "SELECT id FROM files WHERE exact_group=? AND id!=?", (exact_group, file_id)
+                )]
+                for duplicate_id in duplicate_ids:
+                    db.execute("DELETE FROM file_facets WHERE file_id=? AND source=?", (duplicate_id, source))
+                    if facets:
+                        db.executemany(
+                            """INSERT OR REPLACE INTO file_facets(
+                                 file_id,facet_type,value,confidence,source,reason,updated_at
+                               ) VALUES(?,?,?,?,?,?,?)""",
+                            [
+                                (duplicate_id, facet_type, value, facet_confidence, facet_source, reason, updated_at)
+                                for _, facet_type, value, facet_confidence, facet_source, reason, updated_at in facets
+                            ],
+                        )
+                    db.execute(
+                        """UPDATE files SET ai_caption=?,ai_people=?,ai_objects=?,ai_tags=?,ai_model=?,ai_updated_at=?,
+                                  media_origin=CASE WHEN media_origin='unknown' AND ?!='unknown' THEN ? ELSE media_origin END,
+                                  sensitivity=CASE WHEN sensitivity='unknown' AND ?!='unknown' THEN ? ELSE sensitivity END
+                           WHERE id=?""",
+                        (
+                            str(result.get("caption") or "")[:4000] or None,
+                            json.dumps(people, ensure_ascii=False), json.dumps(topics, ensure_ascii=False),
+                            json.dumps(result, ensure_ascii=False), config.model, utcnow(),
+                            origin or "unknown", origin or "unknown",
+                            sensitivity or "unknown", sensitivity or "unknown", duplicate_id,
+                        ),
+                    )
             db.commit()
         return result
+
+    def _ai_batch_candidates(
+        self, media_kind: str = "all", pending_only: bool = True, uncertain_only: bool = True,
+        limit: int = 100,
+    ) -> list[int]:
+        if media_kind not in {"all", "photo", "video"}:
+            raise ValueError("invalid media type")
+        clauses = ["media_kind IN ('photo','video')", "size>0", "validation NOT IN ('zero','corrupt','unreadable')"]
+        params: list[object] = []
+        if media_kind != "all":
+            clauses.append("media_kind=?")
+            params.append(media_kind)
+        if pending_only:
+            clauses.append("ai_updated_at IS NULL")
+        if uncertain_only:
+            clauses.append("(media_origin='unknown' OR category_confidence<80 OR sensitivity='unknown')")
+        settings = self.ai_provider_settings()
+        if not settings.get("allow_sensitive_media"):
+            clauses.append("sensitivity NOT IN ('adult','intimate','possibly_sensitive')")
+        requested = max(1, min(int(limit), 5000))
+        candidates = []
+        seen_groups: set[str] = set()
+        with connect(self.db_path) as db:
+            rows = db.execute(
+                f"SELECT id,exact_group FROM files WHERE {' AND '.join(clauses)} ORDER BY id", params
+            )
+            for row in rows:
+                key = f"exact:{row['exact_group']}" if row["exact_group"] else f"file:{row['id']}"
+                if key in seen_groups:
+                    continue
+                seen_groups.add(key)
+                candidates.append(int(row["id"]))
+                if len(candidates) >= requested:
+                    break
+        return candidates
+
+    def ai_batch_candidate_count(
+        self, media_kind: str = "all", pending_only: bool = True, uncertain_only: bool = True,
+    ) -> int:
+        if media_kind not in {"all", "photo", "video"}:
+            raise ValueError("invalid media type")
+        clauses = ["media_kind IN ('photo','video')", "size>0", "validation NOT IN ('zero','corrupt','unreadable')"]
+        params: list[object] = []
+        if media_kind != "all":
+            clauses.append("media_kind=?")
+            params.append(media_kind)
+        if pending_only:
+            clauses.append("ai_updated_at IS NULL")
+        if uncertain_only:
+            clauses.append("(media_origin='unknown' OR category_confidence<80 OR sensitivity='unknown')")
+        if not self.ai_provider_settings().get("allow_sensitive_media"):
+            clauses.append("sensitivity NOT IN ('adult','intimate','possibly_sensitive')")
+        with connect(self.db_path) as db:
+            return int(db.execute(
+                f"""SELECT COUNT(DISTINCT CASE WHEN exact_group IS NOT NULL
+                          THEN 'exact:'||exact_group ELSE 'file:'||id END)
+                    FROM files WHERE {' AND '.join(clauses)}""",
+                params,
+            ).fetchone()[0])
+
+    def start_ai_batch(
+        self, media_kind: str = "all", pending_only: bool = True,
+        uncertain_only: bool = True, limit: int = 100,
+    ) -> int:
+        settings = self.ai_provider_settings()
+        if not settings.get("enabled"):
+            raise RuntimeError("Save and enable an AI provider before starting a batch.")
+        candidates = self._ai_batch_candidates(media_kind, pending_only, uncertain_only, limit)
+        if not candidates:
+            raise RuntimeError("No media matches the selected AI batch filters.")
+        with self.lock:
+            if self.state["running"]:
+                raise RuntimeError("Another scan or analysis job is already running.")
+            self.state.update(
+                running=True, phase="ai_batch", processed=0, total=len(candidates), rate=0.0,
+                message=f"Starting AI analysis for {len(candidates):,} representative files", error=None,
+            )
+        self.stop_event.clear()
+        threading.Thread(target=self._ai_batch_wrapper, args=(candidates,), daemon=True).start()
+        return len(candidates)
+
+    def _ai_batch_wrapper(self, candidates: list[int]) -> None:
+        completed = failed = 0
+        self.phase_started = time.monotonic()
+        try:
+            for file_id in candidates:
+                self._check_cancel()
+                try:
+                    self.analyze_file_with_ai(file_id)
+                    completed += 1
+                except Exception:
+                    failed += 1
+                processed = completed + failed
+                self._progress(
+                    processed, len(candidates),
+                    f"AI media analysis — {completed:,} complete, {failed:,} failed",
+                )
+            with connect(self.db_path) as db:
+                if db.execute("SELECT COUNT(*) FROM reconstruction_proposals").fetchone()[0]:
+                    self._build_reconstruction_proposals(db)
+                    db.commit()
+            self.export_reconstruction_catalogs()
+            self._set_state(
+                running=False, phase="complete", processed=len(candidates), total=len(candidates),
+                message=f"AI batch complete — {completed:,} analyzed, {failed:,} failed", error=None,
+            )
+        except ScanCancelled as exc:
+            self._set_state(
+                running=False, phase="stopped",
+                message=f"{exc} AI results already completed were kept.", error=None,
+            )
+        except Exception as exc:
+            self._set_state(running=False, phase="failed", message="AI batch failed", error=str(exc))
 
     def recent_ai_runs(self, limit: int = 25) -> list[dict]:
         with connect(self.db_path) as db:

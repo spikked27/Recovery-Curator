@@ -1,168 +1,191 @@
 {% extends "base.html" %}{% block title %}Reconstruction · Recovery Curator{% endblock %}{% block content %}
-<h2>Reconstruction</h2>
-<p>Builds a reviewable plan from the saved catalog. This analysis does not copy, move, rename, quarantine, or delete source files.</p>
+<div class="page-heading">
+  <div><span class="eyebrow">Recovery workspace</span><h2>Reconstruction</h2>
+    <p>Turn surviving structure, your memories, metadata, and optional AI suggestions into a plan you control.</p></div>
+  <span class="safety-badge">Source remains unchanged</span>
+</div>
 
-<section class="card">
-  <h3>Media enrichment and plan</h3>
-  <div class="grid">
-    <div><div class="metric">{{ reconstruction.proposals or 0 }}</div><div class="muted">destination proposals</div></div>
-    <div><div class="metric">{{ reconstruction.folder_suggestions or 0 }}</div><div class="muted">folder clues discovered</div></div>
-    <div><div class="metric">{{ reconstruction.reviewed_folders or 0 }}</div><div class="muted">folder clues reviewed</div></div>
-    <div><div class="metric">{{ reconstruction.relationships or 0 }}</div><div class="muted">placeholder relationships</div></div>
-    <div><div class="metric">{{ reconstruction.known_good_path_matches or 0 }}</div><div class="muted">known-good path relationships</div></div>
-    <div><div class="metric">{{ reconstruction.videos or 0 }}</div><div class="muted">videos</div></div>
-    <div><div class="metric warn">{{ reconstruction.pending_videos or 0 }}</div><div class="muted">videos awaiting FFprobe metadata</div></div>
+<section class="card workflow-card">
+  <div class="workflow-steps">
+    <a href="#folder-clues"><strong>1</strong><span>Teach</span></a>
+    <a href="#ai-provider"><strong>2</strong><span>Classify</span></a>
+    <a href="#proposed-tree"><strong>3</strong><span>Review</span></a>
+    <a href="#export-plan"><strong>4</strong><span>Export</span></a>
   </div>
-  <p id="reconstruction-message">{{ status.message }}{% if status.error %} — <span class="bad">{{ status.error }}</span>{% endif %}</p>
-  <progress id="reconstruction-progress" max="{{ status.total or 1 }}" value="{{ status.processed or 0 }}"></progress>
-  <p class="muted" id="reconstruction-detail">{{ status.phase }} — {{ status.processed }}/{{ status.total }} — {{ status.rate or 0 }} files/s</p>
+  <div class="metric-grid compact">
+    <div><div class="metric">{{ reconstruction.proposals or 0 }}</div><div class="muted">proposals</div></div>
+    <div><div class="metric good">{{ reconstruction.accepted_proposals or 0 }}</div><div class="muted">accepted</div></div>
+    <div><div class="metric warn">{{ reconstruction.pending_proposals or 0 }}</div><div class="muted">awaiting review</div></div>
+    <div><div class="metric">{{ reconstruction.reviewed_folders or 0 }}</div><div class="muted">folders taught</div></div>
+    <div><div class="metric">{{ reconstruction.ai_pending or 0 }}</div><div class="muted">media without AI</div></div>
+  </div>
+  <div class="job-status">
+    <p id="reconstruction-message"><strong>{{ status.message }}</strong>{% if status.error %} — <span class="bad">{{ status.error }}</span>{% endif %}</p>
+    <progress id="reconstruction-progress" max="{{ status.total or 1 }}" value="{{ status.processed or 0 }}"></progress>
+    <p class="muted" id="reconstruction-detail">{{ status.phase }} — {{ status.processed }}/{{ status.total }} — {{ status.rate or 0 }} files/s</p>
+  </div>
   <div class="scan-actions">
-    <form method="post" action="/reconstruction/start"><button id="start-reconstruction" {% if status.running %}disabled{% endif %}>Analyze media &amp; build plan</button></form>
-    <form id="cancel-reconstruction-form" method="post" action="/scan/stop"><button id="cancel-reconstruction" class="danger" {% if not status.running %}disabled{% endif %}>Cancel</button></form>
+    <form method="post" action="/reconstruction/start"><button id="start-reconstruction" {% if status.running %}disabled{% endif %}>Full media analysis</button></form>
+    <form method="post" action="/reconstruction/refresh"><button id="refresh-reconstruction" class="secondary" {% if status.running %}disabled{% endif %}>Apply feedback to plan</button></form>
+    <form id="cancel-reconstruction-form" method="post" action="/scan/stop"><button id="cancel-reconstruction" class="danger" {% if not status.running %}disabled{% endif %}>Cancel current job</button></form>
   </div>
-  <p class="muted">Run this again after recognizing folders or adding context. Completed video metadata is reused; only pending videos are probed.</p>
+  <p class="muted"><strong>Full media analysis</strong> enriches new media and rebuilds everything. <strong>Apply feedback</strong> is the fast option after reviewing folders, adding rules, or running AI.</p>
+</section>
+
+<section class="card" id="folder-clues">
+  <div class="section-heading"><div><span class="step-label">Step 1</span><h3>Teach Recovery Curator what you recognize</h3></div>
+    <form method="post" action="/reconstruction/refresh"><button class="secondary" {% if status.running %}disabled{% endif %}>Apply saved feedback</button></form></div>
+  <p>Folder reviews now directly affect the plan: useful folders are preserved, private folders go under <code>Private</code>, recovery noise is stripped away, and system/application branches are excluded.</p>
+  <form method="get" action="/reconstruction" class="filter-bar">
+    <label>Find a folder <input name="folder_q" value="{{ folder_query }}" placeholder="Name or surviving path"></label>
+    <button class="secondary">Search</button>{% if folder_query %}<a class="button ghost" href="/reconstruction#folder-clues">Clear</a>{% endif %}
+  </form>
+  {% if not folders %}<p class="empty-state">Run the full analysis to discover folder names.</p>{% endif %}
+  <div class="table-wrap"><table><tr><th>Folder found</th><th>Contents</th><th>What should it mean?</th></tr>
+  {% for folder in folders %}<tr>
+    <td class="path"><strong>{{ folder.name }}</strong><br><span class="muted">{{ folder.relative_path }}</span><br><span class="pill">score {{ '%.1f'|format(folder.suggestion_score) }}</span>{% if folder.zero_files %}<span class="pill warn">{{ folder.zero_files }} zero-byte clues</span>{% endif %}</td>
+    <td>{{ folder.descendant_files }} files<br><span class="muted">{{ folder.descendant_bytes|human_bytes }}</span></td>
+    <td><form method="post" action="/folders/review" class="inline-editor">
+      <input type="hidden" name="directory_id" value="{{ folder.directory_id }}">
+      <select name="review_status" aria-label="Folder meaning">
+        {% for value,label in [('unreviewed','Not reviewed'),('recognized','Useful — preserve it'),('private','Private — preserve separately'),('noise','Recovery noise — strip folder'),('system','System/app — exclude branch')] %}
+          <option value="{{ value }}" {% if folder.review_status == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+      <input name="user_label" value="{{ folder.user_label or '' }}" placeholder="Preferred name (optional)">
+      <input name="notes" value="{{ folder.notes or '' }}" placeholder="Memory or note (optional)">
+      <button class="secondary">Save</button>
+    </form></td>
+  </tr>{% endfor %}</table></div>
+</section>
+
+<section class="card" id="recovery-context">
+  <h3>Context clues and automatic path rules</h3>
+  <p>A clue helps the AI understand your library. Add both rule fields when a filename or surviving path should automatically map to a destination.</p>
+  <form method="post" action="/context/add" class="stacked-form">
+    <div class="form-grid">
+      <label>Clue type<select name="context_type"><option>device</option><option>event</option><option>application</option><option>person</option><option>folder</option><option>privacy</option><option>general</option></select></label>
+      <label>Short label<input name="label" required placeholder="SnapSave exports"></label>
+      <label>Match path/name containing <input name="match_text" placeholder="snapsave (optional)"></label>
+      <label>Put matching files under <input name="destination" placeholder="Media/Photos/Snapchat (optional)"></label>
+    </div>
+    <label class="full-label">Details<textarea name="details" placeholder="Dates, device names, people, events, or anything else the AI should know"></textarea></label>
+    <button>Save clue or rule</button>
+  </form>
+  {% if context_items %}<div class="table-wrap"><table><tr><th>Type</th><th>Clue</th><th>Automatic rule</th><th></th></tr>
+    {% for item in context_items %}<tr><td><span class="pill">{{ item.context_type }}</span></td><td><strong>{{ item.label }}</strong><br><span class="muted">{{ item.details or '' }}</span></td><td>{% if item.match_text %}<code>{{ item.match_text }}</code> → <code>{{ item.destination }}</code>{% else %}<span class="muted">AI context only</span>{% endif %}</td><td><form method="post" action="/context/{{ item.id }}/delete" onsubmit="return confirm('Remove this context clue?');"><button class="danger">Remove</button></form></td></tr>{% endfor %}
+  </table></div>{% endif %}
+</section>
+
+<section class="card" id="ai-provider">
+  <div class="section-heading"><div><span class="step-label">Step 2</span><h3>Connect a vision AI</h3></div><span class="pill {{ 'good' if ai_settings.enabled else 'warn' }}">{{ 'Enabled' if ai_settings.enabled else 'Not configured' }}</span></div>
+  <p>The provider receives only a reduced image preview or four-frame video contact sheet plus metadata and your saved clues. It never gets filesystem access or permission to move files.</p>
+  <div class="preset-row">
+    <button type="button" class="preset secondary" data-provider="Ollama" data-endpoint="http://YOUR-AI-SERVER:11434" data-model="llava">Ollama / local</button>
+    <button type="button" class="preset secondary" data-provider="LM Studio" data-endpoint="http://YOUR-AI-PC:1234" data-model="your-loaded-vision-model">LM Studio</button>
+    <button type="button" class="preset secondary" data-provider="OpenAI-compatible cloud" data-endpoint="https://api.openai.com" data-model="your-vision-model">Cloud API</button>
+  </div>
+  {% if ai_settings.endpoint and not ai_settings.is_local and not ai_settings.allow_cloud_media %}<div class="notice"><strong>Remote endpoint detected.</strong> Preview transmission is blocked until you opt in below.</div>{% endif %}
+  <form method="post" action="/ai/provider" class="stacked-form" id="ai-provider-form">
+    <div class="form-grid">
+      <label>Provider name<input id="provider-name" name="provider_name" value="{{ ai_settings.provider_name or 'Local AI' }}"></label>
+      <label>OpenAI-compatible endpoint<input id="provider-endpoint" name="endpoint" value="{{ ai_settings.endpoint or '' }}" placeholder="http://192.168.x.x:11434"></label>
+      <label>Vision model<input id="provider-model" name="model" value="{{ ai_settings.model or '' }}" placeholder="Model name exposed by the provider"></label>
+      <label>API-key environment variable<input name="api_key_env" value="{{ ai_settings.api_key_env or '' }}" placeholder="RECOVERY_AI_API_KEY"></label>
+    </div>
+    <div class="check-row">
+      <label><input type="checkbox" name="enabled" value="1" {% if ai_settings.enabled %}checked{% endif %}> Enable provider</label>
+      <label><input type="checkbox" name="allow_cloud_media" value="1" {% if ai_settings.allow_cloud_media %}checked{% endif %}> Allow previews to leave my network</label>
+      <label><input type="checkbox" name="allow_sensitive_media" value="1" {% if ai_settings.allow_sensitive_media %}checked{% endif %}> Include media already marked sensitive</label>
+    </div>
+    <button>Save provider</button>
+  </form>
+  <form method="post" action="/ai/test"><button class="secondary">Test connection (no media sent)</button></form>
+
+  <div class="subcard" id="ai-batch">
+    <h4>Batch classification</h4>
+    <p><strong>{{ ai_candidate_count }}</strong> representative files currently match the recommended filters. Exact duplicates reuse one AI result, reducing time and API cost.</p>
+    <form method="post" action="/ai/batch" class="filter-bar">
+      <label>Media<select name="media_kind"><option value="all">Photos and videos</option><option value="photo">Photos only</option><option value="video">Videos only</option></select></label>
+      <label>Maximum<select name="limit"><option>25</option><option selected>100</option><option>500</option><option>1000</option></select></label>
+      <label class="checkbox-label"><input type="checkbox" name="pending_only" value="1" checked> Skip previously analyzed</label>
+      <label class="checkbox-label"><input type="checkbox" name="uncertain_only" value="1" checked> Focus on uncertain media</label>
+      <button id="start-ai-batch" {% if status.running or not ai_settings.enabled %}disabled{% endif %}>Start AI batch</button>
+    </form>
+  </div>
+  {% if ai_runs %}<details><summary>Recent AI activity</summary><div class="table-wrap"><table><tr><th>File</th><th>Provider / model</th><th>Status</th><th>Error</th></tr>
+    {% for run in ai_runs %}<tr><td>{{ run.name or 'connection/job' }}</td><td>{{ run.provider_name }} / {{ run.model }}</td><td>{{ run.status }}</td><td>{{ run.error or '' }}</td></tr>{% endfor %}
+  </table></div></details>{% endif %}
+</section>
+
+{% if review_questions %}<section class="card" id="review-questions">
+  <h3>Questions from the AI</h3><p>Answers become context for later files; they are never silently treated as facts.</p>
+  <div class="items">{% for question in review_questions %}<article class="item">
+    {% if question.file_id and question.media_kind in ['photo','video'] %}<a href="/preview/{{ question.file_id }}" target="_blank"><img class="thumb {% if question.sensitivity in ['adult','intimate','possibly_sensitive'] %}sensitive{% endif %}" src="/preview/{{ question.file_id }}" loading="lazy"></a>{% endif %}
+    <p><strong>{{ question.question }}</strong></p>{% if question.name %}<p class="path muted">{{ question.name }}<br>{{ question.relative_path }}</p>{% endif %}
+    <form method="post" action="/questions/answer" class="stacked-form"><input type="hidden" name="question_id" value="{{ question.id }}"><textarea name="answer" placeholder="What do you recognize or remember?"></textarea><div><button>Save answer</button> <button class="secondary" name="dismiss" value="1">Dismiss</button></div></form>
+  </article>{% endfor %}</div>
+</section>{% endif %}
+
+<section class="card" id="proposed-tree">
+  <div class="section-heading"><div><span class="step-label">Step 3</span><h3>Review the proposed library</h3></div>
+    <form method="post" action="/reconstruction/proposals/accept-safe" class="compact-form"><label>Minimum confidence <input type="number" name="minimum_confidence" min="0" max="100" value="85"></label><button>Accept safe proposals</button></form></div>
+  <p>Accepting approves only a destination. Files with unresolved duplicate decisions, corruption, known-good coverage, zero-byte evidence, or excluded system branches cannot be accepted.</p>
+  {% if proposal_tree %}<div class="tree-grid">{% for branch in proposal_tree[:12] %}<div class="tree-branch"><strong>{{ branch.path }}</strong><span>{{ branch.files }} files · {{ branch.bytes|human_bytes }}</span><span class="muted">{{ branch.accepted }} accepted · {{ branch.pending }} pending</span></div>{% endfor %}</div>{% endif %}
+  <form method="get" action="/reconstruction" class="filter-bar">
+    <label>Search <input name="proposal_q" value="{{ proposal_query }}" placeholder="Source or proposed path"></label>
+    <label>Review<select name="review_state"><option value="">All</option>{% for value in ['pending','accepted','excluded'] %}<option value="{{ value }}" {% if selected_review_state==value %}selected{% endif %}>{{ value|title }}</option>{% endfor %}</select></label>
+    <label>File status<select name="status"><option value="">All</option>{% for value in proposal_options.statuses %}<option value="{{ value }}" {% if selected_status==value %}selected{% endif %}>{{ value|replace('_',' ')|title }}</option>{% endfor %}</select></label>
+    <label>Basis<select name="basis"><option value="">All</option>{% for value in proposal_options.bases %}<option value="{{ value }}" {% if selected_basis==value %}selected{% endif %}>{{ value|replace('_',' ')|title }}</option>{% endfor %}</select></label>
+    <button class="secondary">Filter</button><a class="button ghost" href="/reconstruction#proposed-tree">Clear</a>
+  </form>
+  {% if not proposals %}<p class="empty-state">No proposals match these filters.</p>{% endif %}
+  <div class="proposal-list">{% for item in proposals %}<article class="proposal-card {{ item.review_state }}">
+    <div class="proposal-source">{% if item.media_kind in ['photo','video'] and item.size %}<a href="/preview/{{ item.file_id }}" target="_blank"><img class="proposal-thumb {% if item.sensitivity in ['adult','intimate','possibly_sensitive'] %}sensitive{% endif %}" src="/preview/{{ item.file_id }}" loading="lazy"></a>{% endif %}<div><strong>{{ item.name }}</strong><span class="path muted">{{ item.relative_path }}</span><span>{{ item.size|human_bytes }} · {{ item.media_kind }} · {{ item.media_origin }}</span></div></div>
+    <div class="proposal-destination"><span class="muted">Proposed destination</span><strong class="path">{{ item.effective_path }}</strong><span>{{ item.confidence }}% · {{ item.basis|replace('_',' ') }} · {{ item.reason }}</span><span><span class="pill">{{ item.status|replace('_',' ') }}</span><span class="pill {{ 'good' if item.review_state=='accepted' else 'warn' if item.review_state=='pending' else 'bad' }}">{{ item.review_state }}</span></span></div>
+    <form method="post" action="/reconstruction/proposal/{{ item.file_id }}" class="proposal-actions">
+      <input name="user_path" value="{{ item.user_path or '' }}" placeholder="Optional destination override">
+      <input name="note" value="{{ item.review_note or '' }}" placeholder="Review note (optional)">
+      <button name="review_state" value="accepted" {% if item.status!='proposed' %}disabled title="Resolve this file status first"{% endif %}>Accept</button>
+      <button class="secondary" name="review_state" value="pending">Reset</button>
+      <button class="danger" name="review_state" value="excluded">Exclude</button>
+    </form>
+  </article>{% endfor %}</div>
+</section>
+
+<section class="card" id="export-plan">
+  <div class="section-heading"><div><span class="step-label">Step 4</span><h3>Dry run and export accepted files</h3></div><span class="safety-badge">Explicit confirmation required</span></div>
+  <div class="metric-grid compact">
+    <div><div class="metric">{{ export_preview.accepted }}</div><div class="muted">accepted</div></div>
+    <div><div class="metric good">{{ export_preview.ready }}</div><div class="muted">ready to copy</div></div>
+    <div><div class="metric warn">{{ export_preview.collisions }}</div><div class="muted">name collisions</div></div>
+    <div><div class="metric bad">{{ export_preview.blocked + export_preview.unavailable }}</div><div class="muted">blocked/unavailable</div></div>
+    <div><div class="metric">{{ export_preview.bytes_human }}</div><div class="muted">new data</div></div>
+  </div>
+  <p>Name collisions are preserved with a numbered suffix; existing output files are never overwritten. Already-exported files are skipped.</p>
+  <form method="post" action="/reconstruction/export/preview"><button>Generate fresh dry run</button></form>
+  {% if export_preview.authorized %}
+    <div class="notice good"><strong>Dry run is current.</strong> Any proposal change will invalidate it.</div>
+    {% if not summary.allow_actions %}<div class="notice"><strong>Export is still locked.</strong> Set <code>Allow Write Actions</code> to <code>true</code> in the Unraid container, then restart it. The source can remain read-only.</div>{% endif %}
+    <form method="post" action="/reconstruction/export" class="confirm-form" onsubmit="return confirm('Copy every accepted, ready file to the curated output? The source will not be changed.');">
+      <input type="hidden" name="token" value="{{ export_preview.token }}">
+      <label>Type <strong>EXPORT</strong> <input name="confirmation" required pattern="EXPORT" autocomplete="off"></label>
+      <button {% if not summary.allow_actions or not export_preview.ready %}disabled{% endif %}>Export accepted files</button>
+    </form>
+  {% else %}<p class="muted">Generate a dry run after your latest review before export becomes available.</p>{% endif %}
 </section>
 
 <script>
 const reconstructionMessage = document.getElementById('reconstruction-message');
 const reconstructionProgress = document.getElementById('reconstruction-progress');
 const reconstructionDetail = document.getElementById('reconstruction-detail');
-const startReconstruction = document.getElementById('start-reconstruction');
+const jobButtons = ['start-reconstruction','refresh-reconstruction','start-ai-batch'].map(id => document.getElementById(id)).filter(Boolean);
 const cancelReconstruction = document.getElementById('cancel-reconstruction');
-const cancelReconstructionForm = document.getElementById('cancel-reconstruction-form');
+const cancelForm = document.getElementById('cancel-reconstruction-form');
 let reconstructionWasRunning = {{ 'true' if status.running else 'false' }};
-
-cancelReconstructionForm.addEventListener('submit', () => {
-  cancelReconstruction.disabled = true;
-  cancelReconstruction.textContent = 'Cancellation requested…';
-  reconstructionMessage.textContent = 'Cancellation requested — finishing the current file batch…';
-});
-
-async function refreshReconstruction(){
-  try {
-    const response = await fetch('/api/status');
-    const data = await response.json();
-    const status = data.status;
-    reconstructionMessage.textContent = status.message + (status.error ? ' — ' + status.error : '');
-    reconstructionProgress.max = Math.max(status.total, 1);
-    reconstructionProgress.value = status.processed;
-    reconstructionDetail.textContent = `${status.phase} — ${status.processed}/${status.total} — ${status.rate || 0} files/s`;
-    startReconstruction.disabled = status.running;
-    cancelReconstruction.disabled = !status.running;
-    if (status.running) {
-      reconstructionWasRunning = true;
-      setTimeout(refreshReconstruction, 1500);
-    } else if (reconstructionWasRunning) {
-      window.location.reload();
-    }
-  } catch (error) {
-    reconstructionMessage.textContent = 'Unable to refresh reconstruction status — retrying…';
-    setTimeout(refreshReconstruction, 3000);
-  }
-}
+cancelForm.addEventListener('submit', () => { cancelReconstruction.disabled=true; cancelReconstruction.textContent='Cancellation requested…'; reconstructionMessage.textContent='Cancellation requested — finishing the current item…'; });
+async function refreshReconstruction(){try{const response=await fetch('/api/status');const data=await response.json();const s=data.status;reconstructionMessage.textContent=s.message+(s.error?' — '+s.error:'');reconstructionProgress.max=Math.max(s.total,1);reconstructionProgress.value=s.processed;reconstructionDetail.textContent=`${s.phase} — ${s.processed}/${s.total} — ${s.rate||0} files/s`;jobButtons.forEach(button=>button.disabled=s.running||(button.id==='start-ai-batch'&&!{{ 'true' if ai_settings.enabled else 'false' }}));cancelReconstruction.disabled=!s.running;if(s.running){reconstructionWasRunning=true;setTimeout(refreshReconstruction,1500)}else if(reconstructionWasRunning){window.location.reload()}}catch(error){reconstructionMessage.textContent='Unable to refresh status — retrying…';setTimeout(refreshReconstruction,3000)}}
 refreshReconstruction();
+document.querySelectorAll('.preset').forEach(button=>button.addEventListener('click',()=>{document.getElementById('provider-name').value=button.dataset.provider;document.getElementById('provider-endpoint').value=button.dataset.endpoint;document.getElementById('provider-model').value=button.dataset.model;document.getElementById('provider-endpoint').focus()}));
 </script>
-
-<section class="card" style="margin-top:18px">
-  <h3>Media inventory</h3>
-  <table><tr><th>Media type</th><th>Files</th><th>Size</th></tr>
-  {% for item in reconstruction.media %}<tr><td>{{ item.media_kind }}</td><td>{{ item.count }}</td><td>{{ item.bytes|human_bytes }}</td></tr>{% endfor %}
-  </table>
-</section>
-
-<section class="card" id="review-questions" style="margin-top:18px">
-  <h3>Questions from the recovery assistant</h3>
-  <p>Questions appear only when an answer would materially improve a classification or reconstruction decision. Your answers are saved as recovery context and can help with related files.</p>
-  {% if not review_questions %}<p class="muted">No unanswered questions.</p>{% endif %}
-  <div class="items">
-  {% for question in review_questions %}<article class="item">
-    {% if question.file_id and question.media_kind in ['photo','video'] %}<a href="/preview/{{ question.file_id }}" target="_blank"><img class="thumb {% if question.sensitivity in ['adult','intimate','possibly_sensitive'] %}sensitive{% endif %}" src="/preview/{{ question.file_id }}" loading="lazy"></a>{% endif %}
-    <p><strong>{{ question.question }}</strong></p>
-    {% if question.name %}<p class="path muted">Example: {{ question.name }}<br>{{ question.relative_path }}</p>{% endif %}
-    <form method="post" action="/questions/answer" style="display:block">
-      <input type="hidden" name="question_id" value="{{ question.id }}">
-      <textarea name="answer" style="width:100%" placeholder="What do you recognize or remember?"></textarea>
-      <button>Save answer</button>
-      <button class="secondary" name="dismiss" value="1">Dismiss</button>
-    </form>
-  </article>{% endfor %}
-  </div>
-</section>
-
-<section class="card" id="recovery-context" style="margin-top:18px">
-  <h3>Recovery context</h3>
-  <p>Add clues as they come back to you. These are supplied to the optional AI and retained as evidence for this saved scan.</p>
-  <form method="post" action="/context/add" style="display:block">
-    <div class="form-grid">
-      <label>Type<select name="context_type"><option>device</option><option>event</option><option>application</option><option>person</option><option>folder</option><option>privacy</option><option>general</option></select></label>
-      <label>Short label<input name="label" required placeholder="Samsung phone used 2014–2017"></label>
-      <label style="grid-column:span 2">Details<textarea name="details" placeholder="Anything that could help identify or group recovered files"></textarea></label>
-    </div>
-    <button>Save context clue</button>
-  </form>
-  {% if context_items %}<table><tr><th>Type</th><th>Label</th><th>Details</th></tr>
-    {% for item in context_items %}<tr><td>{{ item.context_type }}</td><td>{{ item.label }}</td><td>{{ item.details or '' }}</td></tr>{% endfor %}
-  </table>{% endif %}
-</section>
-
-<section class="card" id="folder-clues" style="margin-top:18px">
-  <h3>Folder names found in the recovery</h3>
-  <p>The list is generated from the surviving hierarchy, including empty and zero-byte-only branches. Recognize what you can; you do not need to remember names before seeing them.</p>
-  <form method="get" action="/reconstruction" style="display:block">
-    <label>Search names or paths <input name="q" value="{{ folder_query }}" size="45"></label>
-    <button class="secondary">Search</button>
-  </form>
-  {% if not folders %}<p class="muted">Build the reconstruction plan to generate folder suggestions.</p>{% endif %}
-  <table><tr><th>Found folder</th><th>Descendants</th><th>Review</th></tr>
-  {% for folder in folders %}<tr>
-    <td class="path"><strong>{{ folder.name }}</strong><br><span class="muted">{{ folder.relative_path }}</span><br><span class="pill">score {{ '%.1f'|format(folder.suggestion_score) }}</span>{% if folder.zero_files %}<span class="pill warn">{{ folder.zero_files }} zero-byte clues</span>{% endif %}</td>
-    <td>{{ folder.descendant_files }} files<br>{{ folder.descendant_bytes|human_bytes }}</td>
-    <td><form method="post" action="/folders/review" style="display:block">
-      <input type="hidden" name="directory_id" value="{{ folder.directory_id }}">
-      <select name="review_status">
-        {% for value,label in [('unreviewed','Not reviewed'),('recognized','Recognized / useful'),('private','Recognized / private'),('noise','Recovery-generated noise'),('system','System/application folder')] %}
-          <option value="{{ value }}" {% if folder.review_status == value %}selected{% endif %}>{{ label }}</option>
-        {% endfor %}
-      </select>
-      <input name="user_label" value="{{ folder.user_label or '' }}" placeholder="Preferred folder name">
-      <input name="notes" value="{{ folder.notes or '' }}" placeholder="What you remember">
-      <button class="secondary">Save</button>
-    </form></td>
-  </tr>{% endfor %}</table>
-</section>
-
-<section class="card" style="margin-top:18px">
-  <h3>Proposed reconstruction</h3>
-  <p class="muted">These are proposals only. Known-good files are marked covered rather than scheduled for another copy. Zero-byte entries remain evidence-only.</p>
-  {% if not proposals %}<p>Build the reconstruction plan to generate proposals.</p>{% endif %}
-  <table><tr><th>Source</th><th>Proposed destination</th><th>Basis</th><th>Status</th></tr>
-  {% for item in proposals %}<tr>
-    <td class="path"><strong>{{ item.name }}</strong><br><span class="muted">{{ item.relative_path }}</span><br>{{ item.size|human_bytes }}</td>
-    <td class="path">{{ item.proposed_path }}<br><span class="muted">{{ item.confidence }}% — {{ item.reason }}</span></td>
-    <td>{{ item.basis }}<br><span class="pill">{{ item.media_kind }}</span><span class="pill">{{ item.media_origin }}</span></td>
-    <td>{{ item.status }}</td>
-  </tr>{% endfor %}</table>
-</section>
-
-<section class="card" id="ai-provider" style="margin-top:18px">
-  <h3>Optional AI provider</h3>
-  <p>Recovery Curator sends only reduced previews/contact sheets and structured evidence. The provider never receives filesystem access and cannot perform file actions.</p>
-  {% if ai_settings.endpoint and not ai_settings.is_local and not ai_settings.allow_cloud_media %}<div class="notice"><strong>Remote endpoint detected.</strong> Media transmission remains blocked until you explicitly enable cloud media.</div>{% endif %}
-  <form method="post" action="/ai/provider" style="display:block">
-    <div class="form-grid">
-      <label>Provider name<input name="provider_name" value="{{ ai_settings.provider_name or 'Local AI' }}"></label>
-      <label>OpenAI-compatible endpoint<input name="endpoint" value="{{ ai_settings.endpoint or '' }}" placeholder="http://server:11434"></label>
-      <label>Vision model<input name="model" value="{{ ai_settings.model or '' }}"></label>
-      <label>API key environment variable<input name="api_key_env" value="{{ ai_settings.api_key_env or '' }}" placeholder="RECOVERY_AI_API_KEY"></label>
-    </div>
-    <p><label><input type="checkbox" name="enabled" value="1" {% if ai_settings.enabled %}checked{% endif %}> Enable this provider</label></p>
-    <p><label><input type="checkbox" name="allow_cloud_media" value="1" {% if ai_settings.allow_cloud_media %}checked{% endif %}> Allow previews to leave the local/private network</label></p>
-    <p><label><input type="checkbox" name="allow_sensitive_media" value="1" {% if ai_settings.allow_sensitive_media %}checked{% endif %}> Allow media already marked adult, intimate, or possibly sensitive</label></p>
-    <button>Save provider</button>
-  </form>
-  <form method="post" action="/ai/test" style="margin-left:8px"><button class="secondary">Test connection without sending media</button></form>
-  {% if ai_runs %}<h4>Recent AI runs</h4><table><tr><th>File</th><th>Provider/model</th><th>Status</th><th>Error</th></tr>
-    {% for run in ai_runs %}<tr><td>{{ run.name or 'connection/job' }}</td><td>{{ run.provider_name }} / {{ run.model }}</td><td>{{ run.status }}</td><td>{{ run.error or '' }}</td></tr>{% endfor %}
-  </table>{% endif %}
-</section>
 {% endblock %}
