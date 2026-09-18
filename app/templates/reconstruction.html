@@ -13,14 +13,55 @@
     <div><div class="metric">{{ reconstruction.videos or 0 }}</div><div class="muted">videos</div></div>
     <div><div class="metric warn">{{ reconstruction.pending_videos or 0 }}</div><div class="muted">videos awaiting FFprobe metadata</div></div>
   </div>
-  <p>{{ status.message }}{% if status.error %} — <span class="bad">{{ status.error }}</span>{% endif %}</p>
-  <progress max="{{ status.total or 1 }}" value="{{ status.processed or 0 }}"></progress>
+  <p id="reconstruction-message">{{ status.message }}{% if status.error %} — <span class="bad">{{ status.error }}</span>{% endif %}</p>
+  <progress id="reconstruction-progress" max="{{ status.total or 1 }}" value="{{ status.processed or 0 }}"></progress>
+  <p class="muted" id="reconstruction-detail">{{ status.phase }} — {{ status.processed }}/{{ status.total }} — {{ status.rate or 0 }} files/s</p>
   <div class="scan-actions">
-    <form method="post" action="/reconstruction/start"><button {% if status.running %}disabled{% endif %}>Analyze media &amp; build plan</button></form>
-    <form method="post" action="/scan/stop"><button class="danger" {% if not status.running %}disabled{% endif %}>Cancel</button></form>
+    <form method="post" action="/reconstruction/start"><button id="start-reconstruction" {% if status.running %}disabled{% endif %}>Analyze media &amp; build plan</button></form>
+    <form id="cancel-reconstruction-form" method="post" action="/scan/stop"><button id="cancel-reconstruction" class="danger" {% if not status.running %}disabled{% endif %}>Cancel</button></form>
   </div>
   <p class="muted">Run this again after recognizing folders or adding context. Completed video metadata is reused; only pending videos are probed.</p>
 </section>
+
+<script>
+const reconstructionMessage = document.getElementById('reconstruction-message');
+const reconstructionProgress = document.getElementById('reconstruction-progress');
+const reconstructionDetail = document.getElementById('reconstruction-detail');
+const startReconstruction = document.getElementById('start-reconstruction');
+const cancelReconstruction = document.getElementById('cancel-reconstruction');
+const cancelReconstructionForm = document.getElementById('cancel-reconstruction-form');
+let reconstructionWasRunning = {{ 'true' if status.running else 'false' }};
+
+cancelReconstructionForm.addEventListener('submit', () => {
+  cancelReconstruction.disabled = true;
+  cancelReconstruction.textContent = 'Cancellation requested…';
+  reconstructionMessage.textContent = 'Cancellation requested — finishing the current file batch…';
+});
+
+async function refreshReconstruction(){
+  try {
+    const response = await fetch('/api/status');
+    const data = await response.json();
+    const status = data.status;
+    reconstructionMessage.textContent = status.message + (status.error ? ' — ' + status.error : '');
+    reconstructionProgress.max = Math.max(status.total, 1);
+    reconstructionProgress.value = status.processed;
+    reconstructionDetail.textContent = `${status.phase} — ${status.processed}/${status.total} — ${status.rate || 0} files/s`;
+    startReconstruction.disabled = status.running;
+    cancelReconstruction.disabled = !status.running;
+    if (status.running) {
+      reconstructionWasRunning = true;
+      setTimeout(refreshReconstruction, 1500);
+    } else if (reconstructionWasRunning) {
+      window.location.reload();
+    }
+  } catch (error) {
+    reconstructionMessage.textContent = 'Unable to refresh reconstruction status — retrying…';
+    setTimeout(refreshReconstruction, 3000);
+  }
+}
+refreshReconstruction();
+</script>
 
 <section class="card" style="margin-top:18px">
   <h3>Media inventory</h3>

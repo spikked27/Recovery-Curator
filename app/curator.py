@@ -1585,28 +1585,85 @@ class Curator:
         self._progress(1, 1)
 
     def _build_placeholder_relationships(self, db: sqlite3.Connection) -> None:
-        self._begin_phase("placeholder_relationships", 1, "Linking zero-byte placeholders to surviving content")
-        db.execute("DELETE FROM file_relationships WHERE relationship='zero_same_name'")
+        total = db.execute("SELECT COUNT(*) FROM files WHERE size=0").fetchone()[0]
+        self._begin_phase(
+            "placeholder_index",
+            1,
+            "Indexing filenames for zero-byte placeholder matching",
+        )
         db.execute(
-            """WITH candidates AS (
-                 SELECT lower(name) name_key,COUNT(*) candidate_count,
-                        COUNT(DISTINCT content_hash) hash_count
-                 FROM files WHERE size>0 GROUP BY lower(name)
-               )
-               INSERT OR IGNORE INTO file_relationships(
-                 file_id,related_file_id,relationship,confidence,evidence,updated_at
-               )
-               SELECT z.id,n.id,'zero_same_name',
-                      CASE WHEN c.hash_count=1 THEN 92 WHEN c.candidate_count=1 THEN 85 ELSE 55 END,
-                      json_object('filename',z.name,'candidate_count',c.candidate_count,'hash_count',c.hash_count),?
-               FROM files z
-               JOIN candidates c ON c.name_key=lower(z.name) AND c.candidate_count<=10
-               JOIN files n ON lower(n.name)=c.name_key AND n.size>0
-               WHERE z.size=0""",
-            (utcnow(),),
+            "CREATE INDEX IF NOT EXISTS idx_files_name_nocase_size "
+            "ON files(name COLLATE NOCASE,size)"
+        )
+        db.execute("DELETE FROM file_relationships WHERE relationship='zero_same_name'")
+        db.execute("DROP TABLE IF EXISTS temp.placeholder_candidates")
+        db.execute(
+            """CREATE TEMP TABLE placeholder_candidates(
+                 name_key TEXT PRIMARY KEY COLLATE NOCASE,
+                 candidate_count INTEGER NOT NULL,
+                 hash_count INTEGER NOT NULL
+               ) WITHOUT ROWID"""
+        )
+        db.execute(
+            """INSERT INTO placeholder_candidates(name_key,candidate_count,hash_count)
+               SELECT MIN(name),COUNT(*),COUNT(DISTINCT content_hash)
+               FROM files
+               WHERE size>0
+               GROUP BY name COLLATE NOCASE
+               HAVING COUNT(*)<=10"""
         )
         db.commit()
         self._progress(1, 1)
+
+        self._begin_phase(
+            "placeholder_relationships",
+            total,
+            f"Linking {total:,} zero-byte placeholders to surviving content",
+        )
+        processed = 0
+        last_id = 0
+        try:
+            while True:
+                self._check_cancel()
+                rows = db.execute(
+                    "SELECT id FROM files WHERE size=0 AND id>? ORDER BY id LIMIT ?",
+                    (last_id, self.batch_size),
+                ).fetchall()
+                if not rows:
+                    break
+                ids = [int(row["id"]) for row in rows]
+                markers = ",".join("?" for _ in ids)
+                db.execute(
+                    f"""INSERT OR IGNORE INTO file_relationships(
+                           file_id,related_file_id,relationship,confidence,evidence,updated_at
+                         )
+                         SELECT z.id,n.id,'zero_same_name',
+                                CASE WHEN c.hash_count=1 THEN 92
+                                     WHEN c.candidate_count=1 THEN 85 ELSE 55 END,
+                                json_object(
+                                  'filename',z.name,
+                                  'candidate_count',c.candidate_count,
+                                  'hash_count',c.hash_count
+                                ),?
+                         FROM files z
+                         JOIN placeholder_candidates c
+                           ON c.name_key=z.name COLLATE NOCASE
+                         JOIN files n
+                           ON n.name=c.name_key COLLATE NOCASE AND n.size>0
+                         WHERE z.id IN ({markers})""",
+                    (utcnow(), *ids),
+                )
+                db.commit()
+                last_id = ids[-1]
+                processed += len(ids)
+                self._progress(
+                    processed,
+                    total,
+                    f"Linking zero-byte placeholders — {processed:,}/{total:,}",
+                )
+        finally:
+            db.execute("DROP TABLE IF EXISTS temp.placeholder_candidates")
+            db.commit()
 
     def _refresh_folder_context(self, db: sqlite3.Connection) -> None:
         directories = {

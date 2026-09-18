@@ -418,6 +418,37 @@ class CuratorTests(unittest.TestCase):
             self.assertIn("Recovered Structure", proposal["proposed_path"])
             self.assertIn("Aruba vacation", proposal["proposed_path"])
 
+    def test_zero_byte_relationships_use_indexed_batches(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            live = source / "live"
+            placeholders = source / "placeholders"
+            live.mkdir()
+            placeholders.mkdir()
+            for index in range(17):
+                name = f"recovered-{index}.dat"
+                (live / name).write_bytes(f"content-{index}".encode())
+                (placeholders / name.upper()).touch()
+
+            curator = Curator(
+                source, output, quarantine, config / "catalog.sqlite3", batch_size=8,
+            )
+            curator.scan()
+            curator.build_reconstruction_foundation()
+
+            with connect(config / "catalog.sqlite3") as db:
+                relationship_count = db.execute(
+                    "SELECT COUNT(*) FROM file_relationships WHERE relationship='zero_same_name'"
+                ).fetchone()[0]
+                indexes = {row[1] for row in db.execute("PRAGMA index_list(files)")}
+            self.assertEqual(relationship_count, 17)
+            self.assertIn("idx_files_name_nocase_size", indexes)
+
     def test_recovery_context_and_ai_provider_settings_are_scan_local(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
