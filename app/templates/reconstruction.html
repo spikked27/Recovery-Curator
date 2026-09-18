@@ -33,10 +33,22 @@
   <p class="muted"><strong>Full media analysis</strong> enriches new media and rebuilds everything. <strong>Apply feedback</strong> is the fast option after reviewing folders, adding rules, or running AI.</p>
 </section>
 
+<section class="card evidence-plan">
+  <div class="section-heading"><div><span class="step-label">Conservative strategy</span><h3>Reconstruct only what the evidence supports</h3></div><span class="safety-badge">No invented hierarchy</span></div>
+  <p>Recovery Curator exhausts known-good paths, your explicit folder reviews, approved rules, metadata, and optional AI suggestions. When that still is not enough, it stops trying to recreate the original tree and uses a clean <code>Organized Library</code> grouped by media type, origin, interpreted category, and date.</p>
+  <div class="metric-grid compact">
+    <div><div class="metric good">{{ reconstruction.preserved_structure or 0 }}</div><div class="muted">files with supported structure</div></div>
+    <div><div class="metric">{{ reconstruction.interpreted_categories or 0 }}</div><div class="muted">interpreted categories</div></div>
+    <div><div class="metric">{{ reconstruction.sanitized_categories or 0 }}</div><div class="muted">organized fallback files</div></div>
+    <div><div class="metric warn">{{ reconstruction.low_evidence_proposals or 0 }}</div><div class="muted">low-evidence files to review</div></div>
+  </div>
+</section>
+
 <section class="card" id="folder-clues">
   <div class="section-heading"><div><span class="step-label">Step 1</span><h3>Teach Recovery Curator what you recognize</h3></div>
     <form method="post" action="/reconstruction/refresh"><button class="secondary" {% if status.running %}disabled{% endif %}>Apply saved feedback</button></form></div>
   <p>Folder reviews now directly affect the plan: useful folders are preserved, private folders go under <code>Private</code>, recovery noise is stripped away, and system/application branches are excluded.</p>
+  <details class="review-drawer" {% if folder_query %}open{% endif %}><summary>Browse and review {{ reconstruction.folder_suggestions or 0 }} discovered folders</summary>
   <form method="get" action="/reconstruction" class="filter-bar">
     <label>Find a folder <input name="folder_q" value="{{ folder_query }}" placeholder="Name or surviving path"></label>
     <button class="secondary">Search</button>{% if folder_query %}<a class="button ghost" href="/reconstruction#folder-clues">Clear</a>{% endif %}
@@ -57,7 +69,7 @@
       <input name="notes" value="{{ folder.notes or '' }}" placeholder="Memory or note (optional)">
       <button class="secondary">Save</button>
     </form></td>
-  </tr>{% endfor %}</table></div>
+  </tr>{% endfor %}</table></div></details>
 </section>
 
 <section class="card" id="recovery-context">
@@ -73,9 +85,9 @@
     <label class="full-label">Details<textarea name="details" placeholder="Dates, device names, people, events, or anything else the AI should know"></textarea></label>
     <button>Save clue or rule</button>
   </form>
-  {% if context_items %}<div class="table-wrap"><table><tr><th>Type</th><th>Clue</th><th>Automatic rule</th><th></th></tr>
+  {% if context_items %}<details class="review-drawer"><summary>Review {{ context_items|length }} saved context clues and rules</summary><div class="table-wrap"><table><tr><th>Type</th><th>Clue</th><th>Automatic rule</th><th></th></tr>
     {% for item in context_items %}<tr><td><span class="pill">{{ item.context_type }}</span></td><td><strong>{{ item.label }}</strong><br><span class="muted">{{ item.details or '' }}</span></td><td>{% if item.match_text %}<code>{{ item.match_text }}</code> → <code>{{ item.destination }}</code>{% else %}<span class="muted">AI context only</span>{% endif %}</td><td><form method="post" action="/context/{{ item.id }}/delete" onsubmit="return confirm('Remove this context clue?');"><button class="danger">Remove</button></form></td></tr>{% endfor %}
-  </table></div>{% endif %}
+  </table></div></details>{% endif %}
 </section>
 
 <section class="card" id="ai-provider">
@@ -110,7 +122,7 @@
       <label>Folders to include<select name="limit"><option value="100">100 — focused</option><option value="300" selected>300 — recommended</option><option value="750">750 — broader hierarchy</option><option value="1000">1,000 — maximum</option></select></label>
       <button id="start-ai-structure" {% if status.running or not ai_settings.enabled %}disabled{% endif %}>Ask AI to interpret context</button>
     </form>
-    {% if structure_suggestions %}<div class="suggestion-list"><h4>Suggestions awaiting your review</h4>
+    {% if structure_suggestions %}<details class="review-drawer"><summary>{{ structure_suggestions|length }} AI structure suggestions awaiting review</summary><div class="suggestion-list">
       {% for item in structure_suggestions %}<article class="suggestion-card">
         <div><span class="pill">{{ item.suggestion_type }}</span><span class="pill">{{ item.confidence }}% confidence</span>
           {% if item.suggestion_type=='folder' %}<strong class="path">{{ item.relative_path }}</strong><span>Mark as <strong>{{ item.review_status }}</strong>{% if item.user_label %} and name it <strong>{{ item.user_label }}</strong>{% endif %}</span>
@@ -118,7 +130,7 @@
           <span class="muted">{{ item.reason or 'No additional explanation supplied.' }}</span></div>
         <form method="post" action="/ai/structure/{{ item.id }}"><button name="decision" value="accepted">Accept &amp; apply</button> <button class="secondary" name="decision" value="rejected">Reject</button></form>
       </article>{% endfor %}
-    </div>{% endif %}
+    </div></details>{% endif %}
   </div>
 
   <div class="subcard" id="ai-batch">
@@ -154,6 +166,7 @@
   {% if directory_proposals %}<details><summary>See original folders that will be recreated ({{ reconstruction.directory_proposals }})</summary><div class="table-wrap"><table><tr><th>Proposed folder</th><th>Original evidence</th><th>Contents</th></tr>
     {% for directory in directory_proposals %}<tr><td class="path"><strong>{{ directory.proposed_path }}</strong></td><td class="path muted">{{ directory.source_relative_path }}</td><td>{% if directory.descendant_files==0 %}<span class="pill good">empty original folder</span>{% else %}{{ directory.descendant_files }} descendant files{% endif %}</td></tr>{% endfor %}
   </table></div></details>{% endif %}
+  <details class="review-drawer" {% if proposal_query or selected_review_state or selected_status or selected_basis %}open{% endif %}><summary>Browse and review individual file proposals</summary>
   <form method="get" action="/reconstruction" class="filter-bar">
     <label>Search <input name="proposal_q" value="{{ proposal_query }}" placeholder="Source or proposed path"></label>
     <label>Review<select name="review_state"><option value="">All</option>{% for value in ['pending','accepted','excluded'] %}<option value="{{ value }}" {% if selected_review_state==value %}selected{% endif %}>{{ value|title }}</option>{% endfor %}</select></label>
@@ -172,7 +185,7 @@
       <button class="secondary" name="review_state" value="pending">Reset</button>
       <button class="danger" name="review_state" value="excluded">Exclude</button>
     </form>
-  </article>{% endfor %}</div>
+  </article>{% endfor %}</div></details>
 </section>
 
 <section class="card" id="export-plan">

@@ -1942,8 +1942,10 @@ class Curator:
                     else:
                         media = row["media_kind"] or "other"
                         file_facets = facets.get(file_id, {})
-                        origin = file_facets.get("origin", {}).get("value") or row["media_origin"]
-                        sensitivity = file_facets.get("sensitivity", {}).get("value") or row["sensitivity"]
+                        origin_facet = file_facets.get("origin", {})
+                        sensitivity_facet = file_facets.get("sensitivity", {})
+                        origin = origin_facet.get("value") or row["media_origin"]
+                        sensitivity = sensitivity_facet.get("value") or row["sensitivity"]
                         base_names = {
                             "photo": "Photos", "video": "Videos", "audio": "Audio",
                             "document": "Documents", "email": "Email", "other": "Other Files",
@@ -1951,11 +1953,17 @@ class Curator:
                         pieces = []
                         if sensitivity in {"adult", "intimate", "possibly_sensitive"}:
                             pieces.append("Private")
-                        pieces.extend(["Media" if media in {"photo", "video", "audio"} else "Files", base_names.get(media, "Other Files")])
+                        pieces.extend([
+                            "Organized Library",
+                            "Media" if media in {"photo", "video", "audio"} else "Files",
+                            base_names.get(media, "Other Files"),
+                        ])
                         if origin and origin != "unknown":
                             pieces.append(sanitize_component(origin.replace("_", " ").title()))
+                        classification_facet = None
                         for facet_type in ("event", "topic", "application"):
-                            value = file_facets.get(facet_type, {}).get("value")
+                            classification_facet = file_facets.get(facet_type, {})
+                            value = classification_facet.get("value")
                             if value:
                                 pieces.append(sanitize_component(value))
                                 break
@@ -1972,7 +1980,14 @@ class Curator:
                             reason += f"; ignored recovery-generated folder {noise_context['label']}"
                         pieces.append(row["name"])
                         proposed = self._clean_relative_path(str(Path(*pieces)))
-                        basis = "noise_removed" if noise_context else "metadata_fallback"
+                        interpretation_used = any(
+                            item and item.get("source") != "deterministic"
+                            for item in (origin_facet, sensitivity_facet, classification_facet)
+                        )
+                        if interpretation_used:
+                            basis = "interpreted_category_noise_removed" if noise_context else "interpreted_category"
+                        else:
+                            basis = "sanitized_category_noise_removed" if noise_context else "sanitized_category"
                     if not system_context:
                         if row["decision"] == "reject":
                             status = "excluded"
@@ -2088,6 +2103,14 @@ class Curator:
                      (SELECT COUNT(*) FROM files WHERE media_kind='video' AND COALESCE(video_analysis_version,0)<?) pending_videos,
                      (SELECT COUNT(*) FROM recovery_context) context_items,
                      (SELECT COUNT(*) FROM reconstruction_directories WHERE status='included') directory_proposals,
+                     (SELECT COUNT(*) FROM reconstruction_proposals
+                       WHERE basis IN ('recognized_folder','private_folder','user_context_rule')) preserved_structure,
+                     (SELECT COUNT(*) FROM reconstruction_proposals
+                       WHERE basis LIKE 'interpreted_category%') interpreted_categories,
+                     (SELECT COUNT(*) FROM reconstruction_proposals
+                       WHERE basis LIKE 'sanitized_category%') sanitized_categories,
+                     (SELECT COUNT(*) FROM reconstruction_proposals
+                       WHERE status='proposed' AND confidence<70) low_evidence_proposals,
                      (SELECT COUNT(*) FROM reconstruction_proposals WHERE review_state='accepted') accepted_proposals,
                      (SELECT COUNT(*) FROM reconstruction_proposals WHERE review_state='pending') pending_proposals,
                      (SELECT COUNT(*) FROM reconstruction_proposals WHERE review_state='excluded') excluded_proposals,

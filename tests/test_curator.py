@@ -533,6 +533,9 @@ class CuratorTests(unittest.TestCase):
             (system / "cache.bin").write_bytes(b"application cache")
             Image.new("RGB", (32, 32), (10, 10, 10)).save(source / "space.png")
             Image.new("RGB", (32, 32), (15, 25, 35)).save(vacation / "nested.png")
+            uncertain = source / "Uncertain Dump" / "Mystery"
+            uncertain.mkdir(parents=True)
+            Image.new("RGB", (32, 32), (5, 15, 25)).save(uncertain / "unplaced.png")
 
             curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
             curator.scan()
@@ -562,8 +565,13 @@ class CuratorTests(unittest.TestCase):
             self.assertTrue(proposals["private.png"]["effective_path"].startswith("Private/Recovered Structure/Personal/"))
             self.assertEqual(proposals["cache.bin"]["status"], "excluded_system")
             self.assertIn("NASA", proposals["space.png"]["effective_path"])
+            self.assertEqual(proposals["space.png"]["basis"], "interpreted_category")
             self.assertIn("Recovered Originals/Vacation/nested.png", proposals["nested.png"]["effective_path"])
             self.assertNotIn("Organized By Me", proposals["nested.png"]["effective_path"])
+            self.assertTrue(proposals["unplaced.png"]["effective_path"].startswith("Organized Library/"))
+            self.assertNotIn("Uncertain Dump", proposals["unplaced.png"]["effective_path"])
+            self.assertNotIn("Mystery", proposals["unplaced.png"]["effective_path"])
+            self.assertEqual(proposals["unplaced.png"]["basis"], "sanitized_category")
             with connect(config / "catalog.sqlite3") as db:
                 directory_paths = {
                     row[0] for row in db.execute(

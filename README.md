@@ -48,6 +48,7 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
 - Separate AI structure interpretation for folder names, folder notes, empty-directory evidence, and free-form recovery context. Its folder classifications and path rules require human acceptance before affecting the plan.
 - Exact duplicates share one AI classification, reducing local processing and cloud API use.
 - Safety-gated reconstruction export: only accepted proposals are copied, only after a current dry run and explicit confirmation. Existing output files are never overwritten.
+- Evidence-first reconstruction: original hierarchy is claimed only for known-good paths, explicitly recognized/private branches, or user-approved rules. When evidence is exhausted, files use a clearly labeled `Organized Library` fallback by type, origin, interpreted category, and date rather than an invented folder tree.
 - Non-destructive curated export. Selected files are copied into category/year/month folders.
 - Filename-derived dates are written with ExifTool only to the curated copy, never the recovered source.
 - File and directory CSV/JSONL catalogs containing paths, filesystem evidence, hashes, dates, validation, classifications, decisions, provenance, and blank AI enrichment columns.
@@ -103,6 +104,14 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
 10. Search the proposed tree, override destinations where necessary, and accept proposals individually or use the confidence threshold to accept safe proposals in bulk.
 11. Generate a fresh dry run. When ready to copy accepted files, stop the container, set **Allow Write Actions** to `true`, restart it, type `EXPORT`, and run the reconstruction export. The source remains read-only and unchanged. If PUID `0` is required to read restricted source files, exported files are still assigned to the configured Curated Output Owner UID/GID (`99:100` by default).
 12. Keep the original recovery set until the curated output has been backed up and manually spot-checked.
+
+The reconstruction workspace is intentionally conservative. Its output has three evidence levels:
+
+- **Supported structure** — known-good paths, folders you explicitly marked recognized/private, and path rules you approved.
+- **Interpreted category** — user or AI classifications such as Snapchat, NASA, screenshots, events, or applications. These organize content but are not represented as recovered original hierarchy.
+- **Organized fallback** — media type, deterministic origin clues, and strongest available date. Unknown recovery folders are not preserved merely because their names look plausible.
+
+If there is insufficient evidence, leaving a file in the organized fallback is the correct outcome. It is safer than fabricating an original location.
 
 ## Clearing a scan
 
