@@ -41,9 +41,11 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
 - Discovered-folder review generated from the surviving hierarchy—including empty and zero-byte-only branches—so the user can recognize names shown by the application instead of recalling them unaided.
 - Saved recovery context for devices, people, events, applications, folders, and privacy rules.
 - Feedback-aware proposals: recognized/private folders preserve structure, recovery-noise folders are stripped, and system/application branches are excluded.
+- Empty original directories beneath recognized/private branches are preserved in the proposed tree and recreated during an accepted reconstruction export.
 - Optional filename/path rules that route matching files to a user-selected destination.
 - Searchable proposal review with destination overrides, confidence filtering, individual approval, and bulk approval for high-confidence files.
 - Optional OpenAI-compatible local or cloud vision provider with quick setup presets and cancellable batch analysis. The provider receives only reduced previews/contact sheets and structured evidence, never filesystem access or action permissions.
+- Separate AI structure interpretation for folder names, folder notes, empty-directory evidence, and free-form recovery context. Its folder classifications and path rules require human acceptance before affecting the plan.
 - Exact duplicates share one AI classification, reducing local processing and cloud API use.
 - Safety-gated reconstruction export: only accepted proposals are copied, only after a current dry run and explicit confirmation. Existing output files are never overwritten.
 - Non-destructive curated export. Selected files are copied into category/year/month folders.
@@ -96,8 +98,8 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
 5. Review known-good matches, exact duplicate groups, similar-photo groups, date proposals, and low-confidence categories. The automatic exact-keeper action only records decisions.
 6. Open **Reconstruction** and select **Full media analysis**. Existing file hashes and image analysis are reused; pending videos receive FFprobe metadata without another source inventory.
 7. Review folder names the application found. Mark useful original folders, recovery-generated noise, system folders, and private branches. Add remembered devices, events, applications, people, and privacy context as it becomes recognizable.
-8. Select **Apply feedback to plan**. This fast rebuild uses folder reviews, automatic path rules, manual facets, and saved AI results without repeating media enrichment.
-9. Optionally connect Ollama, LM Studio, or another OpenAI-compatible vision endpoint. Test the connection without sending media, then start with a small AI batch. Cloud media and already-sensitive media remain separate opt-ins.
+8. Select **Apply feedback to plan**. This fast rebuild uses folder reviews, preserves recognized empty directories, strips noise levels even when nested inside recognized structure, and applies automatic path rules, manual facets, and saved AI results without repeating media enrichment.
+9. Optionally connect Ollama, LM Studio, or another OpenAI-compatible endpoint. Test the connection without sending media, then use **Interpret folder structure and your context** before media batches. Review each suggested folder meaning or path rule before accepting it. Cloud transmission remains opt-in.
 10. Search the proposed tree, override destinations where necessary, and accept proposals individually or use the confidence threshold to accept safe proposals in bulk.
 11. Generate a fresh dry run. When ready to copy accepted files, stop the container, set **Allow Write Actions** to `true`, restart it, type `EXPORT`, and run the reconstruction export. The source remains read-only and unchanged. If PUID `0` is required to read restricted source files, exported files are still assigned to the configured Curated Output Owner UID/GID (`99:100` by default).
 12. Keep the original recovery set until the curated output has been backed up and manually spot-checked.
@@ -155,11 +157,13 @@ During curated export, a proposal with at least 85% confidence is applied to `Da
 
 ## Optional AI provider and privacy
 
-The Reconstruction page accepts an OpenAI-compatible endpoint and vision-model name and includes quick-fill presets for Ollama, LM Studio, and cloud APIs. Replace the example host with the LAN address of the machine running the provider. A LAN hostname, private IP, localhost, or `.local` hostname is treated as local/private. Public endpoints cannot receive previews unless **Allow previews to leave the local/private network** is explicitly enabled. Files already marked adult, intimate, or possibly sensitive require the separate sensitive-media opt-in.
+The Reconstruction page accepts an OpenAI-compatible endpoint and model name and includes quick-fill presets for Ollama, LM Studio, and cloud APIs. Replace the example host with the LAN address of the machine running the provider. A LAN hostname, private IP, localhost, or `.local` hostname is treated as local/private. Public endpoints cannot receive previews, folder/context evidence, or notes unless **Allow previews and context to leave the local/private network** is explicitly enabled. Files already marked adult, intimate, or possibly sensitive require the separate sensitive-media opt-in.
 
 API keys are not stored in the scan database. Enter only the name of an environment variable supplied to the container. AI analysis is advisory: responses are stored as source-attributed facets and an audit record. The AI cannot move, rename, quarantine, delete, or export files. Filenames, OCR, metadata, and visible text are treated as untrusted evidence rather than model instructions.
 
 The Unraid template includes an optional masked `RECOVERY_AI_API_KEY` variable. If the provider requires a credential, set that variable in the container and enter `RECOVERY_AI_API_KEY` as the environment-variable name on the Reconstruction page. Local providers commonly leave it empty.
+
+Use **Interpret folder structure and your context** to send a bounded set of folder names, counts, reviews, notes, empty-directory evidence, and saved context without sending media. Returned folder classifications and automatic path rules appear in a review queue and do nothing until accepted.
 
 Use **Batch classification** to analyze uncertain photos and videos, or use the Catalog's **Ask configured AI** action for one file. The batch is cancellable, skips previously analyzed media by default, and sends only one representative from each exact-duplicate set. Requests include the recovery context saved for the active scan. Any questions returned by the provider are displayed for human review rather than silently treated as facts.
 

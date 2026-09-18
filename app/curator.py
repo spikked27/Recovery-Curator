@@ -245,6 +245,17 @@ def initialize(db_path: Path) -> None:
               updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_reconstruction_status ON reconstruction_proposals(status);
+            CREATE TABLE IF NOT EXISTS reconstruction_directories (
+              directory_id INTEGER PRIMARY KEY,
+              proposed_path TEXT NOT NULL,
+              confidence INTEGER NOT NULL DEFAULT 0,
+              basis TEXT NOT NULL,
+              reason TEXT,
+              status TEXT NOT NULL DEFAULT 'included',
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_reconstruction_directories_status
+              ON reconstruction_directories(status);
             CREATE TABLE IF NOT EXISTS folder_context (
               directory_id INTEGER PRIMARY KEY,
               name TEXT NOT NULL,
@@ -303,6 +314,24 @@ def initialize(db_path: Path) -> None:
               updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_review_questions_status ON review_questions(status);
+            CREATE TABLE IF NOT EXISTS ai_structure_suggestions (
+              id INTEGER PRIMARY KEY,
+              suggestion_type TEXT NOT NULL,
+              directory_id INTEGER,
+              relative_path TEXT,
+              review_status TEXT,
+              user_label TEXT,
+              match_text TEXT,
+              destination TEXT,
+              confidence INTEGER NOT NULL DEFAULT 0,
+              reason TEXT,
+              source TEXT NOT NULL,
+              status TEXT NOT NULL DEFAULT 'pending',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_ai_structure_suggestions_status
+              ON ai_structure_suggestions(status);
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS actions (
               id INTEGER PRIMARY KEY,
@@ -908,9 +937,11 @@ class Curator:
             directory_count = db.execute("SELECT COUNT(*) FROM directories").fetchone()[0]
             db.execute("DELETE FROM actions")
             db.execute("DELETE FROM ai_runs")
+            db.execute("DELETE FROM ai_structure_suggestions")
             db.execute("DELETE FROM review_questions")
             db.execute("DELETE FROM ai_provider_settings")
             db.execute("DELETE FROM reconstruction_proposals")
+            db.execute("DELETE FROM reconstruction_directories")
             db.execute("DELETE FROM file_relationships")
             db.execute("DELETE FROM file_facets")
             db.execute("DELETE FROM known_good_matches")
@@ -926,12 +957,14 @@ class Curator:
             "recovery_catalog.csv", "recovery_catalog.jsonl",
             "directory_catalog.csv", "directory_catalog.jsonl",
             "reconstruction_plan.csv", "reconstruction_plan.jsonl",
+            "reconstruction_directories.csv", "reconstruction_directories.jsonl",
             "folder_context.csv", "folder_context.jsonl",
             "known_good_matches.csv", "known_good_matches.jsonl",
             "file_relationships.csv", "file_relationships.jsonl",
             "file_facets.csv", "file_facets.jsonl",
             "recovery_context.csv", "recovery_context.jsonl",
             "review_questions.csv", "review_questions.jsonl",
+            "ai_structure_suggestions.csv", "ai_structure_suggestions.jsonl",
         ):
             report = self.db_path.parent / name
             try:
@@ -1750,6 +1783,34 @@ class Curator:
     def _clean_relative_path(value: str) -> str:
         return str(Path(*(sanitize_component(part) for part in PurePosixPath(value).parts if part not in ("", "."))))
 
+    @staticmethod
+    def _folder_lineage(relative_path: str, folder_reviews: dict[str, dict], include_self: bool = False) -> list[dict]:
+        current = PurePosixPath(relative_path) if include_self else PurePosixPath(relative_path).parent
+        lineage = []
+        while str(current) not in ("", ".", "/"):
+            reviewed = folder_reviews.get(str(current))
+            if reviewed:
+                lineage.append(reviewed)
+            current = current.parent
+        return lineage
+
+    @staticmethod
+    def _suffix_without_noise(relative_path: str, anchor_path: str, lineage: list[dict]) -> str:
+        full_parts = list(PurePosixPath(relative_path).parts)
+        anchor_parts = list(PurePosixPath(anchor_path).parts)
+        removed_indexes = set()
+        for item in lineage:
+            if item["review_status"] != "noise":
+                continue
+            noise_parts = list(PurePosixPath(item["relative_path"]).parts)
+            if full_parts[:len(noise_parts)] == noise_parts:
+                removed_indexes.add(len(noise_parts) - 1)
+        suffix = [
+            part for index, part in enumerate(full_parts)
+            if index >= len(anchor_parts) and index not in removed_indexes
+        ]
+        return str(Path(*suffix)) if suffix else ""
+
     def start_reconstruction_plan_refresh(self) -> bool:
         """Rebuild only the proposal layer after user/AI feedback changes."""
         with self.lock:
@@ -1836,16 +1897,13 @@ class Curator:
                         "evidence_only",
                     )
                 else:
-                    matching_folders = []
-                    parent = PurePosixPath(row["relative_path"]).parent
-                    while str(parent) not in ("", ".", "/"):
-                        reviewed = folder_reviews.get(str(parent))
-                        if reviewed:
-                            matching_folders.append(reviewed)
-                        parent = parent.parent
+                    matching_folders = self._folder_lineage(row["relative_path"], folder_reviews)
                     system_context = next((item for item in matching_folders if item["review_status"] == "system"), None)
                     private_context = next((item for item in matching_folders if item["review_status"] == "private"), None)
-                    recognized_context = next((item for item in matching_folders if item["review_status"] == "recognized"), None)
+                    structure_context = next(
+                        (item for item in matching_folders if item["review_status"] in {"recognized", "private"}),
+                        None,
+                    )
                     noise_context = next((item for item in matching_folders if item["review_status"] == "noise"), None)
                     path_text = row["relative_path"].casefold()
                     context_rule = next(
@@ -1869,12 +1927,13 @@ class Curator:
                             "user_context_rule", 96,
                             f"matched user context rule: {context_rule['label']}",
                         )
-                    elif recognized_context or private_context:
-                        matched_context = recognized_context or private_context
-                        suffix = row["relative_path"][len(matched_context["relative_path"]):].lstrip("/") or row["name"]
+                    elif structure_context:
+                        suffix = self._suffix_without_noise(
+                            row["relative_path"], structure_context["relative_path"], matching_folders,
+                        ) or row["name"]
                         prefix = Path("Private") if private_context else Path()
                         proposed = self._clean_relative_path(
-                            str(prefix / "Recovered Structure" / sanitize_component(matched_context["label"]) / suffix)
+                            str(prefix / "Recovered Structure" / sanitize_component(structure_context["label"]) / suffix)
                         )
                         basis, confidence, reason = (
                             "private_folder" if private_context else "recognized_folder", 94,
@@ -1950,6 +2009,65 @@ class Curator:
             self._progress(processed, total)
             self._check_cancel()
         db.execute("DELETE FROM reconstruction_proposals WHERE file_id NOT IN (SELECT id FROM files)")
+        self._build_reconstruction_directory_proposals(db, folder_reviews)
+
+    def _build_reconstruction_directory_proposals(
+        self, db: sqlite3.Connection, folder_reviews: dict[str, dict] | None = None,
+    ) -> None:
+        if folder_reviews is None:
+            folder_reviews = {row["relative_path"]: dict(row) for row in db.execute(
+                """SELECT relative_path,COALESCE(NULLIF(user_label,''),name) label,review_status,notes
+                   FROM folder_context WHERE review_status!='unreviewed'"""
+            )}
+        db.execute("DELETE FROM reconstruction_directories")
+        proposals = []
+        now = utcnow()
+        for row in db.execute("SELECT id,relative_path,name FROM directories WHERE relative_path!='.' ORDER BY id"):
+            lineage = self._folder_lineage(row["relative_path"], folder_reviews, include_self=True)
+            if not lineage:
+                continue
+            system_context = next((item for item in lineage if item["review_status"] == "system"), None)
+            private_context = next((item for item in lineage if item["review_status"] == "private"), None)
+            structure_context = next(
+                (item for item in lineage if item["review_status"] in {"recognized", "private"}),
+                None,
+            )
+            if system_context:
+                proposed = self._clean_relative_path(
+                    str(Path("Excluded") / "System and Application Files" / row["relative_path"])
+                )
+                proposals.append((
+                    row["id"], proposed, 100, "system_folder",
+                    f"inside folder marked system/application: {system_context['label']}",
+                    "excluded_system", now,
+                ))
+                continue
+            if not structure_context:
+                continue
+            suffix = self._suffix_without_noise(
+                row["relative_path"], structure_context["relative_path"], lineage,
+            )
+            prefix = Path("Private") if private_context else Path()
+            proposed = self._clean_relative_path(
+                str(prefix / "Recovered Structure" / sanitize_component(structure_context["label"]) / suffix)
+            )
+            is_collapsed_noise = any(
+                item["review_status"] == "noise" and item["relative_path"] == row["relative_path"]
+                for item in lineage
+            )
+            proposals.append((
+                row["id"], proposed, 96,
+                "private_folder" if private_context else "recognized_folder",
+                "empty and populated original directory structure beneath a user-recognized branch",
+                "collapsed_noise" if is_collapsed_noise else "included", now,
+            ))
+        if proposals:
+            db.executemany(
+                """INSERT INTO reconstruction_directories(
+                     directory_id,proposed_path,confidence,basis,reason,status,updated_at
+                   ) VALUES(?,?,?,?,?,?,?)""",
+                proposals,
+            )
 
     def reconstruction_summary(self) -> dict:
         with connect(self.db_path) as db:
@@ -1969,6 +2087,7 @@ class Curator:
                      (SELECT COUNT(*) FROM files WHERE media_kind='video') videos,
                      (SELECT COUNT(*) FROM files WHERE media_kind='video' AND COALESCE(video_analysis_version,0)<?) pending_videos,
                      (SELECT COUNT(*) FROM recovery_context) context_items,
+                     (SELECT COUNT(*) FROM reconstruction_directories WHERE status='included') directory_proposals,
                      (SELECT COUNT(*) FROM reconstruction_proposals WHERE review_state='accepted') accepted_proposals,
                      (SELECT COUNT(*) FROM reconstruction_proposals WHERE review_state='pending') pending_proposals,
                      (SELECT COUNT(*) FROM reconstruction_proposals WHERE review_state='excluded') excluded_proposals,
@@ -2095,6 +2214,20 @@ class Curator:
                 )],
             }
 
+    def list_reconstruction_directories(self, limit: int = 250) -> list[dict]:
+        with connect(self.db_path) as db:
+            return [dict(row) for row in db.execute(
+                """SELECT r.*,d.relative_path source_relative_path,d.name,
+                          COALESCE(f.descendant_files,0) descendant_files
+                   FROM reconstruction_directories r
+                   JOIN directories d ON d.id=r.directory_id
+                   LEFT JOIN folder_context f ON f.directory_id=r.directory_id
+                   WHERE r.status='included'
+                   ORDER BY (COALESCE(f.descendant_files,0)=0) DESC,r.proposed_path
+                   LIMIT ?""",
+                (max(1, min(int(limit), 1000)),),
+            )]
+
     def review_reconstruction_proposal(
         self, file_id: int, review_state: str, user_path: str = "", note: str = "",
     ) -> None:
@@ -2132,6 +2265,17 @@ class Curator:
     def reconstruction_tree(self, limit: int = 100) -> list[dict]:
         branches: dict[str, dict] = {}
         with connect(self.db_path) as db:
+            for row in db.execute(
+                "SELECT proposed_path path FROM reconstruction_directories WHERE status='included'"
+            ):
+                parts = PurePosixPath(row["path"]).parts
+                branch = "/".join(parts[:3]) if parts else "Other"
+                item = branches.setdefault(
+                    branch,
+                    {"path": branch, "files": 0, "directories": 0, "bytes": 0,
+                     "accepted": 0, "pending": 0, "excluded": 0, "minimum_confidence": 100},
+                )
+                item["directories"] += 1
             rows = db.execute(
                 """SELECT COALESCE(p.user_path,p.proposed_path) path,p.review_state,p.status,p.confidence,f.size
                    FROM reconstruction_proposals p JOIN files f ON f.id=p.file_id"""
@@ -2141,30 +2285,38 @@ class Curator:
                 branch = "/".join(parts[:3]) if parts else "Other"
                 item = branches.setdefault(
                     branch,
-                    {"path": branch, "files": 0, "bytes": 0, "accepted": 0, "pending": 0, "excluded": 0,
-                     "minimum_confidence": 100},
+                    {"path": branch, "files": 0, "directories": 0, "bytes": 0,
+                     "accepted": 0, "pending": 0, "excluded": 0, "minimum_confidence": 100},
                 )
                 item["files"] += 1
                 item["bytes"] += int(row["size"] or 0)
                 state = row["review_state"] if row["review_state"] in {"accepted", "pending", "excluded"} else "pending"
                 item[state] += 1
                 item["minimum_confidence"] = min(item["minimum_confidence"], int(row["confidence"] or 0))
-        return sorted(branches.values(), key=lambda item: (-item["files"], item["path"]))[:limit]
+        return sorted(
+            branches.values(), key=lambda item: (-(item["files"] + item["directories"]), item["path"])
+        )[:limit]
 
     def _current_reconstruction_export_preview(self) -> dict:
         ready, blocked, unavailable, already_exported, collisions, total_bytes = 0, 0, 0, 0, 0, 0
         signature = []
         seen_destinations: set[str] = set()
         with connect(self.db_path) as db:
+            directory_rows = db.execute(
+                """SELECT directory_id,proposed_path,updated_at FROM reconstruction_directories
+                   WHERE status='included' ORDER BY directory_id"""
+            ).fetchall()
             rows = db.execute(
                 """SELECT p.file_id,p.status,p.review_state,p.proposed_path,p.user_path,p.updated_at,
                           f.path,f.size,f.validation,f.exported_path
                    FROM reconstruction_proposals p JOIN files f ON f.id=p.file_id
                    WHERE p.review_state='accepted' ORDER BY p.file_id"""
             ).fetchall()
+        for row in directory_rows:
+            signature.append(("directory", row["directory_id"], row["proposed_path"], row["updated_at"]))
         for row in rows:
             effective = row["user_path"] or row["proposed_path"]
-            signature.append((row["file_id"], effective, row["updated_at"]))
+            signature.append(("file", row["file_id"], effective, row["updated_at"]))
             if row["exported_path"] and Path(row["exported_path"]).exists():
                 already_exported += 1
                 continue
@@ -2183,9 +2335,9 @@ class Curator:
             total_bytes += int(row["size"] or 0)
         token = blake3(json.dumps(signature, separators=(",", ":")).encode("utf-8")).hexdigest()
         return {
-            "accepted": len(signature), "ready": ready, "blocked": blocked, "unavailable": unavailable,
+            "accepted": len(rows), "ready": ready, "blocked": blocked, "unavailable": unavailable,
             "already_exported": already_exported, "collisions": collisions, "bytes": total_bytes,
-            "bytes_human": human_bytes(total_bytes), "token": token,
+            "bytes_human": human_bytes(total_bytes), "directories": len(directory_rows), "token": token,
         }
 
     def reconstruction_export_preview(self, authorize: bool = False) -> dict:
@@ -2211,6 +2363,14 @@ class Curator:
             raise RuntimeError("The plan changed or has not been previewed. Generate a fresh dry run first.")
         exported, failed, skipped = 0, 0, 0
         with connect(self.db_path) as db:
+            directory_rows = db.execute(
+                """SELECT proposed_path FROM reconstruction_directories
+                   WHERE status='included' ORDER BY LENGTH(proposed_path),proposed_path"""
+            ).fetchall()
+            for directory in directory_rows:
+                destination = self.output / directory["proposed_path"]
+                destination.mkdir(parents=True, exist_ok=True)
+                self._normalize_output_directories(destination, self.output)
             rows = db.execute(
                 """SELECT p.*,COALESCE(p.user_path,p.proposed_path) effective_path,f.*
                    FROM reconstruction_proposals p JOIN files f ON f.id=p.file_id
@@ -2329,6 +2489,175 @@ class Curator:
 
         config = ProviderConfig.from_mapping(self.ai_provider_settings())
         return AIProviderClient(config).test_connection()
+
+    def start_structure_ai(self, limit: int = 300) -> int:
+        settings = self.ai_provider_settings()
+        if not settings.get("enabled"):
+            raise RuntimeError("Save and enable an AI provider before interpreting folder context.")
+        requested = max(25, min(int(limit), 1000))
+        with connect(self.db_path) as db:
+            available = db.execute("SELECT COUNT(*) FROM folder_context").fetchone()[0]
+        if not available:
+            raise RuntimeError("Build the reconstruction plan before interpreting folder context.")
+        with self.lock:
+            if self.state["running"]:
+                raise RuntimeError("Another scan or analysis job is already running.")
+            self.state.update(
+                running=True, phase="ai_structure", processed=0, total=1, rate=0.0,
+                message="AI is interpreting folder reviews, empty directories, and context", error=None,
+            )
+        self.stop_event.clear()
+        threading.Thread(target=self._structure_ai_wrapper, args=(requested,), daemon=True).start()
+        return min(requested, available)
+
+    def _structure_ai_wrapper(self, limit: int) -> None:
+        from .ai import AIProviderClient, ProviderConfig
+
+        settings = self.ai_provider_settings()
+        config = ProviderConfig.from_mapping(settings)
+        source = f"ai:{config.provider_name}"[:100]
+        with connect(self.db_path) as db:
+            folders = [dict(row) for row in db.execute(
+                """SELECT directory_id,relative_path,name,descendant_files,descendant_bytes,zero_files,
+                          review_status,user_label,notes,suggestion_score
+                   FROM folder_context
+                   ORDER BY (review_status!='unreviewed') DESC,(notes IS NOT NULL) DESC,
+                            (descendant_files=0) DESC,suggestion_score DESC,directory_id
+                   LIMIT ?""",
+                (limit,),
+            )]
+            run_id = int(db.execute(
+                """INSERT INTO ai_runs(
+                     file_id,provider_name,model,status,request_kind,created_at
+                   ) VALUES(NULL,?,?, 'running','structure_analysis',?)""",
+                (config.provider_name, config.model, utcnow()),
+            ).lastrowid)
+            db.commit()
+        try:
+            self._check_cancel()
+            result = AIProviderClient(config).analyze_structure(folders, self.list_recovery_context())
+            self._check_cancel()
+            valid_paths = {item["relative_path"]: item for item in folders}
+            folder_items = result.get("folder_suggestions")
+            rule_items = result.get("path_rules")
+            if not isinstance(folder_items, list):
+                folder_items = []
+            if not isinstance(rule_items, list):
+                rule_items = []
+            saved = []
+            now = utcnow()
+            def confidence_of(item: dict) -> int:
+                try:
+                    return max(0, min(int(item.get("confidence") or 0), 100))
+                except (TypeError, ValueError):
+                    return 0
+            for item in folder_items[:500]:
+                if not isinstance(item, dict):
+                    continue
+                relative = str(item.get("relative_path") or "").strip()
+                status = str(item.get("review_status") or "").strip()
+                target = valid_paths.get(relative)
+                if not target or status not in {"recognized", "private", "noise", "system"}:
+                    continue
+                label_text = str(item.get("user_label") or "").strip()
+                saved.append((
+                    "folder", target["directory_id"], relative, status,
+                    sanitize_component(label_text)[:150] if label_text else None,
+                    None, None, confidence_of(item),
+                    str(item.get("reason") or "")[:1000] or None, source, "pending", now, now,
+                ))
+            for item in rule_items[:200]:
+                if not isinstance(item, dict):
+                    continue
+                match_text = str(item.get("match_text") or "").strip()[:300]
+                destination = self._clean_relative_path(str(item.get("destination") or "").strip())[:500]
+                if not match_text or not destination or destination == ".":
+                    continue
+                saved.append((
+                    "rule", None, None, None, str(item.get("label") or "AI path rule")[:150],
+                    match_text, destination, confidence_of(item),
+                    str(item.get("reason") or "")[:1000] or None, source, "pending", now, now,
+                ))
+            with connect(self.db_path) as db:
+                db.execute("DELETE FROM ai_structure_suggestions WHERE status='pending'")
+                if saved:
+                    db.executemany(
+                        """INSERT INTO ai_structure_suggestions(
+                             suggestion_type,directory_id,relative_path,review_status,user_label,
+                             match_text,destination,confidence,reason,source,status,created_at,updated_at
+                           ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        saved,
+                    )
+                db.execute(
+                    """UPDATE ai_runs SET status='complete',response_json=?,completed_at=? WHERE id=?""",
+                    (json.dumps(result, ensure_ascii=False), utcnow(), run_id),
+                )
+                db.commit()
+            self._set_state(
+                running=False, phase="complete", processed=1, total=1,
+                message=f"AI folder interpretation ready — {len(saved):,} suggestions to review", error=None,
+            )
+        except ScanCancelled as exc:
+            with connect(self.db_path) as db:
+                db.execute(
+                    "UPDATE ai_runs SET status='cancelled',error=?,completed_at=? WHERE id=?",
+                    (str(exc), utcnow(), run_id),
+                )
+                db.commit()
+            self._set_state(running=False, phase="stopped", message=str(exc), error=None)
+        except Exception as exc:
+            with connect(self.db_path) as db:
+                db.execute(
+                    "UPDATE ai_runs SET status='failed',error=?,completed_at=? WHERE id=?",
+                    (str(exc)[:1000], utcnow(), run_id),
+                )
+                db.commit()
+            self._set_state(running=False, phase="failed", message="AI folder interpretation failed", error=str(exc))
+
+    def list_structure_suggestions(self, status: str = "pending", limit: int = 250) -> list[dict]:
+        with connect(self.db_path) as db:
+            return [dict(row) for row in db.execute(
+                """SELECT * FROM ai_structure_suggestions WHERE status=?
+                   ORDER BY confidence DESC,id LIMIT ?""",
+                (status, max(1, min(int(limit), 1000))),
+            )]
+
+    def review_structure_suggestion(self, suggestion_id: int, decision: str) -> bool:
+        if decision not in {"accepted", "rejected"}:
+            raise ValueError("invalid suggestion decision")
+        with connect(self.db_path) as db:
+            item = db.execute(
+                "SELECT * FROM ai_structure_suggestions WHERE id=? AND status='pending'", (suggestion_id,)
+            ).fetchone()
+            if not item:
+                raise FileNotFoundError("pending AI structure suggestion not found")
+            if decision == "accepted":
+                if item["suggestion_type"] == "folder":
+                    db.execute(
+                        """UPDATE folder_context SET review_status=?,user_label=COALESCE(?,user_label),
+                                  notes=CASE WHEN notes IS NULL THEN ? ELSE notes END,updated_at=?
+                           WHERE directory_id=?""",
+                        (
+                            item["review_status"], item["user_label"], item["reason"],
+                            utcnow(), item["directory_id"],
+                        ),
+                    )
+                elif item["suggestion_type"] == "rule":
+                    db.execute(
+                        """INSERT INTO recovery_context(
+                             context_type,label,details,match_text,destination,created_at,updated_at
+                           ) VALUES('folder',?,?,?,?,?,?)""",
+                        (
+                            item["user_label"] or "AI path rule", item["reason"], item["match_text"],
+                            item["destination"], utcnow(), utcnow(),
+                        ),
+                    )
+            db.execute(
+                "UPDATE ai_structure_suggestions SET status=?,updated_at=? WHERE id=?",
+                (decision, utcnow(), suggestion_id),
+            )
+            db.commit()
+        return decision == "accepted"
 
     def analyze_file_with_ai(self, file_id: int) -> dict:
         from .ai import AIProviderClient, ProviderConfig
@@ -2964,11 +3293,13 @@ class Curator:
                                         FROM reconstruction_proposals p JOIN files f ON f.id=p.file_id
                                         ORDER BY p.file_id""",
             "folder_context": "SELECT * FROM folder_context ORDER BY suggestion_score DESC,directory_id",
+            "reconstruction_directories": "SELECT * FROM reconstruction_directories ORDER BY directory_id",
             "known_good_matches": "SELECT * FROM known_good_matches ORDER BY file_id,library,relative_path",
             "file_relationships": "SELECT * FROM file_relationships ORDER BY file_id,relationship,related_file_id",
             "file_facets": "SELECT * FROM file_facets ORDER BY file_id,facet_type,source,value",
             "recovery_context": "SELECT * FROM recovery_context ORDER BY context_type,label,id",
             "review_questions": "SELECT * FROM review_questions ORDER BY status,id",
+            "ai_structure_suggestions": "SELECT * FROM ai_structure_suggestions ORDER BY status,id",
         }
         written = []
         with connect(self.db_path) as db:

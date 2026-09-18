@@ -203,9 +203,11 @@ def reconstruction():
         selected_status=proposal_status or "", selected_basis=basis or "",
         proposal_options=curator.proposal_filter_options(),
         proposal_tree=curator.reconstruction_tree(),
+        directory_proposals=curator.list_reconstruction_directories(),
         export_preview=curator.reconstruction_export_preview(),
         ai_settings=ai_settings, ai_runs=curator.recent_ai_runs(),
         ai_candidate_count=curator.ai_batch_candidate_count(),
+        structure_suggestions=curator.list_structure_suggestions(),
     )
 
 
@@ -366,6 +368,28 @@ def start_ai_batch():
     except Exception as exc:
         return render_template("message.html", title="AI batch not started", message=str(exc)), 400
     return redirect(url_for("reconstruction") + "#ai-batch")
+
+
+@app.post("/ai/structure")
+def start_ai_structure():
+    try:
+        curator.start_structure_ai(int(request.form.get("limit", "300")))
+    except Exception as exc:
+        return render_template("message.html", title="Folder interpretation not started", message=str(exc)), 400
+    return redirect(url_for("reconstruction") + "#ai-structure")
+
+
+@app.post("/ai/structure/<int:suggestion_id>")
+def review_ai_structure(suggestion_id: int):
+    try:
+        accepted = curator.review_structure_suggestion(
+            suggestion_id, request.form.get("decision", "rejected")
+        )
+        if accepted:
+            curator.start_reconstruction_plan_refresh()
+    except Exception as exc:
+        return render_template("message.html", title="AI suggestion not updated", message=str(exc)), 400
+    return redirect(url_for("reconstruction") + "#ai-structure")
 
 
 @app.post("/ai/analyze/<int:file_id>")

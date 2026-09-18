@@ -522,12 +522,17 @@ class CuratorTests(unittest.TestCase):
             noise = source / "Recovered Files"
             private = source / "Private Shots"
             system = source / "System Cache"
-            for directory in (noise, private, system):
-                directory.mkdir()
+            original = source / "Original Structure"
+            organized = original / "Organized By Me"
+            vacation = organized / "Vacation"
+            empty_original = original / "Empty Original Album"
+            for directory in (noise, private, system, vacation, empty_original):
+                directory.mkdir(parents=True)
             Image.new("RGB", (32, 32), (20, 40, 60)).save(noise / "snapsave-trip.png")
             Image.new("RGB", (32, 32), (80, 20, 40)).save(private / "private.png")
             (system / "cache.bin").write_bytes(b"application cache")
             Image.new("RGB", (32, 32), (10, 10, 10)).save(source / "space.png")
+            Image.new("RGB", (32, 32), (15, 25, 35)).save(vacation / "nested.png")
 
             curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
             curator.scan()
@@ -535,9 +540,13 @@ class CuratorTests(unittest.TestCase):
             noise_folder = curator.list_folder_context("Recovered Files")[0]
             private_folder = curator.list_folder_context("Private Shots")[0]
             system_folder = curator.list_folder_context("System Cache")[0]
+            original_folder = curator.list_folder_context("Original Structure")[0]
+            organized_folder = curator.list_folder_context("Organized By Me")[0]
             curator.review_folder_context(noise_folder["directory_id"], "noise")
             curator.review_folder_context(private_folder["directory_id"], "private", "Personal")
             curator.review_folder_context(system_folder["directory_id"], "system")
+            curator.review_folder_context(original_folder["directory_id"], "recognized", "Recovered Originals")
+            curator.review_folder_context(organized_folder["directory_id"], "noise", notes="Folder I created while sorting")
             curator.add_recovery_context(
                 "application", "SnapSave exports", "Saved Snapchat media",
                 "snapsave", "Media/Photos/Snapchat",
@@ -553,6 +562,19 @@ class CuratorTests(unittest.TestCase):
             self.assertTrue(proposals["private.png"]["effective_path"].startswith("Private/Recovered Structure/Personal/"))
             self.assertEqual(proposals["cache.bin"]["status"], "excluded_system")
             self.assertIn("NASA", proposals["space.png"]["effective_path"])
+            self.assertIn("Recovered Originals/Vacation/nested.png", proposals["nested.png"]["effective_path"])
+            self.assertNotIn("Organized By Me", proposals["nested.png"]["effective_path"])
+            with connect(config / "catalog.sqlite3") as db:
+                directory_paths = {
+                    row[0] for row in db.execute(
+                        "SELECT proposed_path FROM reconstruction_directories WHERE status='included'"
+                    )
+                }
+            self.assertIn(
+                "Recovered Structure/Recovered Originals/Empty Original Album", directory_paths,
+            )
+            self.assertIn("Recovered Structure/Recovered Originals/Vacation", directory_paths)
+            self.assertFalse(any("Organized By Me" in path for path in directory_paths))
 
     def test_reconstruction_review_dry_run_and_export_are_safety_gated(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -564,11 +586,18 @@ class CuratorTests(unittest.TestCase):
                 directory.mkdir()
             recovered = source / "report.txt"
             recovered.write_text("important recovered document", encoding="utf-8")
+            empty = source / "Original Empty Tree" / "Empty Child"
+            empty.mkdir(parents=True)
             curator = Curator(
                 source, output, quarantine, config / "catalog.sqlite3", allow_actions=True,
             )
             curator.scan()
             curator.build_reconstruction_foundation()
+            original_folder = curator.list_folder_context("Original Empty Tree")[0]
+            curator.review_folder_context(original_folder["directory_id"], "recognized", "Original Tree")
+            with connect(config / "catalog.sqlite3") as db:
+                curator._build_reconstruction_proposals(db)
+                db.commit()
             proposal = curator.list_reconstruction_proposals()[0]
             curator.review_reconstruction_proposal(
                 proposal["file_id"], "accepted", "Recovered Documents/report.txt", "verified",
@@ -582,6 +611,7 @@ class CuratorTests(unittest.TestCase):
             result = curator.export_reconstruction(authorized["token"])
             self.assertEqual(result["exported"], 1)
             self.assertEqual((output / "Recovered Documents" / "report.txt").read_text(), recovered.read_text())
+            self.assertTrue((output / "Recovered Structure" / "Original Tree" / "Empty Child").is_dir())
             self.assertFalse(curator.reconstruction_export_preview()["authorized"])
 
     def test_ai_batch_candidates_use_one_exact_duplicate_representative(self):
@@ -620,6 +650,48 @@ class CuratorTests(unittest.TestCase):
                 ).fetchone()[0]
             self.assertEqual(analyzed, 2)
             self.assertEqual(topic_facets, 2)
+
+    def test_ai_interprets_folder_context_as_reviewable_suggestions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            organized = source / "Sorted Recovery"
+            organized.mkdir()
+            (organized / "file.txt").write_text("recovered", encoding="utf-8")
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+            curator.scan()
+            curator.build_reconstruction_foundation()
+            folder = curator.list_folder_context("Sorted Recovery")[0]
+            curator.review_folder_context(
+                folder["directory_id"], "recognized", notes="I made this folder while sorting recovery output",
+            )
+            curator.add_recovery_context(
+                "general", "Sorting history", "Folders I made during recovery should not be preserved.",
+            )
+            curator.save_ai_provider_settings({
+                "provider_name": "Local vision", "endpoint": "http://ollama:11434",
+                "model": "vision", "enabled": True, "allow_cloud_media": False,
+                "allow_sensitive_media": False,
+            })
+            response = {
+                "folder_suggestions": [{
+                    "relative_path": "Sorted Recovery", "review_status": "noise",
+                    "confidence": 96, "reason": "User says this was a temporary sorting folder",
+                }],
+                "path_rules": [], "summary": "Temporary sorting wrapper found",
+            }
+            with patch("app.ai.AIProviderClient.analyze_structure", return_value=response):
+                curator._structure_ai_wrapper(100)
+            suggestions = curator.list_structure_suggestions()
+            self.assertEqual(len(suggestions), 1)
+            self.assertEqual(suggestions[0]["review_status"], "noise")
+            curator.review_structure_suggestion(suggestions[0]["id"], "accepted")
+            updated = curator.list_folder_context("Sorted Recovery")[0]
+            self.assertEqual(updated["review_status"], "noise")
 
 
 if __name__ == "__main__":

@@ -17,6 +17,7 @@
     <div><div class="metric good">{{ reconstruction.accepted_proposals or 0 }}</div><div class="muted">accepted</div></div>
     <div><div class="metric warn">{{ reconstruction.pending_proposals or 0 }}</div><div class="muted">awaiting review</div></div>
     <div><div class="metric">{{ reconstruction.reviewed_folders or 0 }}</div><div class="muted">folders taught</div></div>
+    <div><div class="metric">{{ reconstruction.directory_proposals or 0 }}</div><div class="muted">original directories preserved</div></div>
     <div><div class="metric">{{ reconstruction.ai_pending or 0 }}</div><div class="muted">media without AI</div></div>
   </div>
   <div class="job-status">
@@ -95,12 +96,30 @@
     </div>
     <div class="check-row">
       <label><input type="checkbox" name="enabled" value="1" {% if ai_settings.enabled %}checked{% endif %}> Enable provider</label>
-      <label><input type="checkbox" name="allow_cloud_media" value="1" {% if ai_settings.allow_cloud_media %}checked{% endif %}> Allow previews to leave my network</label>
+      <label><input type="checkbox" name="allow_cloud_media" value="1" {% if ai_settings.allow_cloud_media %}checked{% endif %}> Allow previews and context to leave my network</label>
       <label><input type="checkbox" name="allow_sensitive_media" value="1" {% if ai_settings.allow_sensitive_media %}checked{% endif %}> Include media already marked sensitive</label>
     </div>
     <button>Save provider</button>
   </form>
   <form method="post" action="/ai/test"><button class="secondary">Test connection (no media sent)</button></form>
+
+  <div class="subcard recommended" id="ai-structure">
+    <span class="step-label">Recommended first</span><h4>Interpret folder structure and your context</h4>
+    <p>This asks the AI to reason over folder names, your folder reviews and notes, empty-directory evidence, and saved context. No photos or videos are sent. Every suggestion remains pending until you accept it.</p>
+    <form method="post" action="/ai/structure" class="filter-bar">
+      <label>Folders to include<select name="limit"><option value="100">100 — focused</option><option value="300" selected>300 — recommended</option><option value="750">750 — broader hierarchy</option><option value="1000">1,000 — maximum</option></select></label>
+      <button id="start-ai-structure" {% if status.running or not ai_settings.enabled %}disabled{% endif %}>Ask AI to interpret context</button>
+    </form>
+    {% if structure_suggestions %}<div class="suggestion-list"><h4>Suggestions awaiting your review</h4>
+      {% for item in structure_suggestions %}<article class="suggestion-card">
+        <div><span class="pill">{{ item.suggestion_type }}</span><span class="pill">{{ item.confidence }}% confidence</span>
+          {% if item.suggestion_type=='folder' %}<strong class="path">{{ item.relative_path }}</strong><span>Mark as <strong>{{ item.review_status }}</strong>{% if item.user_label %} and name it <strong>{{ item.user_label }}</strong>{% endif %}</span>
+          {% else %}<strong>{{ item.user_label }}</strong><span><code>{{ item.match_text }}</code> → <code>{{ item.destination }}</code></span>{% endif %}
+          <span class="muted">{{ item.reason or 'No additional explanation supplied.' }}</span></div>
+        <form method="post" action="/ai/structure/{{ item.id }}"><button name="decision" value="accepted">Accept &amp; apply</button> <button class="secondary" name="decision" value="rejected">Reject</button></form>
+      </article>{% endfor %}
+    </div>{% endif %}
+  </div>
 
   <div class="subcard" id="ai-batch">
     <h4>Batch classification</h4>
@@ -131,7 +150,10 @@
   <div class="section-heading"><div><span class="step-label">Step 3</span><h3>Review the proposed library</h3></div>
     <form method="post" action="/reconstruction/proposals/accept-safe" class="compact-form"><label>Minimum confidence <input type="number" name="minimum_confidence" min="0" max="100" value="85"></label><button>Accept safe proposals</button></form></div>
   <p>Accepting approves only a destination. Files with unresolved duplicate decisions, corruption, known-good coverage, zero-byte evidence, or excluded system branches cannot be accepted.</p>
-  {% if proposal_tree %}<div class="tree-grid">{% for branch in proposal_tree[:12] %}<div class="tree-branch"><strong>{{ branch.path }}</strong><span>{{ branch.files }} files · {{ branch.bytes|human_bytes }}</span><span class="muted">{{ branch.accepted }} accepted · {{ branch.pending }} pending</span></div>{% endfor %}</div>{% endif %}
+  {% if proposal_tree %}<div class="tree-grid">{% for branch in proposal_tree[:12] %}<div class="tree-branch"><strong>{{ branch.path }}</strong><span>{{ branch.files }} files · {{ branch.directories }} original folders · {{ branch.bytes|human_bytes }}</span><span class="muted">{{ branch.accepted }} accepted · {{ branch.pending }} pending</span></div>{% endfor %}</div>{% endif %}
+  {% if directory_proposals %}<details><summary>See original folders that will be recreated ({{ reconstruction.directory_proposals }})</summary><div class="table-wrap"><table><tr><th>Proposed folder</th><th>Original evidence</th><th>Contents</th></tr>
+    {% for directory in directory_proposals %}<tr><td class="path"><strong>{{ directory.proposed_path }}</strong></td><td class="path muted">{{ directory.source_relative_path }}</td><td>{% if directory.descendant_files==0 %}<span class="pill good">empty original folder</span>{% else %}{{ directory.descendant_files }} descendant files{% endif %}</td></tr>{% endfor %}
+  </table></div></details>{% endif %}
   <form method="get" action="/reconstruction" class="filter-bar">
     <label>Search <input name="proposal_q" value="{{ proposal_query }}" placeholder="Source or proposed path"></label>
     <label>Review<select name="review_state"><option value="">All</option>{% for value in ['pending','accepted','excluded'] %}<option value="{{ value }}" {% if selected_review_state==value %}selected{% endif %}>{{ value|title }}</option>{% endfor %}</select></label>
@@ -157,6 +179,7 @@
   <div class="section-heading"><div><span class="step-label">Step 4</span><h3>Dry run and export accepted files</h3></div><span class="safety-badge">Explicit confirmation required</span></div>
   <div class="metric-grid compact">
     <div><div class="metric">{{ export_preview.accepted }}</div><div class="muted">accepted</div></div>
+    <div><div class="metric">{{ export_preview.directories }}</div><div class="muted">original folders</div></div>
     <div><div class="metric good">{{ export_preview.ready }}</div><div class="muted">ready to copy</div></div>
     <div><div class="metric warn">{{ export_preview.collisions }}</div><div class="muted">name collisions</div></div>
     <div><div class="metric bad">{{ export_preview.blocked + export_preview.unavailable }}</div><div class="muted">blocked/unavailable</div></div>
@@ -179,12 +202,12 @@
 const reconstructionMessage = document.getElementById('reconstruction-message');
 const reconstructionProgress = document.getElementById('reconstruction-progress');
 const reconstructionDetail = document.getElementById('reconstruction-detail');
-const jobButtons = ['start-reconstruction','refresh-reconstruction','start-ai-batch'].map(id => document.getElementById(id)).filter(Boolean);
+const jobButtons = ['start-reconstruction','refresh-reconstruction','start-ai-batch','start-ai-structure'].map(id => document.getElementById(id)).filter(Boolean);
 const cancelReconstruction = document.getElementById('cancel-reconstruction');
 const cancelForm = document.getElementById('cancel-reconstruction-form');
 let reconstructionWasRunning = {{ 'true' if status.running else 'false' }};
 cancelForm.addEventListener('submit', () => { cancelReconstruction.disabled=true; cancelReconstruction.textContent='Cancellation requested…'; reconstructionMessage.textContent='Cancellation requested — finishing the current item…'; });
-async function refreshReconstruction(){try{const response=await fetch('/api/status');const data=await response.json();const s=data.status;reconstructionMessage.textContent=s.message+(s.error?' — '+s.error:'');reconstructionProgress.max=Math.max(s.total,1);reconstructionProgress.value=s.processed;reconstructionDetail.textContent=`${s.phase} — ${s.processed}/${s.total} — ${s.rate||0} files/s`;jobButtons.forEach(button=>button.disabled=s.running||(button.id==='start-ai-batch'&&!{{ 'true' if ai_settings.enabled else 'false' }}));cancelReconstruction.disabled=!s.running;if(s.running){reconstructionWasRunning=true;setTimeout(refreshReconstruction,1500)}else if(reconstructionWasRunning){window.location.reload()}}catch(error){reconstructionMessage.textContent='Unable to refresh status — retrying…';setTimeout(refreshReconstruction,3000)}}
+async function refreshReconstruction(){try{const response=await fetch('/api/status');const data=await response.json();const s=data.status;reconstructionMessage.textContent=s.message+(s.error?' — '+s.error:'');reconstructionProgress.max=Math.max(s.total,1);reconstructionProgress.value=s.processed;reconstructionDetail.textContent=`${s.phase} — ${s.processed}/${s.total} — ${s.rate||0} files/s`;jobButtons.forEach(button=>button.disabled=s.running||(['start-ai-batch','start-ai-structure'].includes(button.id)&&!{{ 'true' if ai_settings.enabled else 'false' }}));cancelReconstruction.disabled=!s.running;if(s.running){reconstructionWasRunning=true;setTimeout(refreshReconstruction,1500)}else if(reconstructionWasRunning){window.location.reload()}}catch(error){reconstructionMessage.textContent='Unable to refresh status — retrying…';setTimeout(refreshReconstruction,3000)}}
 refreshReconstruction();
 document.querySelectorAll('.preset').forEach(button=>button.addEventListener('click',()=>{document.getElementById('provider-name').value=button.dataset.provider;document.getElementById('provider-endpoint').value=button.dataset.endpoint;document.getElementById('provider-model').value=button.dataset.model;document.getElementById('provider-endpoint').focus()}));
 </script>
