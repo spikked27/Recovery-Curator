@@ -93,27 +93,42 @@
 <section class="card" id="ai-provider">
   <div class="section-heading"><div><span class="step-label">Step 2</span><h3>Connect a vision AI</h3></div><span class="pill {{ 'good' if ai_settings.enabled else 'warn' }}">{{ 'Enabled' if ai_settings.enabled else 'Not configured' }}</span></div>
   <p>The provider receives only a reduced image preview or four-frame video contact sheet plus metadata and your saved clues. It never gets filesystem access or permission to move files.</p>
-  <div class="preset-row">
-    <button type="button" class="preset secondary" data-provider="Ollama" data-endpoint="http://YOUR-AI-SERVER:11434" data-model="llava">Ollama / local</button>
-    <button type="button" class="preset secondary" data-provider="LM Studio" data-endpoint="http://YOUR-AI-PC:1234" data-model="your-loaded-vision-model">LM Studio</button>
-    <button type="button" class="preset secondary" data-provider="OpenAI-compatible cloud" data-endpoint="https://api.openai.com" data-model="your-vision-model">Cloud API</button>
-  </div>
   {% if ai_settings.endpoint and not ai_settings.is_local and not ai_settings.allow_cloud_media %}<div class="notice"><strong>Remote endpoint detected.</strong> Preview transmission is blocked until you opt in below.</div>{% endif %}
-  <form method="post" action="/ai/provider" class="stacked-form" id="ai-provider-form">
-    <div class="form-grid">
-      <label>Provider name<input id="provider-name" name="provider_name" value="{{ ai_settings.provider_name or 'Local AI' }}"></label>
-      <label>OpenAI-compatible endpoint<input id="provider-endpoint" name="endpoint" value="{{ ai_settings.endpoint or '' }}" placeholder="http://192.168.x.x:11434"></label>
-      <label>Vision model<input id="provider-model" name="model" value="{{ ai_settings.model or '' }}" placeholder="Model name exposed by the provider"></label>
-      <label>API-key environment variable<input name="api_key_env" value="{{ ai_settings.api_key_env or '' }}" placeholder="RECOVERY_AI_API_KEY"></label>
+  <form class="stacked-form ai-connect" id="ai-provider-form">
+    <div class="ai-connect-grid">
+      <label>Provider
+        <select id="provider-id" name="provider_id">
+          <option value="openai" {% if ai_settings.provider_id=='openai' %}selected{% endif %}>OpenAI</option>
+          <option value="gemini" {% if ai_settings.provider_id=='gemini' %}selected{% endif %}>Google Gemini</option>
+          <option value="openrouter" {% if ai_settings.provider_id=='openrouter' %}selected{% endif %}>OpenRouter</option>
+          <option value="ollama" {% if ai_settings.provider_id=='ollama' %}selected{% endif %}>Ollama (local)</option>
+          <option value="lmstudio" {% if ai_settings.provider_id=='lmstudio' %}selected{% endif %}>LM Studio (local)</option>
+          <option value="custom" {% if ai_settings.provider_id not in ['openai','gemini','openrouter','ollama','lmstudio'] %}selected{% endif %}>Other OpenAI-compatible provider</option>
+        </select>
+      </label>
+      <label>API endpoint<input id="provider-endpoint" name="endpoint" value="{{ ai_settings.endpoint or '' }}" placeholder="Choose a provider to fill this in" spellcheck="false"></label>
+      <label>API key
+        <div class="input-action"><input id="provider-api-key" name="api_key" type="password" autocomplete="new-password" placeholder="{{ 'Saved — enter a new key to replace it' if ai_settings.has_api_key else 'Paste your provider API key' }}"><button type="button" class="ghost" id="toggle-api-key">Show</button></div>
+        <small id="key-state" class="muted">{% if ai_settings.has_api_key %}A key is saved for this scan. It is never shown again.{% else %}Local providers usually do not require a key.{% endif %}</small>
+      </label>
     </div>
+    <div class="ai-model-row">
+      <label>Vision-capable model<input id="provider-model" name="model" value="{{ ai_settings.model or '' }}" list="ai-model-options" placeholder="Test the connection to load models" autocomplete="off"></label>
+      <datalist id="ai-model-options"></datalist>
+      <button type="button" class="secondary" id="test-ai-provider">Test &amp; load models</button>
+    </div>
+    <div id="ai-provider-result" class="connection-result" role="status" aria-live="polite">No test run in this browser session.</div>
     <div class="check-row">
       <label><input type="checkbox" name="enabled" value="1" {% if ai_settings.enabled %}checked{% endif %}> Enable provider</label>
       <label><input type="checkbox" name="allow_cloud_media" value="1" {% if ai_settings.allow_cloud_media %}checked{% endif %}> Allow previews and context to leave my network</label>
       <label><input type="checkbox" name="allow_sensitive_media" value="1" {% if ai_settings.allow_sensitive_media %}checked{% endif %}> Include media already marked sensitive</label>
     </div>
-    <button>Save provider</button>
+    <details class="advanced-settings"><summary>Advanced settings</summary><div class="form-grid">
+      <label>Display name<input id="provider-name" name="provider_name" value="{{ ai_settings.provider_name or 'Local AI' }}"></label>
+      <label>API key environment-variable name<input id="provider-api-key-env" name="api_key_env" value="{{ ai_settings.api_key_env or '' }}" placeholder="RECOVERY_AI_API_KEY"><small class="muted">This is a variable name, not the key itself.</small></label>
+    </div></details>
+    <div class="provider-actions"><button type="submit" id="save-ai-provider">Save connection</button>{% if ai_settings.has_api_key %}<button type="button" class="danger" id="forget-api-key">Forget saved key</button>{% endif %}<span class="muted">Testing and save errors stay on this page.</span></div>
   </form>
-  <form method="post" action="/ai/test"><button class="secondary">Test connection (no media sent)</button></form>
 
   <div class="subcard recommended" id="ai-structure">
     <span class="step-label">Recommended first</span><h4>Interpret folder structure and your context</h4>
@@ -222,6 +237,72 @@ let reconstructionWasRunning = {{ 'true' if status.running else 'false' }};
 cancelForm.addEventListener('submit', () => { cancelReconstruction.disabled=true; cancelReconstruction.textContent='Cancellation requested…'; reconstructionMessage.textContent='Cancellation requested — finishing the current item…'; });
 async function refreshReconstruction(){try{const response=await fetch('/api/status');const data=await response.json();const s=data.status;reconstructionMessage.textContent=s.message+(s.error?' — '+s.error:'');reconstructionProgress.max=Math.max(s.total,1);reconstructionProgress.value=s.processed;reconstructionDetail.textContent=`${s.phase} — ${s.processed}/${s.total} — ${s.rate||0} files/s`;jobButtons.forEach(button=>button.disabled=s.running||(['start-ai-batch','start-ai-structure'].includes(button.id)&&!{{ 'true' if ai_settings.enabled else 'false' }}));cancelReconstruction.disabled=!s.running;if(s.running){reconstructionWasRunning=true;setTimeout(refreshReconstruction,1500)}else if(reconstructionWasRunning){window.location.reload()}}catch(error){reconstructionMessage.textContent='Unable to refresh status — retrying…';setTimeout(refreshReconstruction,3000)}}
 refreshReconstruction();
-document.querySelectorAll('.preset').forEach(button=>button.addEventListener('click',()=>{document.getElementById('provider-name').value=button.dataset.provider;document.getElementById('provider-endpoint').value=button.dataset.endpoint;document.getElementById('provider-model').value=button.dataset.model;document.getElementById('provider-endpoint').focus()}));
+const providerPresets = {
+  openai:{name:'OpenAI',endpoint:'https://api.openai.com/v1',key:'Paste your OpenAI API key'},
+  gemini:{name:'Google Gemini',endpoint:'https://generativelanguage.googleapis.com/v1beta/openai',key:'Paste your Gemini API key'},
+  openrouter:{name:'OpenRouter',endpoint:'https://openrouter.ai/api/v1',key:'Paste your OpenRouter API key'},
+  ollama:{name:'Ollama',endpoint:'http://YOUR-AI-SERVER:11434/v1',key:'Usually no API key is needed'},
+  lmstudio:{name:'LM Studio',endpoint:'http://YOUR-AI-PC:1234/v1',key:'Usually no API key is needed'},
+  custom:{name:'OpenAI-compatible provider',endpoint:'',key:'Paste a key if your provider requires one'}
+};
+const providerForm = document.getElementById('ai-provider-form');
+const providerId = document.getElementById('provider-id');
+const providerName = document.getElementById('provider-name');
+const providerEndpoint = document.getElementById('provider-endpoint');
+const providerModel = document.getElementById('provider-model');
+const providerKey = document.getElementById('provider-api-key');
+const providerKeyEnv = document.getElementById('provider-api-key-env');
+const keyState = document.getElementById('key-state');
+const providerResult = document.getElementById('ai-provider-result');
+const modelOptions = document.getElementById('ai-model-options');
+const testProvider = document.getElementById('test-ai-provider');
+const saveProvider = document.getElementById('save-ai-provider');
+const forgetKey = document.getElementById('forget-api-key');
+let hasSavedKey = {{ 'true' if ai_settings.has_api_key else 'false' }};
+let clearSavedKey = false;
+const draftKey = 'recovery-curator-ai-provider-draft';
+
+function providerValues(){return {
+  provider_id:providerId.value,provider_name:providerName.value.trim(),endpoint:providerEndpoint.value.trim(),
+  model:providerModel.value.trim(),api_key:providerKey.value.trim(),api_key_env:providerKeyEnv.value.trim(),
+  enabled:providerForm.elements.enabled.checked,
+  allow_cloud_media:providerForm.elements.allow_cloud_media.checked,
+  allow_sensitive_media:providerForm.elements.allow_sensitive_media.checked,clear_api_key:clearSavedKey
+}}
+function showProviderResult(message,state=''){providerResult.textContent=message;providerResult.className='connection-result '+state}
+function saveDraft(){const values=providerValues();delete values.api_key;delete values.clear_api_key;sessionStorage.setItem(draftKey,JSON.stringify(values))}
+function restoreDraft(){try{const values=JSON.parse(sessionStorage.getItem(draftKey)||'null');if(!values)return;for(const [name,value] of Object.entries(values)){const field=providerForm.elements[name];if(!field)continue;if(field.type==='checkbox')field.checked=Boolean(value);else field.value=value}}catch(error){sessionStorage.removeItem(draftKey)}}
+async function providerRequest(url,values){
+  const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)});
+  let data={};try{data=await response.json()}catch(error){throw new Error(`Server returned ${response.status} without a readable response.`)}
+  if(!response.ok||data.ok===false)throw new Error(data.error||`Request failed (${response.status}).`);
+  return data;
+}
+restoreDraft();
+providerId.addEventListener('change',()=>{const preset=providerPresets[providerId.value];providerName.value=preset.name;providerEndpoint.value=preset.endpoint;providerModel.value='';providerKey.placeholder=preset.key;modelOptions.replaceChildren();saveDraft();providerEndpoint.focus()});
+providerForm.addEventListener('input',saveDraft);
+document.getElementById('toggle-api-key').addEventListener('click',event=>{const showing=providerKey.type==='text';providerKey.type=showing?'password':'text';event.currentTarget.textContent=showing?'Show':'Hide'});
+if(forgetKey)forgetKey.addEventListener('click',()=>{clearSavedKey=!clearSavedKey;providerKey.value='';forgetKey.textContent=clearSavedKey?'Keep saved key':'Forget saved key';keyState.textContent=clearSavedKey?'The saved key will be removed when you save.':'The saved key will be kept.'});
+testProvider.addEventListener('click',async()=>{
+  testProvider.disabled=true;testProvider.textContent='Testing…';showProviderResult('Contacting the provider’s model list…');
+  try{
+    const data=await providerRequest('/api/ai/provider/test',providerValues());
+    modelOptions.replaceChildren(...data.models.map(id=>{const option=document.createElement('option');option.value=id;return option}));
+    showProviderResult(`Connected to a ${data.local?'local/private':'cloud'} endpoint. Loaded ${data.models.length} model${data.models.length===1?'':'s'}.`,'success');
+    if(data.models.length&&!providerModel.value)providerModel.focus();
+  }catch(error){showProviderResult(error.message,'error')}
+  finally{testProvider.disabled=false;testProvider.textContent='Test & load models'}
+});
+providerForm.addEventListener('submit',async event=>{
+  event.preventDefault();saveProvider.disabled=true;saveProvider.textContent='Saving…';showProviderResult('Saving connection settings…');
+  try{
+    const data=await providerRequest('/api/ai/provider/save',providerValues());
+    hasSavedKey=data.settings.has_api_key;clearSavedKey=false;providerKey.value='';providerKey.placeholder=hasSavedKey?'Saved — enter a new key to replace it':providerPresets[providerId.value].key;
+    keyState.textContent=hasSavedKey?'A key is saved for this scan. It is never shown again.':'No API key is saved.';
+    if(forgetKey&&!hasSavedKey)forgetKey.hidden=true;
+    sessionStorage.removeItem(draftKey);showProviderResult('Connection saved. You can now run a test or start AI analysis.','success');
+  }catch(error){showProviderResult(error.message,'error')}
+  finally{saveProvider.disabled=false;saveProvider.textContent='Save connection'}
+});
 </script>
 {% endblock %}

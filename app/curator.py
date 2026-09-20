@@ -282,6 +282,7 @@ def initialize(db_path: Path) -> None:
             );
             CREATE TABLE IF NOT EXISTS ai_provider_settings (
               id INTEGER PRIMARY KEY CHECK(id=1),
+              provider_id TEXT NOT NULL DEFAULT 'custom',
               provider_name TEXT NOT NULL DEFAULT 'Local AI',
               endpoint TEXT,
               model TEXT,
@@ -375,6 +376,9 @@ def initialize(db_path: Path) -> None:
         for column in ("match_text", "destination"):
             if column not in context_columns:
                 db.execute(f"ALTER TABLE recovery_context ADD COLUMN {column} TEXT")
+        provider_columns = {row[1] for row in db.execute("PRAGMA table_info(ai_provider_settings)")}
+        if "provider_id" not in provider_columns:
+            db.execute("ALTER TABLE ai_provider_settings ADD COLUMN provider_id TEXT NOT NULL DEFAULT 'custom'")
         db.execute("CREATE INDEX IF NOT EXISTS idx_files_known_good ON files(known_good_match)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_files_media_kind ON files(media_kind)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_files_media_origin ON files(media_origin)")
@@ -952,6 +956,10 @@ class Curator:
             db.execute("DELETE FROM reference_files")
             db.execute("DELETE FROM settings")
             db.commit()
+        try:
+            self._ai_secret_path().unlink()
+        except FileNotFoundError:
+            pass
         removed_reports = 0
         for name in (
             "recovery_catalog.csv", "recovery_catalog.jsonl",
@@ -2476,30 +2484,79 @@ class Curator:
         with connect(self.db_path) as db:
             row = db.execute("SELECT * FROM ai_provider_settings WHERE id=1").fetchone()
         result = dict(row) if row else {
-            "id": 1, "provider_name": "Local AI", "endpoint": "", "model": "", "api_key_env": "",
+            "id": 1, "provider_id": "custom", "provider_name": "Local AI", "endpoint": "", "model": "",
+            "api_key_env": "",
             "enabled": 0, "allow_cloud_media": 0, "allow_sensitive_media": 0, "updated_at": None,
         }
         result["is_local"] = endpoint_is_local(result.get("endpoint") or "") if result.get("endpoint") else None
+        result["has_api_key"] = bool(self._load_ai_secret())
         return result
+
+    def _ai_secret_path(self) -> Path:
+        return self.db_path.parent / "ai-provider-secret.json"
+
+    def _load_ai_secret(self) -> str:
+        try:
+            value = json.loads(self._ai_secret_path().read_text(encoding="utf-8"))
+            return str(value.get("api_key") or "").strip()
+        except (FileNotFoundError, OSError, TypeError, ValueError, json.JSONDecodeError):
+            return ""
+
+    def _save_ai_secret(self, api_key: str) -> None:
+        target = self._ai_secret_path()
+        if not api_key:
+            try:
+                target.unlink()
+            except FileNotFoundError:
+                pass
+            return
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+        try:
+            temporary.write_text(json.dumps({"api_key": api_key}), encoding="utf-8")
+            temporary.chmod(0o600)
+            temporary.replace(target)
+            target.chmod(0o600)
+        finally:
+            try:
+                temporary.unlink()
+            except FileNotFoundError:
+                pass
+
+    def _ai_provider_config_values(self, overrides: dict | None = None) -> dict:
+        values = self.ai_provider_settings()
+        if overrides:
+            values.update(overrides)
+        supplied_key = str(values.get("api_key") or "").strip()
+        values["api_key"] = supplied_key or self._load_ai_secret()
+        return values
 
     def save_ai_provider_settings(self, values: dict) -> dict:
         from .ai import ProviderConfig
 
         config = ProviderConfig.from_mapping(values)
         config.validate()
+        new_key = str(values.get("api_key") or "").strip()
+        clear_key = bool(values.get("clear_api_key"))
+        if new_key:
+            self._save_ai_secret(new_key)
+        elif clear_key:
+            self._save_ai_secret("")
         with connect(self.db_path) as db:
             db.execute(
                 """INSERT INTO ai_provider_settings(
-                     id,provider_name,endpoint,model,api_key_env,enabled,
+                     id,provider_id,provider_name,endpoint,model,api_key_env,enabled,
                      allow_cloud_media,allow_sensitive_media,updated_at
-                   ) VALUES(1,?,?,?,?,?,?,?,?)
+                   ) VALUES(1,?,?,?,?,?,?,?,?,?)
                    ON CONFLICT(id) DO UPDATE SET
-                     provider_name=excluded.provider_name,endpoint=excluded.endpoint,model=excluded.model,
+                     provider_id=excluded.provider_id,provider_name=excluded.provider_name,
+                     endpoint=excluded.endpoint,model=excluded.model,
                      api_key_env=excluded.api_key_env,enabled=excluded.enabled,
                      allow_cloud_media=excluded.allow_cloud_media,
                      allow_sensitive_media=excluded.allow_sensitive_media,updated_at=excluded.updated_at""",
                 (
-                    config.provider_name[:100], config.endpoint[:500] or None, config.model[:200] or None,
+                    config.provider_id[:50], config.provider_name[:100], config.endpoint[:500] or None,
+                    config.model[:200] or None,
                     config.api_key_env[:100] or None, int(config.enabled), int(config.allow_cloud_media),
                     int(config.allow_sensitive_media), utcnow(),
                 ),
@@ -2507,14 +2564,16 @@ class Curator:
             db.commit()
         return self.ai_provider_settings()
 
-    def test_ai_provider(self) -> dict:
+    def test_ai_provider(self, values: dict | None = None) -> dict:
         from .ai import AIProviderClient, ProviderConfig
 
-        config = ProviderConfig.from_mapping(self.ai_provider_settings())
+        config_values = self._ai_provider_config_values(values)
+        config_values["enabled"] = False
+        config = ProviderConfig.from_mapping(config_values)
         return AIProviderClient(config).test_connection()
 
     def start_structure_ai(self, limit: int = 300) -> int:
-        settings = self.ai_provider_settings()
+        settings = self._ai_provider_config_values()
         if not settings.get("enabled"):
             raise RuntimeError("Save and enable an AI provider before interpreting folder context.")
         requested = max(25, min(int(limit), 1000))
@@ -2536,7 +2595,7 @@ class Curator:
     def _structure_ai_wrapper(self, limit: int) -> None:
         from .ai import AIProviderClient, ProviderConfig
 
-        settings = self.ai_provider_settings()
+        settings = self._ai_provider_config_values()
         config = ProviderConfig.from_mapping(settings)
         source = f"ai:{config.provider_name}"[:100]
         with connect(self.db_path) as db:
@@ -2689,7 +2748,7 @@ class Curator:
         if not row:
             raise FileNotFoundError("catalog row not found")
         preview = self.ensure_media_preview(file_id)
-        settings = self.ai_provider_settings()
+        settings = self._ai_provider_config_values()
         config = ProviderConfig.from_mapping(settings)
         metadata = {
             "name": row["name"], "relative_path": row["relative_path"], "extension": row["extension"],

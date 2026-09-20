@@ -332,10 +332,13 @@ def set_facet(file_id: int):
 def save_ai_provider():
     try:
         curator.save_ai_provider_settings({
+            "provider_id": request.form.get("provider_id", "custom"),
             "provider_name": request.form.get("provider_name", "Local AI"),
             "endpoint": request.form.get("endpoint", ""),
             "model": request.form.get("model", ""),
+            "api_key": request.form.get("api_key", ""),
             "api_key_env": request.form.get("api_key_env", ""),
+            "clear_api_key": request.form.get("clear_api_key") == "1",
             "enabled": request.form.get("enabled") == "1",
             "allow_cloud_media": request.form.get("allow_cloud_media") == "1",
             "allow_sensitive_media": request.form.get("allow_sensitive_media") == "1",
@@ -343,6 +346,26 @@ def save_ai_provider():
     except Exception as exc:
         return render_template("message.html", title="AI provider not saved", message=str(exc)), 400
     return redirect(url_for("reconstruction") + "#ai-provider")
+
+
+@app.post("/api/ai/provider/save")
+def api_save_ai_provider():
+    values = request.get_json(silent=True) or {}
+    try:
+        settings = curator.save_ai_provider_settings(values)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "settings": settings})
+
+
+@app.post("/api/ai/provider/test")
+def api_test_ai_provider():
+    values = request.get_json(silent=True) or {}
+    try:
+        result = curator.test_ai_provider(values)
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify(result)
 
 
 @app.post("/ai/test")

@@ -9,6 +9,7 @@ from unittest.mock import Mock, patch
 
 from PIL import Image
 
+from app.ai import AIProviderClient, ProviderConfig
 from app.curator import Curator, connect, parse_filename_date
 
 
@@ -510,6 +511,51 @@ class CuratorTests(unittest.TestCase):
             curator.answer_review_question(question_id, "It came from my old laptop.")
             self.assertEqual(curator.list_review_questions(), [])
             self.assertEqual(len(curator.list_recovery_context()), 2)
+
+    def test_ai_api_key_is_saved_outside_database_and_can_be_replaced_or_removed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+            values = {
+                "provider_id": "openai", "provider_name": "OpenAI",
+                "endpoint": "https://api.openai.com/v1", "model": "vision-model",
+                "api_key": "sk-test-secret", "enabled": True,
+                "allow_cloud_media": True, "allow_sensitive_media": False,
+            }
+            settings = curator.save_ai_provider_settings(values)
+            self.assertTrue(settings["has_api_key"])
+            self.assertNotIn("api_key", settings)
+            secret_path = config / "ai-provider-secret.json"
+            self.assertEqual(stat.S_IMODE(secret_path.stat().st_mode), 0o600)
+            with connect(config / "catalog.sqlite3") as db:
+                stored = json.dumps(dict(db.execute("SELECT * FROM ai_provider_settings").fetchone()))
+            self.assertNotIn("sk-test-secret", stored)
+
+            with patch.object(AIProviderClient, "test_connection", autospec=True) as connection:
+                connection.return_value = {"ok": True, "local": False, "models": ["vision-model"]}
+                curator.test_ai_provider()
+                self.assertEqual(connection.call_args.args[0].config.api_key, "sk-test-secret")
+
+            values["api_key"] = ""
+            curator.save_ai_provider_settings(values)
+            self.assertTrue(curator.ai_provider_settings()["has_api_key"])
+            values["clear_api_key"] = True
+            curator.save_ai_provider_settings(values)
+            self.assertFalse(curator.ai_provider_settings()["has_api_key"])
+            self.assertFalse(secret_path.exists())
+
+    def test_ai_provider_endpoint_normalization_supports_cloud_and_local_presets(self):
+        gemini = AIProviderClient(ProviderConfig(endpoint="https://generativelanguage.googleapis.com/v1beta/openai"))
+        ollama = AIProviderClient(ProviderConfig(endpoint="http://ollama:11434"))
+        self.assertEqual(gemini._base_v1(), "https://generativelanguage.googleapis.com/v1beta/openai")
+        self.assertEqual(ollama._base_v1(), "http://ollama:11434/v1")
+        with self.assertRaisesRegex(ValueError, "Paste the actual secret"):
+            ProviderConfig(api_key_env="sk-actual-key").validate()
 
     def test_folder_feedback_context_rules_and_facets_change_reconstruction(self):
         with tempfile.TemporaryDirectory() as temp:

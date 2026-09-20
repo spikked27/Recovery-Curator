@@ -7,7 +7,7 @@ import os
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -17,10 +17,12 @@ class AIProviderError(RuntimeError):
 
 @dataclass
 class ProviderConfig:
+    provider_id: str = "custom"
     provider_name: str = "Local AI"
     endpoint: str = ""
     model: str = ""
     api_key_env: str = ""
+    api_key: str = field(default="", repr=False)
     enabled: bool = False
     allow_cloud_media: bool = False
     allow_sensitive_media: bool = False
@@ -28,24 +30,36 @@ class ProviderConfig:
     @classmethod
     def from_mapping(cls, item: dict) -> "ProviderConfig":
         return cls(
+            provider_id=str(item.get("provider_id") or "custom").strip(),
             provider_name=str(item.get("provider_name") or "Local AI"),
             endpoint=str(item.get("endpoint") or "").strip(),
             model=str(item.get("model") or "").strip(),
             api_key_env=str(item.get("api_key_env") or "").strip(),
+            api_key=str(item.get("api_key") or "").strip(),
             enabled=bool(item.get("enabled")),
             allow_cloud_media=bool(item.get("allow_cloud_media")),
             allow_sensitive_media=bool(item.get("allow_sensitive_media")),
         )
 
-    def validate(self) -> None:
-        if self.enabled and (not self.endpoint or not self.model):
+    def validate(self, require_model: bool = True) -> None:
+        if self.enabled and (not self.endpoint or (require_model and not self.model)):
             raise ValueError("An enabled AI provider requires both an endpoint and model.")
         if self.endpoint:
             parsed = urllib.parse.urlparse(self.endpoint)
             if parsed.scheme not in {"http", "https"} or not parsed.hostname:
                 raise ValueError("AI endpoint must be an http:// or https:// URL.")
-        if self.api_key_env and not self.api_key_env.replace("_", "").isalnum():
-            raise ValueError("API key environment-variable name contains unsupported characters.")
+        if self.api_key_env and not (
+            self.api_key_env[0].isalpha() or self.api_key_env[0] == "_"
+        ):
+            raise ValueError(
+                "The environment-variable name must look like RECOVERY_AI_API_KEY. "
+                "Paste the actual secret into the API key field instead."
+            )
+        if self.api_key_env and not all(character.isalnum() or character == "_" for character in self.api_key_env):
+            raise ValueError(
+                "The environment-variable name must look like RECOVERY_AI_API_KEY. "
+                "Paste the actual secret into the API key field instead."
+            )
 
 
 def endpoint_is_local(endpoint: str) -> bool:
@@ -61,14 +75,14 @@ def endpoint_is_local(endpoint: str) -> bool:
 
 class AIProviderClient:
     def __init__(self, config: ProviderConfig):
-        config.validate()
+        config.validate(require_model=False)
         self.config = config
 
     def _base_v1(self) -> str:
         endpoint = self.config.endpoint.rstrip("/")
         if endpoint.endswith("/chat/completions"):
             return endpoint[: -len("/chat/completions")]
-        if endpoint.endswith("/v1"):
+        if endpoint.endswith("/v1") or endpoint.endswith("/openai"):
             return endpoint
         return endpoint + "/v1"
 
@@ -78,28 +92,40 @@ class AIProviderClient:
         if payload is not None:
             headers["Content-Type"] = "application/json"
             body = json.dumps(payload).encode("utf-8")
-        if self.config.api_key_env:
+        token = self.config.api_key
+        if not token and self.config.api_key_env:
             token = os.environ.get(self.config.api_key_env)
             if not token:
                 raise AIProviderError(
                     f"Environment variable {self.config.api_key_env} is not available inside the container."
                 )
+        if token:
             headers["Authorization"] = f"Bearer {token}"
         request = urllib.request.Request(url, data=body, headers=headers, method="POST" if body else "GET")
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
                 return json.loads(response.read().decode("utf-8"))
-        except (urllib.error.URLError, urllib.error.HTTPError, TimeoutError, json.JSONDecodeError) as exc:
+        except urllib.error.HTTPError as exc:
+            try:
+                detail = exc.read().decode("utf-8", errors="replace")[:600]
+                parsed = json.loads(detail)
+                detail = str(parsed.get("error", {}).get("message") or parsed.get("message") or detail)
+            except (OSError, TypeError, ValueError, json.JSONDecodeError):
+                detail = ""
+            suffix = f": {detail}" if detail else ""
+            raise AIProviderError(f"Provider returned HTTP {exc.code}{suffix}") from exc
+        except (urllib.error.URLError, TimeoutError, json.JSONDecodeError) as exc:
             raise AIProviderError(str(exc)) from exc
 
     def test_connection(self) -> dict:
         if not self.config.endpoint:
             raise AIProviderError("Configure an AI endpoint first.")
         payload = self._request(self._base_v1() + "/models", timeout=10)
-        model_ids = [str(item.get("id")) for item in payload.get("data", []) if item.get("id")]
-        return {"ok": True, "local": endpoint_is_local(self.config.endpoint), "models": model_ids[:25]}
+        model_ids = sorted({str(item.get("id")) for item in payload.get("data", []) if item.get("id")})
+        return {"ok": True, "local": endpoint_is_local(self.config.endpoint), "models": model_ids[:500]}
 
     def analyze_media(self, preview: Path, metadata: dict, recovery_context: list[dict]) -> dict:
+        self.config.validate(require_model=True)
         if not self.config.enabled:
             raise AIProviderError("The AI provider is disabled.")
         local = endpoint_is_local(self.config.endpoint)
@@ -159,6 +185,7 @@ class AIProviderClient:
         return result
 
     def analyze_structure(self, folders: list[dict], recovery_context: list[dict]) -> dict:
+        self.config.validate(require_model=True)
         if not self.config.enabled:
             raise AIProviderError("The AI provider is disabled.")
         if not endpoint_is_local(self.config.endpoint) and not self.config.allow_cloud_media:
