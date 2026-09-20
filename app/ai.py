@@ -4,6 +4,7 @@ import base64
 import ipaddress
 import json
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -13,6 +14,76 @@ from pathlib import Path
 
 class AIProviderError(RuntimeError):
     pass
+
+
+class AIProviderResponseError(AIProviderError):
+    """A provider answered, but its answer could not be used safely."""
+
+    def __init__(self, message: str, raw_response: str = ""):
+        super().__init__(message)
+        self.raw_response = raw_response[:20000]
+
+
+MEDIA_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "caption": {"type": "string"},
+        "origin": {"type": "string"},
+        "sensitivity": {"type": "string"},
+        "topics": {"type": "array", "items": {"type": "string"}},
+        "people_labels": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "integer"},
+        "reason": {"type": "string"},
+        "questions": {"type": "array", "items": {"type": "string"}},
+    },
+    "required": [
+        "caption", "origin", "sensitivity", "topics", "people_labels",
+        "confidence", "reason", "questions",
+    ],
+    "additionalProperties": False,
+}
+
+
+STRUCTURE_ANALYSIS_SCHEMA = {
+    "type": "object",
+    "properties": {
+        "folder_suggestions": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "relative_path": {"type": "string"},
+                    "review_status": {
+                        "type": "string", "enum": ["recognized", "private", "noise", "system"],
+                    },
+                    "user_label": {"type": "string"},
+                    "confidence": {"type": "integer"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["relative_path", "review_status", "user_label", "confidence", "reason"],
+                "additionalProperties": False,
+            },
+        },
+        "path_rules": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "label": {"type": "string"},
+                    "match_text": {"type": "string"},
+                    "destination": {"type": "string"},
+                    "confidence": {"type": "integer"},
+                    "reason": {"type": "string"},
+                },
+                "required": ["label", "match_text", "destination", "confidence", "reason"],
+                "additionalProperties": False,
+            },
+        },
+        "summary": {"type": "string"},
+    },
+    "required": ["folder_suggestions", "path_rules", "summary"],
+    "additionalProperties": False,
+}
 
 
 @dataclass
@@ -155,19 +226,39 @@ class AIProviderClient:
 
     @staticmethod
     def _json_object(text: str, error: str) -> dict:
-        if text.startswith("```"):
-            text = text.strip("`")
-            if text.lstrip().startswith("json"):
-                text = text.lstrip()[4:].lstrip()
-        try:
-            result = json.loads(text)
-        except json.JSONDecodeError as exc:
-            raise AIProviderError(error) from exc
-        if not isinstance(result, dict):
-            raise AIProviderError(error)
-        return result
+        text = text.strip()
+        candidates = [text]
+        candidates.extend(
+            match.group(1).strip()
+            for match in re.finditer(r"```(?:json)?\s*([\s\S]*?)```", text, flags=re.IGNORECASE)
+        )
+        decoder = json.JSONDecoder()
+        for candidate in candidates:
+            try:
+                result = json.loads(candidate)
+            except json.JSONDecodeError:
+                result = None
+            if isinstance(result, dict):
+                return result
+        # Some models add a sentence before or after otherwise valid JSON. raw_decode
+        # lets us recover the first complete object without guessing at brace boundaries.
+        for offset, character in enumerate(text):
+            if character != "{":
+                continue
+            try:
+                result, _ = decoder.raw_decode(text[offset:])
+            except json.JSONDecodeError:
+                continue
+            if isinstance(result, dict):
+                return result
+        excerpt = " ".join(text.split())[:600]
+        detail = f" Provider reply began: {excerpt}" if excerpt else " The provider returned an empty reply."
+        raise AIProviderResponseError(error + detail, text)
 
-    def _message(self, system: str, user_content: str | list[dict], timeout: int) -> dict:
+    def _message(
+        self, system: str, user_content: str | list[dict], timeout: int,
+        output_schema: dict | None = None,
+    ) -> dict:
         if self._is_anthropic():
             payload = {
                 "model": self.config.model,
@@ -175,6 +266,10 @@ class AIProviderClient:
                 "system": system,
                 "messages": [{"role": "user", "content": user_content}],
             }
+            if output_schema:
+                payload["output_config"] = {
+                    "format": {"type": "json_schema", "schema": output_schema},
+                }
             return self._request(self._base_v1() + "/messages", payload, timeout=timeout)
         payload = {
             "model": self.config.model,
@@ -228,7 +323,12 @@ class AIProviderClient:
                 {"type": "text", "text": prompt},
                 {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}},
             ]
-        response = self._message(system, user_content, timeout=120)
+        response = self._message(system, user_content, timeout=120, output_schema=MEDIA_ANALYSIS_SCHEMA)
+        if response.get("stop_reason") in {"max_tokens", "refusal"}:
+            raw = self._response_text(response)
+            raise AIProviderResponseError(
+                f"The provider stopped before returning a usable analysis ({response['stop_reason']}).", raw,
+            )
         return self._json_object(
             self._response_text(response), "The provider did not return the required JSON analysis object."
         )
@@ -254,7 +354,8 @@ class AIProviderClient:
             "for a well-supported category such as Snapchat over claiming an original folder location. "
             "Return one JSON object with folder_suggestions, path_rules, and summary. "
             "folder_suggestions must contain only exact relative_path values from the supplied data plus "
-            "review_status (recognized, private, noise, or system), optional user_label, confidence 0-100, and reason. "
+            "review_status (recognized, private, noise, or system), user_label (an empty string when unchanged), "
+            "confidence 0-100, and reason. "
             "path_rules may contain label, match_text, destination, confidence, and reason. "
             "Do not suggest destructive file actions and do not invent people identities."
         )
@@ -265,7 +366,13 @@ class AIProviderClient:
             f"Folders:\n{json.dumps(folders, ensure_ascii=False)}\n"
             f"Recovery context:\n{json.dumps(recovery_context, ensure_ascii=False)}"
         )
-        response = self._message(system, prompt, timeout=180)
+        response = self._message(system, prompt, timeout=180, output_schema=STRUCTURE_ANALYSIS_SCHEMA)
+        if response.get("stop_reason") in {"max_tokens", "refusal"}:
+            raw = self._response_text(response)
+            raise AIProviderResponseError(
+                f"The provider stopped before returning a usable structure analysis ({response['stop_reason']}).",
+                raw,
+            )
         return self._json_object(
             self._response_text(response), "The provider did not return the required JSON structure analysis."
         )

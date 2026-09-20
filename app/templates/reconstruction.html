@@ -5,35 +5,42 @@
   <span class="safety-badge">Source remains unchanged</span>
 </div>
 
-<section class="card workflow-card">
-  <div class="workflow-steps">
-    <a href="#folder-clues"><strong>1</strong><span>Teach</span></a>
-    <a href="#ai-provider"><strong>2</strong><span>Classify</span></a>
-    <a href="#proposed-tree"><strong>3</strong><span>Review</span></a>
-    <a href="#export-plan"><strong>4</strong><span>Export</span></a>
+<section class="card workflow-card workspace-overview">
+  <div class="workflow-steps" id="workflow-stages" aria-label="Reconstruction workflow">
+    <a href="#baseline" data-stage="baseline"><strong>1</strong><span>Baseline</span><small>Analyze what survived</small></a>
+    <a href="#evidence" data-stage="evidence"><strong>2</strong><span>Evidence</span><small>Add what you know</small></a>
+    <a href="#ai-provider" data-stage="ai"><strong>3</strong><span>AI assist</span><small>Interpret, never apply</small></a>
+    <a href="#proposed-tree" data-stage="review"><strong>4</strong><span>Review</span><small>Approve destinations</small></a>
+    <a href="#export-plan" data-stage="export"><strong>5</strong><span>Dry run</span><small>Verify before copy</small></a>
   </div>
-  <div class="metric-grid compact">
-    <div><div class="metric">{{ reconstruction.proposals or 0 }}</div><div class="muted">proposals</div></div>
-    <div><div class="metric good">{{ reconstruction.accepted_proposals or 0 }}</div><div class="muted">accepted</div></div>
-    <div><div class="metric warn">{{ reconstruction.pending_proposals or 0 }}</div><div class="muted">awaiting review</div></div>
-    <div><div class="metric">{{ reconstruction.reviewed_folders or 0 }}</div><div class="muted">folders taught</div></div>
-    <div><div class="metric">{{ reconstruction.directory_proposals or 0 }}</div><div class="muted">original directories preserved</div></div>
-    <div><div class="metric">{{ reconstruction.ai_pending or 0 }}</div><div class="muted">media without AI</div></div>
+  <div class="workspace-grid">
+    <div class="next-action" id="next-action">
+      <span class="step-label">Recommended next</span>
+      <h3 id="next-action-title">Loading your next step…</h3>
+      <p id="next-action-detail" class="muted">Checking the current plan and recent activity.</p>
+      <a id="next-action-link" class="button" href="#live-job">View status</a>
+    </div>
+    <div class="live-job {{ 'is-running' if status.running }}" id="live-job" aria-live="polite">
+      <div class="job-heading"><div><span class="step-label">Current activity</span><h3 id="reconstruction-message">{{ status.message }}</h3></div><span id="job-state-pill" class="pill {{ 'good' if status.running else '' }}">{{ 'Running' if status.running else status.phase|replace('_',' ')|title }}</span></div>
+      <progress id="reconstruction-progress" max="{{ status.total or 1 }}" value="{{ status.processed or 0 }}"></progress>
+      <p class="muted" id="reconstruction-detail">{{ status.processed }}/{{ status.total }} · {{ status.rate or 0 }} items/s</p>
+      <p id="reconstruction-error" class="job-error bad" {% if not status.error %}hidden{% endif %}>{{ status.error or '' }}</p>
+      <div class="scan-actions">
+        <form class="async-job" data-endpoint="/api/reconstruction/start"><button id="start-reconstruction" {% if status.running %}disabled{% endif %}>Run full analysis</button></form>
+        <form class="async-job" data-endpoint="/api/reconstruction/refresh"><button id="refresh-reconstruction" class="secondary" {% if status.running %}disabled{% endif %}>Apply saved feedback</button></form>
+        <button id="cancel-reconstruction" class="danger" {% if not status.running %}disabled{% endif %}>Cancel</button>
+      </div>
+    </div>
   </div>
-  <div class="job-status">
-    <p id="reconstruction-message"><strong>{{ status.message }}</strong>{% if status.error %} — <span class="bad">{{ status.error }}</span>{% endif %}</p>
-    <progress id="reconstruction-progress" max="{{ status.total or 1 }}" value="{{ status.processed or 0 }}"></progress>
-    <p class="muted" id="reconstruction-detail">{{ status.phase }} — {{ status.processed }}/{{ status.total }} — {{ status.rate or 0 }} files/s</p>
+  <div class="metric-grid compact workspace-metrics">
+    <div><div class="metric" data-metric="proposals">{{ reconstruction.proposals or 0 }}</div><div class="muted">destinations proposed</div></div>
+    <div><div class="metric" data-metric="reviewed_folders">{{ reconstruction.reviewed_folders or 0 }}</div><div class="muted">folders reviewed</div></div>
+    <div><div class="metric warn" data-metric="pending_proposals">{{ reconstruction.pending_proposals or 0 }}</div><div class="muted">decisions remaining</div></div>
+    <div><div class="metric good" data-metric="accepted_proposals">{{ reconstruction.accepted_proposals or 0 }}</div><div class="muted">destinations approved</div></div>
   </div>
-  <div class="scan-actions">
-    <form method="post" action="/reconstruction/start"><button id="start-reconstruction" {% if status.running %}disabled{% endif %}>Full media analysis</button></form>
-    <form method="post" action="/reconstruction/refresh"><button id="refresh-reconstruction" class="secondary" {% if status.running %}disabled{% endif %}>Apply feedback to plan</button></form>
-    <form id="cancel-reconstruction-form" method="post" action="/scan/stop"><button id="cancel-reconstruction" class="danger" {% if not status.running %}disabled{% endif %}>Cancel current job</button></form>
-  </div>
-  <p class="muted"><strong>Full media analysis</strong> enriches new media and rebuilds everything. <strong>Apply feedback</strong> is the fast option after reviewing folders, adding rules, or running AI.</p>
 </section>
 
-<section class="card evidence-plan">
+<section class="card evidence-plan" id="baseline">
   <div class="section-heading"><div><span class="step-label">Conservative strategy</span><h3>Reconstruct only what the evidence supports</h3></div><span class="safety-badge">No invented hierarchy</span></div>
   <p>Recovery Curator exhausts known-good paths, your explicit folder reviews, approved rules, metadata, and optional AI suggestions. When that still is not enough, it stops trying to recreate the original tree and uses a clean <code>Organized Library</code> grouped by media type, origin, interpreted category, and date.</p>
   <div class="metric-grid compact">
@@ -44,11 +51,11 @@
   </div>
 </section>
 
-<section class="card" id="folder-clues">
-  <div class="section-heading"><div><span class="step-label">Step 1</span><h3>Teach Recovery Curator what you recognize</h3></div>
-    <form method="post" action="/reconstruction/refresh"><button class="secondary" {% if status.running %}disabled{% endif %}>Apply saved feedback</button></form></div>
+<section class="card" id="evidence">
+  <div class="section-heading"><div><span class="step-label">Step 2 · Evidence</span><h3>Teach Recovery Curator what you recognize</h3></div>
+    <form class="async-job" data-endpoint="/api/reconstruction/refresh"><button class="secondary" {% if status.running %}disabled{% endif %}>Apply saved feedback</button></form></div>
   <p>Folder reviews now directly affect the plan: useful folders are preserved, private folders go under <code>Private</code>, recovery noise is stripped away, and system/application branches are excluded.</p>
-  <details class="review-drawer" {% if folder_query %}open{% endif %}><summary>Browse and review {{ reconstruction.folder_suggestions or 0 }} discovered folders</summary>
+  <details class="review-drawer" id="folder-clues" {% if folder_query %}open{% endif %}><summary>Browse and review {{ reconstruction.folder_suggestions or 0 }} discovered folders</summary>
   <form method="get" action="/reconstruction" class="filter-bar">
     <label>Find a folder <input name="folder_q" value="{{ folder_query }}" placeholder="Name or surviving path"></label>
     <button class="secondary">Search</button>{% if folder_query %}<a class="button ghost" href="/reconstruction#folder-clues">Clear</a>{% endif %}
@@ -91,8 +98,10 @@
 </section>
 
 <section class="card" id="ai-provider">
-  <div class="section-heading"><div><span class="step-label">Step 2</span><h3>Connect a vision AI</h3></div><span id="ai-provider-state" class="pill {{ 'good' if ai_settings.enabled else 'warn' }}">{{ 'Enabled' if ai_settings.enabled else 'Not configured' }}</span></div>
-  <p>The provider receives only a reduced image preview or four-frame video contact sheet plus metadata and your saved clues. It never gets filesystem access or permission to move files.</p>
+  <div class="section-heading"><div><span class="step-label">Step 3 · Optional AI assist</span><h3>Interpret the evidence you supplied</h3></div><span id="ai-provider-state" class="pill {{ 'good' if ai_settings.enabled else 'warn' }}">{{ 'Enabled' if ai_settings.enabled else 'Not configured' }}</span></div>
+  <p>AI can interpret your explanations and propose classifications, but nothing is applied until you approve it. It never gets filesystem access or permission to move files.</p>
+  <div class="provider-summary"><div><span class="muted">Current connection</span><strong id="provider-summary-name">{% if ai_settings.enabled %}{{ ai_settings.provider_name }} · {{ ai_settings.model }}{% else %}No AI provider enabled{% endif %}</strong></div><span class="muted">Folder interpretation sends names, notes, and context—not photos or videos.</span></div>
+  <details class="review-drawer connection-drawer" {% if not ai_settings.enabled %}open{% endif %}><summary>Configure or change the AI connection</summary>
   {% if ai_settings.endpoint and not ai_settings.is_local and not ai_settings.allow_cloud_media %}<div class="notice"><strong>Remote endpoint detected.</strong> Preview transmission is blocked until you opt in below.</div>{% endif %}
   <form class="stacked-form ai-connect" id="ai-provider-form">
     <div class="ai-connect-grid">
@@ -132,30 +141,31 @@
       <label>API key environment-variable name<input id="provider-api-key-env" name="api_key_env" value="{{ ai_settings.api_key_env or '' }}" placeholder="RECOVERY_AI_API_KEY"><small class="muted">This is a variable name, not the key itself.</small></label>
     </div></details>
     <div class="provider-actions"><button type="submit" id="save-ai-provider">Save connection</button>{% if ai_settings.has_api_key %}<button type="button" class="danger" id="forget-api-key">Forget saved key</button>{% endif %}<span class="muted">Testing and save errors stay on this page.</span></div>
-  </form>
+  </form></details>
 
   <div class="subcard recommended" id="ai-structure">
     <span class="step-label">Recommended first</span><h4>Interpret folder structure and your context</h4>
     <p>This asks the AI to reason over folder names, your folder reviews and notes, empty-directory evidence, and saved context. No photos or videos are sent. Every suggestion remains pending until you accept it.</p>
-    <form method="post" action="/ai/structure" class="filter-bar">
+    <form class="filter-bar async-job" data-endpoint="/api/reconstruction/ai/structure">
       <label>Folders to include<select name="limit"><option value="100">100 — focused</option><option value="300" selected>300 — recommended</option><option value="750">750 — broader hierarchy</option><option value="1000">1,000 — maximum</option></select></label>
       <button id="start-ai-structure" {% if status.running or not ai_settings.enabled %}disabled{% endif %}>Ask AI to interpret context</button>
     </form>
-    {% if structure_suggestions %}<details class="review-drawer"><summary>{{ structure_suggestions|length }} AI structure suggestions awaiting review</summary><div class="suggestion-list">
+    <div id="ai-structure-result" class="connection-result" role="status" aria-live="polite">{% if ai_runs and ai_runs[0].request_kind=='structure_analysis' %}Last run: {{ ai_runs[0].status }}{% if ai_runs[0].error %} — {{ ai_runs[0].error }}{% endif %}{% else %}No folder interpretation has been run yet.{% endif %}</div>
+    <details class="review-drawer" id="ai-suggestions" {% if structure_suggestions %}open{% endif %}><summary><span id="ai-suggestion-count">{{ structure_suggestions|length }}</span> AI structure suggestions awaiting review</summary><div class="suggestion-list" id="ai-suggestion-list">
       {% for item in structure_suggestions %}<article class="suggestion-card">
         <div><span class="pill">{{ item.suggestion_type }}</span><span class="pill">{{ item.confidence }}% confidence</span>
           {% if item.suggestion_type=='folder' %}<strong class="path">{{ item.relative_path }}</strong><span>Mark as <strong>{{ item.review_status }}</strong>{% if item.user_label %} and name it <strong>{{ item.user_label }}</strong>{% endif %}</span>
           {% else %}<strong>{{ item.user_label }}</strong><span><code>{{ item.match_text }}</code> → <code>{{ item.destination }}</code></span>{% endif %}
           <span class="muted">{{ item.reason or 'No additional explanation supplied.' }}</span></div>
-        <form method="post" action="/ai/structure/{{ item.id }}"><button name="decision" value="accepted">Accept &amp; apply</button> <button class="secondary" name="decision" value="rejected">Reject</button></form>
+        <form class="suggestion-review" data-id="{{ item.id }}"><button name="decision" value="accepted">Accept &amp; apply</button> <button class="secondary" name="decision" value="rejected">Reject</button></form>
       </article>{% endfor %}
-    </div></details>{% endif %}
+    </div><p class="empty-state" id="ai-suggestion-empty" {% if structure_suggestions %}hidden{% endif %}>No AI suggestions are waiting. A successful run may also return zero suggestions when the evidence is not strong enough—that is a valid, safer result.</p></details>
   </div>
 
   <div class="subcard" id="ai-batch">
     <h4>Batch classification</h4>
     <p><strong>{{ ai_candidate_count }}</strong> representative files currently match the recommended filters. Exact duplicates reuse one AI result, reducing time and API cost.</p>
-    <form method="post" action="/ai/batch" class="filter-bar">
+    <form class="filter-bar async-job" data-endpoint="/api/reconstruction/ai/batch">
       <label>Media<select name="media_kind"><option value="all">Photos and videos</option><option value="photo">Photos only</option><option value="video">Videos only</option></select></label>
       <label>Maximum<select name="limit"><option>25</option><option selected>100</option><option>500</option><option>1000</option></select></label>
       <label class="checkbox-label"><input type="checkbox" name="pending_only" value="1" checked> Skip previously analyzed</label>
@@ -163,22 +173,22 @@
       <button id="start-ai-batch" {% if status.running or not ai_settings.enabled %}disabled{% endif %}>Start AI batch</button>
     </form>
   </div>
-  {% if ai_runs %}<details><summary>Recent AI activity</summary><div class="table-wrap"><table><tr><th>File</th><th>Provider / model</th><th>Status</th><th>Error</th></tr>
-    {% for run in ai_runs %}<tr><td>{{ run.name or 'connection/job' }}</td><td>{{ run.provider_name }} / {{ run.model }}</td><td>{{ run.status }}</td><td>{{ run.error or '' }}</td></tr>{% endfor %}
-  </table></div></details>{% endif %}
+  <details class="review-drawer"><summary>Recent AI activity</summary><div class="table-wrap"><table><thead><tr><th>Task</th><th>Provider / model</th><th>Status</th><th>Result</th></tr></thead><tbody id="ai-run-list">
+    {% for run in ai_runs %}<tr><td>{{ 'Folder interpretation' if run.request_kind=='structure_analysis' else (run.name or 'Media analysis') }}</td><td>{{ run.provider_name }} / {{ run.model }}</td><td>{{ run.status }}</td><td>{{ run.error or ('Completed' if run.status=='complete' else '') }}</td></tr>{% endfor %}
+  </tbody></table></div></details>
 </section>
 
 {% if review_questions %}<section class="card" id="review-questions">
-  <h3>Questions from the AI</h3><p>Answers become context for later files; they are never silently treated as facts.</p>
+  <details class="review-drawer"><summary>{{ review_questions|length }} questions from the AI</summary><p>Answers become context for later files; they are never silently treated as facts.</p>
   <div class="items">{% for question in review_questions %}<article class="item">
     {% if question.file_id and question.media_kind in ['photo','video'] %}<a href="/preview/{{ question.file_id }}" target="_blank"><img class="thumb {% if question.sensitivity in ['adult','intimate','possibly_sensitive'] %}sensitive{% endif %}" src="/preview/{{ question.file_id }}" loading="lazy"></a>{% endif %}
     <p><strong>{{ question.question }}</strong></p>{% if question.name %}<p class="path muted">{{ question.name }}<br>{{ question.relative_path }}</p>{% endif %}
     <form method="post" action="/questions/answer" class="stacked-form"><input type="hidden" name="question_id" value="{{ question.id }}"><textarea name="answer" placeholder="What do you recognize or remember?"></textarea><div><button>Save answer</button> <button class="secondary" name="dismiss" value="1">Dismiss</button></div></form>
-  </article>{% endfor %}</div>
+  </article>{% endfor %}</div></details>
 </section>{% endif %}
 
 <section class="card" id="proposed-tree">
-  <div class="section-heading"><div><span class="step-label">Step 3</span><h3>Review the proposed library</h3></div>
+  <div class="section-heading"><div><span class="step-label">Step 4 · Review</span><h3>Review the proposed library</h3></div>
     <form method="post" action="/reconstruction/proposals/accept-safe" class="compact-form"><label>Minimum confidence <input type="number" name="minimum_confidence" min="0" max="100" value="85"></label><button>Accept safe proposals</button></form></div>
   <p>Accepting approves only a destination. Files with unresolved duplicate decisions, corruption, known-good coverage, zero-byte evidence, or excluded system branches cannot be accepted.</p>
   {% if proposal_tree %}<div class="tree-grid">{% for branch in proposal_tree[:12] %}<div class="tree-branch"><strong>{{ branch.path }}</strong><span>{{ branch.files }} files · {{ branch.directories }} original folders · {{ branch.bytes|human_bytes }}</span><span class="muted">{{ branch.accepted }} accepted · {{ branch.pending }} pending</span></div>{% endfor %}</div>{% endif %}
@@ -208,7 +218,7 @@
 </section>
 
 <section class="card" id="export-plan">
-  <div class="section-heading"><div><span class="step-label">Step 4</span><h3>Dry run and export accepted files</h3></div><span class="safety-badge">Explicit confirmation required</span></div>
+  <div class="section-heading"><div><span class="step-label">Step 5 · Verify</span><h3>Dry run and export accepted files</h3></div><span class="safety-badge">Explicit confirmation required</span></div>
   <div class="metric-grid compact">
     <div><div class="metric">{{ export_preview.accepted }}</div><div class="muted">accepted</div></div>
     <div><div class="metric">{{ export_preview.directories }}</div><div class="muted">original folders</div></div>
@@ -234,16 +244,134 @@
 const reconstructionMessage = document.getElementById('reconstruction-message');
 const reconstructionProgress = document.getElementById('reconstruction-progress');
 const reconstructionDetail = document.getElementById('reconstruction-detail');
-const jobButtons = ['start-reconstruction','refresh-reconstruction','start-ai-batch','start-ai-structure'].map(id => document.getElementById(id)).filter(Boolean);
+const reconstructionError = document.getElementById('reconstruction-error');
+const liveJob = document.getElementById('live-job');
+const jobStatePill = document.getElementById('job-state-pill');
+const jobButtons = [...document.querySelectorAll('.async-job button')];
 const cancelReconstruction = document.getElementById('cancel-reconstruction');
-const cancelForm = document.getElementById('cancel-reconstruction-form');
-let reconstructionWasRunning = {{ 'true' if status.running else 'false' }};
 let reconstructionRunning = {{ 'true' if status.running else 'false' }};
 let providerEnabled = {{ 'true' if ai_settings.enabled else 'false' }};
-function updateJobButtons(){jobButtons.forEach(button=>button.disabled=reconstructionRunning||(['start-ai-batch','start-ai-structure'].includes(button.id)&&!providerEnabled))}
-cancelForm.addEventListener('submit', () => { cancelReconstruction.disabled=true; cancelReconstruction.textContent='Cancellation requested…'; reconstructionMessage.textContent='Cancellation requested — finishing the current item…'; });
-async function refreshReconstruction(){try{const response=await fetch('/api/status');const data=await response.json();const s=data.status;reconstructionRunning=s.running;reconstructionMessage.textContent=s.message+(s.error?' — '+s.error:'');reconstructionProgress.max=Math.max(s.total,1);reconstructionProgress.value=s.processed;reconstructionDetail.textContent=`${s.phase} — ${s.processed}/${s.total} — ${s.rate||0} files/s`;updateJobButtons();cancelReconstruction.disabled=!s.running;if(s.running){reconstructionWasRunning=true;setTimeout(refreshReconstruction,1500)}else if(reconstructionWasRunning){window.location.reload()}}catch(error){reconstructionMessage.textContent='Unable to refresh status — retrying…';setTimeout(refreshReconstruction,3000)}}
-refreshReconstruction();
+let workspaceTimer;
+
+function updateJobButtons(){
+  jobButtons.forEach(button=>{
+    const needsAI=['start-ai-batch','start-ai-structure'].includes(button.id);
+    button.disabled=reconstructionRunning||(needsAI&&!providerEnabled);
+  });
+  cancelReconstruction.disabled=!reconstructionRunning;
+}
+function elapsedLabel(started,completed){
+  if(!started)return '';
+  const seconds=Math.max(0,Math.round(((completed?new Date(completed):new Date())-new Date(started))/1000));
+  if(seconds<60)return `${seconds}s elapsed`;
+  const minutes=Math.floor(seconds/60),rest=seconds%60;
+  return `${minutes}m ${rest}s elapsed`;
+}
+async function jsonRequest(url,values={}){
+  const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json','Accept':'application/json'},body:JSON.stringify(values)});
+  let data={};try{data=await response.json()}catch(error){throw new Error(`Server returned ${response.status} without a readable response.`)}
+  if(!response.ok||data.ok===false)throw new Error(data.error||`Request failed (${response.status}).`);
+  return data;
+}
+function formValues(form){
+  const values={};
+  for(const field of form.elements){
+    if(!field.name)continue;
+    values[field.name]=field.type==='checkbox'?field.checked:field.value;
+  }
+  return values;
+}
+function setStarting(message){
+  reconstructionRunning=true;reconstructionMessage.textContent=message;reconstructionError.hidden=true;
+  jobStatePill.textContent='Starting';jobStatePill.className='pill good';liveJob.classList.add('is-running');
+  reconstructionProgress.removeAttribute('value');updateJobButtons();
+}
+document.querySelectorAll('.async-job').forEach(form=>form.addEventListener('submit',async event=>{
+  event.preventDefault();
+  const clicked=event.submitter;const original=clicked?clicked.textContent:'';
+  setStarting(clicked?.id==='start-ai-structure'?'Sending folder evidence and context to AI…':'Starting job…');
+  if(clicked)clicked.textContent='Starting…';
+  try{await jsonRequest(form.dataset.endpoint,formValues(form));await refreshWorkspace(true)}
+  catch(error){reconstructionRunning=false;reconstructionMessage.textContent='Job was not started';reconstructionError.textContent=error.message;reconstructionError.hidden=false;liveJob.classList.remove('is-running');updateJobButtons()}
+  finally{if(clicked)clicked.textContent=original}
+}));
+cancelReconstruction.addEventListener('click',async()=>{
+  cancelReconstruction.disabled=true;cancelReconstruction.textContent='Stopping…';reconstructionMessage.textContent='Cancellation requested — finishing the current checkpoint…';
+  try{await jsonRequest('/api/reconstruction/cancel');await refreshWorkspace(true)}
+  catch(error){reconstructionError.textContent=error.message;reconstructionError.hidden=false}
+  finally{cancelReconstruction.textContent='Cancel'}
+});
+
+function appendText(parent,tag,text,className=''){
+  const element=document.createElement(tag);element.textContent=text;if(className)element.className=className;parent.appendChild(element);return element;
+}
+function renderSuggestions(items){
+  const list=document.getElementById('ai-suggestion-list');const empty=document.getElementById('ai-suggestion-empty');
+  document.getElementById('ai-suggestion-count').textContent=items.length;list.replaceChildren();empty.hidden=Boolean(items.length);
+  for(const item of items){
+    const article=document.createElement('article');article.className='suggestion-card';const copy=document.createElement('div');
+    appendText(copy,'span',item.suggestion_type,'pill');appendText(copy,'span',`${item.confidence}% confidence`,'pill');
+    if(item.suggestion_type==='folder'){
+      appendText(copy,'strong',item.relative_path,'path');appendText(copy,'span',`Mark as ${item.review_status}${item.user_label?` and name it ${item.user_label}`:''}`);
+    }else{
+      appendText(copy,'strong',item.user_label||'AI path rule');appendText(copy,'span',`${item.match_text} → ${item.destination}`,'path');
+    }
+    appendText(copy,'span',item.reason||'No additional explanation supplied.','muted');article.appendChild(copy);
+    const form=document.createElement('form');form.className='suggestion-review';form.dataset.id=item.id;
+    const accept=appendText(form,'button','Accept & apply');accept.name='decision';accept.value='accepted';
+    const reject=appendText(form,'button','Reject','secondary');reject.name='decision';reject.value='rejected';
+    article.appendChild(form);list.appendChild(article);
+  }
+}
+document.getElementById('ai-suggestions').addEventListener('submit',async event=>{
+  const form=event.target.closest('.suggestion-review');if(!form)return;event.preventDefault();
+  const button=event.submitter;button.disabled=true;
+  try{await jsonRequest(`/api/reconstruction/ai/suggestion/${form.dataset.id}`,{decision:button.value});setStarting(button.value==='accepted'?'Suggestion accepted — rebuilding the plan…':'Suggestion rejected');await refreshWorkspace(true)}
+  catch(error){reconstructionError.textContent=error.message;reconstructionError.hidden=false;button.disabled=false}
+});
+function renderRuns(runs){
+  const body=document.getElementById('ai-run-list');body.replaceChildren();
+  for(const run of runs){
+    const row=document.createElement('tr');appendText(row,'td',run.request_kind==='structure_analysis'?'Folder interpretation':(run.name||'Media analysis'));
+    appendText(row,'td',`${run.provider_name||''} / ${run.model||''}`);appendText(row,'td',run.status,`run-${run.status}`);
+    const result=run.error||run.result_summary||(run.status==='complete'?'Completed':run.status==='running'?'In progress':'');appendText(row,'td',result);
+    body.appendChild(row);
+  }
+}
+function renderLiveStatus(s){
+  reconstructionRunning=Boolean(s.running);
+  reconstructionMessage.textContent=s.message||'Ready';reconstructionError.textContent=s.error||'';reconstructionError.hidden=!s.error;
+  jobStatePill.textContent=s.running?'Running':String(s.phase||'ready').replaceAll('_',' ');jobStatePill.className=`pill ${s.phase==='failed'?'bad':s.running||s.phase==='complete'?'good':''}`;
+  liveJob.classList.toggle('is-running',Boolean(s.running));
+  if(s.total){reconstructionProgress.max=s.total;reconstructionProgress.value=s.processed||0}else if(s.running){reconstructionProgress.removeAttribute('value')}else{reconstructionProgress.max=1;reconstructionProgress.value=s.phase==='complete'?1:0}
+  const count=s.total?`${s.processed||0}/${s.total}`:`${s.processed||0} processed`;const rate=s.rate?` · ${s.rate} items/s`:'';
+  reconstructionDetail.textContent=`${String(s.phase||'ready').replaceAll('_',' ')} · ${count}${rate}${s.started_at?` · ${elapsedLabel(s.started_at,s.completed_at)}`:''}`;
+  updateJobButtons();
+}
+function renderWorkspace(data){
+  renderLiveStatus(data.status);providerEnabled=Boolean(data.provider.enabled);
+  for(const [key,value] of Object.entries(data.reconstruction)){const node=document.querySelector(`[data-metric="${key}"]`);if(node)node.textContent=Number(value||0).toLocaleString()}
+  for(const stage of data.stages){const node=document.querySelector(`[data-stage="${stage.id}"]`);if(node){node.dataset.state=stage.state;node.classList.toggle('stage-complete',stage.state==='complete')}}
+  document.getElementById('next-action-title').textContent=data.next_action.title;document.getElementById('next-action-detail').textContent=data.next_action.detail;
+  const nextLink=document.getElementById('next-action-link');nextLink.href=data.next_action.target;nextLink.textContent=data.next_action.button;
+  document.getElementById('provider-summary-name').textContent=data.provider.enabled?`${data.provider.provider_name} · ${data.provider.model}`:'No AI provider enabled';
+  document.getElementById('ai-provider-state').textContent=data.provider.enabled?'Enabled':'Not configured';
+  document.getElementById('ai-provider-state').className=`pill ${data.provider.enabled?'good':'warn'}`;
+  const latest=data.ai_runs.find(run=>run.request_kind==='structure_analysis');const structureResult=document.getElementById('ai-structure-result');
+  if(latest){structureResult.textContent=latest.status==='complete'?`Completed — ${data.suggestion_count} suggestion${data.suggestion_count===1?'':'s'} ready for review.${latest.result_summary?` ${latest.result_summary}`:''}`:latest.status==='running'?'AI is interpreting your evidence now…':`Failed — ${latest.error||'No usable result was returned.'}`;structureResult.className=`connection-result ${latest.status==='complete'?'success':latest.status==='failed'?'error':''}`}
+  renderSuggestions(data.suggestions);renderRuns(data.ai_runs);updateJobButtons();
+}
+async function refreshWorkspace(immediate=false){
+  clearTimeout(workspaceTimer);
+  try{
+    const lightweight=reconstructionRunning;const response=await fetch(lightweight?'/api/status':'/api/reconstruction/workspace',{headers:{'Accept':'application/json'}});
+    if(!response.ok)throw new Error(`Status request failed (${response.status})`);const data=await response.json();
+    if(lightweight){renderLiveStatus(data.status);if(!data.status.running){reconstructionRunning=false;return refreshWorkspace(true)}}else{renderWorkspace(data)}
+    workspaceTimer=setTimeout(refreshWorkspace,data.status.running?1500:7000)
+  }
+  catch(error){reconstructionDetail.textContent=`Live status unavailable — retrying (${error.message})`;workspaceTimer=setTimeout(refreshWorkspace,3000)}
+}
+refreshWorkspace(true);
 const providerPresets = {
   openai:{name:'OpenAI',endpoint:'https://api.openai.com/v1',key:'Paste your OpenAI API key'},
   anthropic:{name:'Anthropic Claude',endpoint:'https://api.anthropic.com/v1',key:'Paste your Anthropic API key'},
@@ -320,7 +448,7 @@ providerForm.addEventListener('submit',async event=>{
     hasSavedKey=data.settings.has_api_key;providerEnabled=Boolean(data.settings.enabled);updateJobButtons();providerState.textContent=providerEnabled?'Enabled':'Disabled';providerState.className='pill '+(providerEnabled?'good':'warn');clearSavedKey=false;providerKey.value='';providerKey.placeholder=hasSavedKey?'Saved — enter a new key to replace it':providerPresets[providerId.value].key;
     keyState.textContent=hasSavedKey?'A key is saved for this scan. It is never shown again.':'No API key is saved.';
     if(forgetKey&&!hasSavedKey)forgetKey.hidden=true;
-    sessionStorage.removeItem(draftKey);showProviderResult('Connection saved. You can now run a test or start AI analysis.','success');
+    sessionStorage.removeItem(draftKey);showProviderResult('Connection saved. You can now run a test or start AI analysis.','success');refreshWorkspace(true);
   }catch(error){showProviderResult(error.message,'error')}
   finally{saveProvider.disabled=false;saveProvider.textContent='Save connection'}
 });

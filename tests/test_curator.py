@@ -9,7 +9,7 @@ from unittest.mock import MagicMock, Mock, patch
 
 from PIL import Image
 
-from app.ai import AIProviderClient, ProviderConfig
+from app.ai import AIProviderClient, AIProviderResponseError, ProviderConfig
 from app.curator import Curator, connect, parse_filename_date
 
 
@@ -598,12 +598,37 @@ class CuratorTests(unittest.TestCase):
             payload = json.loads(request.data.decode())
             self.assertEqual(request.full_url, "https://api.anthropic.com/v1/messages")
             self.assertNotIn("temperature", payload)
+            self.assertEqual(payload["output_config"]["format"]["type"], "json_schema")
+            self.assertEqual(payload["output_config"]["format"]["schema"]["type"], "object")
             self.assertEqual(payload["system"].split()[0], "You")
             image = payload["messages"][0]["content"][0]
             self.assertEqual(image["type"], "image")
             self.assertEqual(image["source"]["type"], "base64")
             self.assertEqual(image["source"]["media_type"], "image/jpeg")
             self.assertEqual(analyzed, expected)
+
+    def test_ai_json_parser_accepts_fenced_and_explained_objects(self):
+        expected = {"folder_suggestions": [], "path_rules": [], "summary": "No safe inference"}
+        fenced = "Here is the analysis:\n```json\n" + json.dumps(expected) + "\n```\nDone."
+        self.assertEqual(
+            AIProviderClient._json_object(fenced, "invalid response"), expected,
+        )
+        with_braces_in_text = (
+            "I considered {folder names}, then returned "
+            + json.dumps({"summary": "A {literal} value", "folder_suggestions": [], "path_rules": []})
+            + " after the explanation."
+        )
+        self.assertEqual(
+            AIProviderClient._json_object(with_braces_in_text, "invalid response")["summary"],
+            "A {literal} value",
+        )
+
+    def test_ai_json_parser_preserves_unusable_provider_reply(self):
+        reply = "I could not produce the requested object because the input was ambiguous."
+        with self.assertRaises(AIProviderResponseError) as raised:
+            AIProviderClient._json_object(reply, "invalid response")
+        self.assertEqual(raised.exception.raw_response, reply)
+        self.assertIn("Provider reply began", str(raised.exception))
 
     def test_anthropic_endpoint_is_recognized_for_existing_custom_settings(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -810,6 +835,32 @@ class CuratorTests(unittest.TestCase):
             curator.review_structure_suggestion(suggestions[0]["id"], "accepted")
             updated = curator.list_folder_context("Sorted Recovery")[0]
             self.assertEqual(updated["review_status"], "noise")
+
+    def test_failed_structure_ai_keeps_provider_reply_and_live_workflow_context(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            (source / "Recovered").mkdir()
+            (source / "Recovered" / "photo.jpg").write_bytes(b"not-an-image")
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+            curator.scan()
+            curator.build_reconstruction_foundation()
+            curator.save_ai_provider_settings({
+                "provider_name": "Claude", "endpoint": "https://api.anthropic.com/v1",
+                "model": "claude-test", "enabled": True, "allow_cloud_media": True,
+            })
+            failure = AIProviderResponseError("invalid response", "Claude explanation without JSON")
+            with patch("app.ai.AIProviderClient.analyze_structure", side_effect=failure):
+                curator._structure_ai_wrapper(100)
+            state = curator.reconstruction_workspace_state()
+            failed = state["ai_runs"][0]
+            self.assertEqual(failed["status"], "failed")
+            self.assertIn("Claude explanation", failed["response_preview"])
+            self.assertEqual(state["next_action"]["id"], "ask_ai")
 
 
 if __name__ == "__main__":

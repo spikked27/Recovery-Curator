@@ -856,7 +856,8 @@ class Curator:
         self.phase_started = time.monotonic()
         self.state = {
             "running": False, "phase": "idle", "processed": 0, "total": 0,
-            "rate": 0.0, "message": "Ready", "error": None,
+            "rate": 0.0, "message": "Ready", "error": None, "job_id": 0,
+            "job_type": None, "started_at": None, "completed_at": None,
         }
         initialize(db_path)
 
@@ -890,12 +891,28 @@ class Curator:
             self.stop_event.clear()
             self.state.update(
                 running=False, phase="idle", processed=0, total=0, rate=0.0,
-                message="Saved scan loaded", error=None,
+                message="Saved scan loaded", error=None, job_type=None,
+                started_at=None, completed_at=None,
             )
 
     def _set_state(self, **values) -> None:
         with self.lock:
+            if values.get("running") is False and self.state.get("running"):
+                values.setdefault("completed_at", utcnow())
             self.state.update(values)
+
+    def _start_job(self, phase: str, message: str, total: int = 0) -> bool:
+        with self.lock:
+            if self.state["running"]:
+                return False
+            self.state.update(
+                running=True, phase=phase, processed=0, total=total, rate=0.0,
+                message=message, error=None, job_id=int(self.state.get("job_id") or 0) + 1,
+                job_type=phase, started_at=utcnow(), completed_at=None,
+            )
+        self.phase_started = time.monotonic()
+        self.stop_event.clear()
+        return True
 
     def _begin_phase(self, phase: str, total: int, message: str) -> None:
         self.phase_started = time.monotonic()
@@ -915,11 +932,8 @@ class Curator:
             raise ScanCancelled("Scan stopped after the latest completed checkpoint")
 
     def start_scan(self) -> bool:
-        with self.lock:
-            if self.state["running"]:
-                return False
-            self.state.update(running=True, phase="inventory", processed=0, total=0, rate=0.0, message="Starting scan", error=None)
-        self.stop_event.clear()
+        if not self._start_job("inventory", "Starting scan"):
+            return False
         threading.Thread(target=self._scan_wrapper, daemon=True).start()
         return True
 
@@ -1514,14 +1528,10 @@ class Curator:
             self._progress(1, 1, f"Known-good comparison complete — {matches:,} exact matches")
 
     def start_reconstruction(self) -> bool:
-        with self.lock:
-            if self.state["running"]:
-                return False
-            self.state.update(
-                running=True, phase="reconstruction", processed=0, total=0, rate=0.0,
-                message="Starting media enrichment and reconstruction planning", error=None,
-            )
-        self.stop_event.clear()
+        if not self._start_job(
+            "reconstruction", "Starting media enrichment and reconstruction planning",
+        ):
+            return False
         threading.Thread(target=self._reconstruction_wrapper, daemon=True).start()
         return True
 
@@ -1821,14 +1831,10 @@ class Curator:
 
     def start_reconstruction_plan_refresh(self) -> bool:
         """Rebuild only the proposal layer after user/AI feedback changes."""
-        with self.lock:
-            if self.state["running"]:
-                return False
-            self.state.update(
-                running=True, phase="reconstruction_plan", processed=0, total=0, rate=0.0,
-                message="Applying folder reviews, context rules, and classifications", error=None,
-            )
-        self.stop_event.clear()
+        if not self._start_job(
+            "reconstruction_plan", "Applying folder reviews, context rules, and classifications",
+        ):
+            return False
         threading.Thread(target=self._reconstruction_plan_wrapper, daemon=True).start()
         return True
 
@@ -2583,14 +2589,10 @@ class Curator:
             available = db.execute("SELECT COUNT(*) FROM folder_context").fetchone()[0]
         if not available:
             raise RuntimeError("Build the reconstruction plan before interpreting folder context.")
-        with self.lock:
-            if self.state["running"]:
-                raise RuntimeError("Another scan or analysis job is already running.")
-            self.state.update(
-                running=True, phase="ai_structure", processed=0, total=1, rate=0.0,
-                message="AI is interpreting folder reviews, empty directories, and context", error=None,
-            )
-        self.stop_event.clear()
+        if not self._start_job(
+            "ai_structure", "AI is interpreting folder reviews, empty directories, and context", 1,
+        ):
+            raise RuntimeError("Another scan or analysis job is already running.")
         threading.Thread(target=self._structure_ai_wrapper, args=(requested,), daemon=True).start()
         return min(requested, available)
 
@@ -2639,7 +2641,7 @@ class Curator:
                 if not isinstance(item, dict):
                     continue
                 relative = str(item.get("relative_path") or "").strip()
-                status = str(item.get("review_status") or "").strip()
+                status = str(item.get("review_status") or "").strip().casefold()
                 target = valid_paths.get(relative)
                 if not target or status not in {"recognized", "private", "noise", "system"}:
                     continue
@@ -2690,10 +2692,11 @@ class Curator:
                 db.commit()
             self._set_state(running=False, phase="stopped", message=str(exc), error=None)
         except Exception as exc:
+            raw_response = getattr(exc, "raw_response", "")
             with connect(self.db_path) as db:
                 db.execute(
-                    "UPDATE ai_runs SET status='failed',error=?,completed_at=? WHERE id=?",
-                    (str(exc)[:1000], utcnow(), run_id),
+                    "UPDATE ai_runs SET status='failed',response_json=?,error=?,completed_at=? WHERE id=?",
+                    (raw_response or None, str(exc)[:1000], utcnow(), run_id),
                 )
                 db.commit()
             self._set_state(running=False, phase="failed", message="AI folder interpretation failed", error=str(exc))
@@ -2773,10 +2776,11 @@ class Curator:
         try:
             result = AIProviderClient(config).analyze_media(preview, metadata, self.list_recovery_context())
         except Exception as exc:
+            raw_response = getattr(exc, "raw_response", "")
             with connect(self.db_path) as db:
                 db.execute(
-                    "UPDATE ai_runs SET status='failed',error=?,completed_at=? WHERE id=?",
-                    (str(exc)[:1000], utcnow(), run_id),
+                    "UPDATE ai_runs SET status='failed',response_json=?,error=?,completed_at=? WHERE id=?",
+                    (raw_response or None, str(exc)[:1000], utcnow(), run_id),
                 )
                 db.commit()
             raise
@@ -2938,14 +2942,11 @@ class Curator:
         candidates = self._ai_batch_candidates(media_kind, pending_only, uncertain_only, limit)
         if not candidates:
             raise RuntimeError("No media matches the selected AI batch filters.")
-        with self.lock:
-            if self.state["running"]:
-                raise RuntimeError("Another scan or analysis job is already running.")
-            self.state.update(
-                running=True, phase="ai_batch", processed=0, total=len(candidates), rate=0.0,
-                message=f"Starting AI analysis for {len(candidates):,} representative files", error=None,
-            )
-        self.stop_event.clear()
+        if not self._start_job(
+            "ai_batch", f"Starting AI analysis for {len(candidates):,} representative files",
+            len(candidates),
+        ):
+            raise RuntimeError("Another scan or analysis job is already running.")
         threading.Thread(target=self._ai_batch_wrapper, args=(candidates,), daemon=True).start()
         return len(candidates)
 
@@ -2989,6 +2990,106 @@ class Curator:
                    ORDER BY r.id DESC LIMIT ?""",
                 (max(1, min(int(limit), 100)),),
             )]
+
+    def reconstruction_workspace_state(self) -> dict:
+        """Small, live payload used by the Reconstruction workspace."""
+        reconstruction = self.reconstruction_summary()
+        settings = self.ai_provider_settings()
+        suggestions = self.list_structure_suggestions(limit=250)
+        runs = self.recent_ai_runs(limit=12)
+        with connect(self.db_path) as db:
+            open_questions = int(db.execute(
+                "SELECT COUNT(*) FROM review_questions WHERE status='open'"
+            ).fetchone()[0])
+        for run in runs:
+            response = str(run.pop("response_json", "") or "")
+            run["response_preview"] = " ".join(response.split())[:800] if response else ""
+            run["result_summary"] = ""
+            if response and run.get("status") == "complete":
+                try:
+                    parsed = json.loads(response)
+                    run["result_summary"] = str(parsed.get("summary") or parsed.get("caption") or "")[:500]
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    pass
+        latest_structure = next(
+            (run for run in runs if run.get("request_kind") == "structure_analysis"), None,
+        )
+        export = self.reconstruction_export_preview()
+        status = self.status()
+        if status["running"]:
+            next_action = {
+                "id": "watch", "title": "Watch the current job",
+                "detail": "Progress and the final result will update here automatically.",
+                "target": "#live-job", "button": "View live status",
+            }
+        elif not reconstruction.get("proposals"):
+            next_action = {
+                "id": "baseline", "title": "Build the recovery baseline",
+                "detail": "Analyze media metadata and surviving folders before adding interpretations.",
+                "target": "#start-reconstruction", "button": "Run full analysis",
+            }
+        elif suggestions:
+            next_action = {
+                "id": "review_ai", "title": "Review AI suggestions",
+                "detail": f"{len(suggestions):,} suggestion(s) are waiting for your approval.",
+                "target": "#ai-suggestions", "button": "Review suggestions",
+            }
+        elif open_questions:
+            next_action = {
+                "id": "questions", "title": "Answer useful questions",
+                "detail": f"{open_questions:,} answer(s) could improve the plan; dismiss anything unhelpful.",
+                "target": "#review-questions", "button": "Review questions",
+            }
+        elif settings.get("enabled") and (
+            not latest_structure or latest_structure.get("status") == "failed"
+        ):
+            next_action = {
+                "id": "ask_ai", "title": "Ask AI to interpret your evidence",
+                "detail": "It will use folder reviews, empty folders, and your context without changing files.",
+                "target": "#ai-structure", "button": "Open AI assistant",
+            }
+        elif reconstruction.get("pending_proposals"):
+            next_action = {
+                "id": "review_plan", "title": "Review the proposed library",
+                "detail": f"{reconstruction['pending_proposals']:,} destination(s) still need a decision.",
+                "target": "#proposed-tree", "button": "Review plan",
+            }
+        elif reconstruction.get("accepted_proposals") and not export.get("authorized"):
+            next_action = {
+                "id": "dry_run", "title": "Generate a safe dry run",
+                "detail": "Check collisions and blocked files before anything is copied.",
+                "target": "#export-plan", "button": "Open export review",
+            }
+        else:
+            next_action = {
+                "id": "evidence", "title": "Add or refine evidence",
+                "detail": "Review recognized folders or add a context clue, then refresh the plan.",
+                "target": "#evidence", "button": "Review evidence",
+            }
+        stages = [
+            {"id": "baseline", "label": "Baseline", "state": "complete" if reconstruction.get("proposals") else "next"},
+            {"id": "evidence", "label": "Evidence", "state": "complete" if reconstruction.get("reviewed_folders") or reconstruction.get("context_items") else "available"},
+            {"id": "ai", "label": "AI assist", "state": "complete" if latest_structure and latest_structure.get("status") == "complete" else "optional" if not settings.get("enabled") else "available"},
+            {"id": "review", "label": "Review", "state": "complete" if reconstruction.get("proposals") and not reconstruction.get("pending_proposals") else "available"},
+            {"id": "export", "label": "Dry run", "state": "complete" if export.get("authorized") else "locked"},
+        ]
+        return {
+            "status": status,
+            "reconstruction": reconstruction,
+            "suggestions": suggestions,
+            "suggestion_count": len(suggestions),
+            "open_questions": open_questions,
+            "ai_runs": runs,
+            "ai_candidate_count": self.ai_batch_candidate_count(),
+            "provider": {
+                "enabled": bool(settings.get("enabled")),
+                "provider_name": settings.get("provider_name") or "AI provider",
+                "model": settings.get("model") or "",
+            },
+            "next_action": next_action,
+            "stages": stages,
+            "export": export,
+        }
 
     def list_review_questions(self, status: str = "open", limit: int = 100) -> list[dict]:
         with connect(self.db_path) as db:

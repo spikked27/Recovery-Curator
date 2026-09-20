@@ -62,6 +62,74 @@ def api_status():
     })
 
 
+@app.get("/api/reconstruction/workspace")
+def api_reconstruction_workspace():
+    return jsonify(curator.reconstruction_workspace_state())
+
+
+@app.post("/api/reconstruction/start")
+def api_start_reconstruction():
+    try:
+        if not curator.start_reconstruction():
+            raise RuntimeError("Another scan or analysis job is already running.")
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 409
+    return jsonify({"ok": True, "status": curator.status()})
+
+
+@app.post("/api/reconstruction/refresh")
+def api_refresh_reconstruction():
+    try:
+        if not curator.start_reconstruction_plan_refresh():
+            raise RuntimeError("Another scan or analysis job is already running.")
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 409
+    return jsonify({"ok": True, "status": curator.status()})
+
+
+@app.post("/api/reconstruction/ai/structure")
+def api_start_ai_structure():
+    values = request.get_json(silent=True) or {}
+    try:
+        count = curator.start_structure_ai(int(values.get("limit", 300)))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "included": count, "status": curator.status()})
+
+
+@app.post("/api/reconstruction/ai/batch")
+def api_start_ai_batch():
+    values = request.get_json(silent=True) or {}
+    try:
+        count = curator.start_ai_batch(
+            str(values.get("media_kind") or "all"), bool(values.get("pending_only", True)),
+            bool(values.get("uncertain_only", True)), int(values.get("limit", 100)),
+        )
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "included": count, "status": curator.status()})
+
+
+@app.post("/api/reconstruction/cancel")
+def api_cancel_reconstruction():
+    requested = curator.request_stop()
+    return jsonify({"ok": True, "requested": requested, "status": curator.status()})
+
+
+@app.post("/api/reconstruction/ai/suggestion/<int:suggestion_id>")
+def api_review_ai_suggestion(suggestion_id: int):
+    values = request.get_json(silent=True) or {}
+    try:
+        accepted = curator.review_structure_suggestion(
+            suggestion_id, str(values.get("decision") or "rejected"),
+        )
+        if accepted and not curator.start_reconstruction_plan_refresh():
+            raise RuntimeError("Suggestion saved, but another job is already running; apply feedback when it finishes.")
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "status": curator.status()})
+
+
 @app.get("/scans")
 def scans():
     return render_template(
