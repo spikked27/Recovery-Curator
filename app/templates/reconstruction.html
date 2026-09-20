@@ -91,7 +91,7 @@
 </section>
 
 <section class="card" id="ai-provider">
-  <div class="section-heading"><div><span class="step-label">Step 2</span><h3>Connect a vision AI</h3></div><span class="pill {{ 'good' if ai_settings.enabled else 'warn' }}">{{ 'Enabled' if ai_settings.enabled else 'Not configured' }}</span></div>
+  <div class="section-heading"><div><span class="step-label">Step 2</span><h3>Connect a vision AI</h3></div><span id="ai-provider-state" class="pill {{ 'good' if ai_settings.enabled else 'warn' }}">{{ 'Enabled' if ai_settings.enabled else 'Not configured' }}</span></div>
   <p>The provider receives only a reduced image preview or four-frame video contact sheet plus metadata and your saved clues. It never gets filesystem access or permission to move files.</p>
   {% if ai_settings.endpoint and not ai_settings.is_local and not ai_settings.allow_cloud_media %}<div class="notice"><strong>Remote endpoint detected.</strong> Preview transmission is blocked until you opt in below.</div>{% endif %}
   <form class="stacked-form ai-connect" id="ai-provider-form">
@@ -114,10 +114,13 @@
       </label>
     </div>
     <div class="ai-model-row">
-      <label>Vision-capable model<input id="provider-model" name="model" value="{{ ai_settings.model or '' }}" list="ai-model-options" placeholder="Test the connection to load models" autocomplete="off"></label>
-      <datalist id="ai-model-options"></datalist>
+      <label>Available models<select id="provider-model" name="model">
+        {% if ai_settings.model %}<option value="{{ ai_settings.model }}" selected>{{ ai_settings.model }} — saved selection</option>{% else %}<option value="" selected>Test the connection to load models</option>{% endif %}
+      </select></label>
       <button type="button" class="secondary" id="test-ai-provider">Test &amp; load models</button>
+      <button type="button" class="ghost" id="manual-model-toggle">Enter model ID manually</button>
     </div>
+    <div id="manual-model-row" class="manual-model-row" hidden><label>Manual model ID<input id="provider-model-manual" placeholder="Exact model ID from your provider" autocomplete="off"></label><span class="muted">Use this only when the provider does not return a model list.</span></div>
     <div id="ai-provider-result" class="connection-result" role="status" aria-live="polite">No test run in this browser session.</div>
     <div class="check-row">
       <label><input type="checkbox" name="enabled" value="1" {% if ai_settings.enabled %}checked{% endif %}> Enable provider</label>
@@ -235,8 +238,11 @@ const jobButtons = ['start-reconstruction','refresh-reconstruction','start-ai-ba
 const cancelReconstruction = document.getElementById('cancel-reconstruction');
 const cancelForm = document.getElementById('cancel-reconstruction-form');
 let reconstructionWasRunning = {{ 'true' if status.running else 'false' }};
+let reconstructionRunning = {{ 'true' if status.running else 'false' }};
+let providerEnabled = {{ 'true' if ai_settings.enabled else 'false' }};
+function updateJobButtons(){jobButtons.forEach(button=>button.disabled=reconstructionRunning||(['start-ai-batch','start-ai-structure'].includes(button.id)&&!providerEnabled))}
 cancelForm.addEventListener('submit', () => { cancelReconstruction.disabled=true; cancelReconstruction.textContent='Cancellation requested…'; reconstructionMessage.textContent='Cancellation requested — finishing the current item…'; });
-async function refreshReconstruction(){try{const response=await fetch('/api/status');const data=await response.json();const s=data.status;reconstructionMessage.textContent=s.message+(s.error?' — '+s.error:'');reconstructionProgress.max=Math.max(s.total,1);reconstructionProgress.value=s.processed;reconstructionDetail.textContent=`${s.phase} — ${s.processed}/${s.total} — ${s.rate||0} files/s`;jobButtons.forEach(button=>button.disabled=s.running||(['start-ai-batch','start-ai-structure'].includes(button.id)&&!{{ 'true' if ai_settings.enabled else 'false' }}));cancelReconstruction.disabled=!s.running;if(s.running){reconstructionWasRunning=true;setTimeout(refreshReconstruction,1500)}else if(reconstructionWasRunning){window.location.reload()}}catch(error){reconstructionMessage.textContent='Unable to refresh status — retrying…';setTimeout(refreshReconstruction,3000)}}
+async function refreshReconstruction(){try{const response=await fetch('/api/status');const data=await response.json();const s=data.status;reconstructionRunning=s.running;reconstructionMessage.textContent=s.message+(s.error?' — '+s.error:'');reconstructionProgress.max=Math.max(s.total,1);reconstructionProgress.value=s.processed;reconstructionDetail.textContent=`${s.phase} — ${s.processed}/${s.total} — ${s.rate||0} files/s`;updateJobButtons();cancelReconstruction.disabled=!s.running;if(s.running){reconstructionWasRunning=true;setTimeout(refreshReconstruction,1500)}else if(reconstructionWasRunning){window.location.reload()}}catch(error){reconstructionMessage.textContent='Unable to refresh status — retrying…';setTimeout(refreshReconstruction,3000)}}
 refreshReconstruction();
 const providerPresets = {
   openai:{name:'OpenAI',endpoint:'https://api.openai.com/v1',key:'Paste your OpenAI API key'},
@@ -256,7 +262,10 @@ const providerKey = document.getElementById('provider-api-key');
 const providerKeyEnv = document.getElementById('provider-api-key-env');
 const keyState = document.getElementById('key-state');
 const providerResult = document.getElementById('ai-provider-result');
-const modelOptions = document.getElementById('ai-model-options');
+const providerState = document.getElementById('ai-provider-state');
+const manualModel = document.getElementById('provider-model-manual');
+const manualModelRow = document.getElementById('manual-model-row');
+const manualModelToggle = document.getElementById('manual-model-toggle');
 const testProvider = document.getElementById('test-ai-provider');
 const saveProvider = document.getElementById('save-ai-provider');
 const forgetKey = document.getElementById('forget-api-key');
@@ -264,16 +273,23 @@ let hasSavedKey = {{ 'true' if ai_settings.has_api_key else 'false' }};
 let clearSavedKey = false;
 const draftKey = 'recovery-curator-ai-provider-draft';
 
+function selectedModel(){return manualModelRow.hidden?providerModel.value.trim():manualModel.value.trim()}
 function providerValues(){return {
   provider_id:providerId.value,provider_name:providerName.value.trim(),endpoint:providerEndpoint.value.trim(),
-  model:providerModel.value.trim(),api_key:providerKey.value.trim(),api_key_env:providerKeyEnv.value.trim(),
+  model:selectedModel(),api_key:providerKey.value.trim(),api_key_env:providerKeyEnv.value.trim(),
   enabled:providerForm.elements.enabled.checked,
   allow_cloud_media:providerForm.elements.allow_cloud_media.checked,
   allow_sensitive_media:providerForm.elements.allow_sensitive_media.checked,clear_api_key:clearSavedKey
 }}
 function showProviderResult(message,state=''){providerResult.textContent=message;providerResult.className='connection-result '+state}
 function saveDraft(){const values=providerValues();delete values.api_key;delete values.clear_api_key;sessionStorage.setItem(draftKey,JSON.stringify(values))}
-function restoreDraft(){try{const values=JSON.parse(sessionStorage.getItem(draftKey)||'null');if(!values)return;for(const [name,value] of Object.entries(values)){const field=providerForm.elements[name];if(!field)continue;if(field.type==='checkbox')field.checked=Boolean(value);else field.value=value}}catch(error){sessionStorage.removeItem(draftKey)}}
+function addModelOption(value,label=value){const option=document.createElement('option');option.value=value;option.textContent=label;providerModel.appendChild(option);return option}
+function setModelOptions(models,current=''){
+  providerModel.replaceChildren();addModelOption('',models.length?`Choose from ${models.length} available models`:'No models returned');
+  if(current&&!models.includes(current))addModelOption(current,`${current} — current selection`);
+  models.forEach(id=>addModelOption(id));providerModel.value=current||'';providerModel.disabled=!models.length&&!current;
+}
+function restoreDraft(){try{const values=JSON.parse(sessionStorage.getItem(draftKey)||'null');if(!values)return;for(const [name,value] of Object.entries(values)){const field=providerForm.elements[name];if(!field)continue;if(field.type==='checkbox')field.checked=Boolean(value);else if(name==='model'){setModelOptions([],String(value||''))}else field.value=value}}catch(error){sessionStorage.removeItem(draftKey)}}
 async function providerRequest(url,values){
   const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(values)});
   let data={};try{data=await response.json()}catch(error){throw new Error(`Server returned ${response.status} without a readable response.`)}
@@ -281,17 +297,19 @@ async function providerRequest(url,values){
   return data;
 }
 restoreDraft();
-providerId.addEventListener('change',()=>{const preset=providerPresets[providerId.value];providerName.value=preset.name;providerEndpoint.value=preset.endpoint;providerModel.value='';providerKey.placeholder=preset.key;modelOptions.replaceChildren();saveDraft();providerEndpoint.focus()});
+providerId.addEventListener('change',()=>{const preset=providerPresets[providerId.value];providerName.value=preset.name;providerEndpoint.value=preset.endpoint;setModelOptions([]);manualModel.value='';manualModelRow.hidden=true;manualModelToggle.textContent='Enter model ID manually';providerKey.placeholder=preset.key;providerForm.elements.enabled.checked=true;saveDraft();providerEndpoint.focus()});
 providerForm.addEventListener('input',saveDraft);
+manualModelToggle.addEventListener('click',()=>{const opening=manualModelRow.hidden;if(opening)manualModel.value=providerModel.value;manualModelRow.hidden=!opening;providerModel.disabled=opening;manualModelToggle.textContent=opening?'Use model dropdown':'Enter model ID manually';if(opening)manualModel.focus();saveDraft()});
 document.getElementById('toggle-api-key').addEventListener('click',event=>{const showing=providerKey.type==='text';providerKey.type=showing?'password':'text';event.currentTarget.textContent=showing?'Show':'Hide'});
 if(forgetKey)forgetKey.addEventListener('click',()=>{clearSavedKey=!clearSavedKey;providerKey.value='';forgetKey.textContent=clearSavedKey?'Keep saved key':'Forget saved key';keyState.textContent=clearSavedKey?'The saved key will be removed when you save.':'The saved key will be kept.'});
 testProvider.addEventListener('click',async()=>{
   testProvider.disabled=true;testProvider.textContent='Testing…';showProviderResult('Contacting the provider’s model list…');
   try{
     const data=await providerRequest('/api/ai/provider/test',providerValues());
-    modelOptions.replaceChildren(...data.models.map(id=>{const option=document.createElement('option');option.value=id;return option}));
+    const current=selectedModel();setModelOptions(data.models,current);manualModelRow.hidden=true;manualModelToggle.textContent='Enter model ID manually';
+    providerForm.elements.enabled.checked=true;saveDraft();
     showProviderResult(`Connected to a ${data.local?'local/private':'cloud'} endpoint. Loaded ${data.models.length} model${data.models.length===1?'':'s'}.`,'success');
-    if(data.models.length&&!providerModel.value)providerModel.focus();
+    if(data.models.length)providerModel.focus();else{manualModelRow.hidden=false;providerModel.disabled=true;manualModelToggle.textContent='Use model dropdown';manualModel.focus()}
   }catch(error){showProviderResult(error.message,'error')}
   finally{testProvider.disabled=false;testProvider.textContent='Test & load models'}
 });
@@ -299,7 +317,7 @@ providerForm.addEventListener('submit',async event=>{
   event.preventDefault();saveProvider.disabled=true;saveProvider.textContent='Saving…';showProviderResult('Saving connection settings…');
   try{
     const data=await providerRequest('/api/ai/provider/save',providerValues());
-    hasSavedKey=data.settings.has_api_key;clearSavedKey=false;providerKey.value='';providerKey.placeholder=hasSavedKey?'Saved — enter a new key to replace it':providerPresets[providerId.value].key;
+    hasSavedKey=data.settings.has_api_key;providerEnabled=Boolean(data.settings.enabled);updateJobButtons();providerState.textContent=providerEnabled?'Enabled':'Disabled';providerState.className='pill '+(providerEnabled?'good':'warn');clearSavedKey=false;providerKey.value='';providerKey.placeholder=hasSavedKey?'Saved — enter a new key to replace it':providerPresets[providerId.value].key;
     keyState.textContent=hasSavedKey?'A key is saved for this scan. It is never shown again.':'No API key is saved.';
     if(forgetKey&&!hasSavedKey)forgetKey.hidden=true;
     sessionStorage.removeItem(draftKey);showProviderResult('Connection saved. You can now run a test or start AI analysis.','success');
