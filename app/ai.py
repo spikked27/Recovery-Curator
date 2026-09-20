@@ -49,17 +49,16 @@ STRUCTURE_ANALYSIS_SCHEMA = {
     "properties": {
         "folder_suggestions": {
             "type": "array",
-            "maxItems": 12,
             "items": {
                 "type": "object",
                 "properties": {
-                    "relative_path": {"type": "string", "maxLength": 1000},
+                    "relative_path": {"type": "string"},
                     "review_status": {
                         "type": "string", "enum": ["recognized", "private", "noise", "system"],
                     },
-                    "user_label": {"type": "string", "maxLength": 150},
+                    "user_label": {"type": "string"},
                     "confidence": {"type": "integer"},
-                    "reason": {"type": "string", "maxLength": 500},
+                    "reason": {"type": "string"},
                 },
                 "required": ["relative_path", "review_status", "user_label", "confidence", "reason"],
                 "additionalProperties": False,
@@ -67,21 +66,20 @@ STRUCTURE_ANALYSIS_SCHEMA = {
         },
         "path_rules": {
             "type": "array",
-            "maxItems": 5,
             "items": {
                 "type": "object",
                 "properties": {
-                    "label": {"type": "string", "maxLength": 150},
-                    "match_text": {"type": "string", "maxLength": 300},
-                    "destination": {"type": "string", "maxLength": 500},
+                    "label": {"type": "string"},
+                    "match_text": {"type": "string"},
+                    "destination": {"type": "string"},
                     "confidence": {"type": "integer"},
-                    "reason": {"type": "string", "maxLength": 500},
+                    "reason": {"type": "string"},
                 },
                 "required": ["label", "match_text", "destination", "confidence", "reason"],
                 "additionalProperties": False,
             },
         },
-        "summary": {"type": "string", "maxLength": 1000},
+        "summary": {"type": "string"},
     },
     "required": ["folder_suggestions", "path_rules", "summary"],
     "additionalProperties": False,

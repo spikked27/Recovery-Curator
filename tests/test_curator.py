@@ -619,8 +619,19 @@ class CuratorTests(unittest.TestCase):
         self.assertEqual(structure_payload["max_tokens"], 4096)
         self.assertIn("12 highest-impact", structure_payload["system"])
         schema = structure_payload["output_config"]["format"]["schema"]
-        self.assertEqual(schema["properties"]["folder_suggestions"]["maxItems"], 12)
-        self.assertEqual(schema["properties"]["path_rules"]["maxItems"], 5)
+        encoded_schema = json.dumps(schema)
+        self.assertNotIn('"maxItems"', encoded_schema)
+        self.assertNotIn('"maxLength"', encoded_schema)
+        supported_keywords = {"type", "properties", "required", "additionalProperties", "items", "enum"}
+
+        def assert_anthropic_schema_subset(node):
+            self.assertTrue(set(node).issubset(supported_keywords), set(node) - supported_keywords)
+            for child in node.get("properties", {}).values():
+                assert_anthropic_schema_subset(child)
+            if isinstance(node.get("items"), dict):
+                assert_anthropic_schema_subset(node["items"])
+
+        assert_anthropic_schema_subset(schema)
 
     def test_ai_json_parser_accepts_fenced_and_explained_objects(self):
         expected = {"folder_suggestions": [], "path_rules": [], "summary": "No safe inference"}
