@@ -607,6 +607,18 @@ class CuratorTests(unittest.TestCase):
             self.assertEqual(image["source"]["media_type"], "image/jpeg")
             self.assertEqual(analyzed, expected)
 
+        structure = {"folder_suggestions": [], "path_rules": [], "summary": "No safe changes"}
+        structure_response = MagicMock()
+        structure_response.__enter__.return_value = structure_response
+        structure_response.read.return_value = json.dumps({
+            "content": [{"type": "text", "text": json.dumps(structure)}],
+        }).encode()
+        with patch("app.ai.urllib.request.urlopen", return_value=structure_response) as opener:
+            self.assertEqual(client.analyze_structure([{"relative_path": "Recovered"}], []), structure)
+        structure_payload = json.loads(opener.call_args.args[0].data.decode())
+        self.assertEqual(structure_payload["max_tokens"], 8192)
+        self.assertIn("75 highest-impact", structure_payload["system"])
+
     def test_ai_json_parser_accepts_fenced_and_explained_objects(self):
         expected = {"folder_suggestions": [], "path_rules": [], "summary": "No safe inference"}
         fenced = "Here is the analysis:\n```json\n" + json.dumps(expected) + "\n```\nDone."

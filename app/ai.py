@@ -257,12 +257,12 @@ class AIProviderClient:
 
     def _message(
         self, system: str, user_content: str | list[dict], timeout: int,
-        output_schema: dict | None = None,
+        output_schema: dict | None = None, max_tokens: int = 4096,
     ) -> dict:
         if self._is_anthropic():
             payload = {
                 "model": self.config.model,
-                "max_tokens": 4096,
+                "max_tokens": max_tokens,
                 "system": system,
                 "messages": [{"role": "user", "content": user_content}],
             }
@@ -352,6 +352,9 @@ class AIProviderClient:
             "not enough evidence to distinguish original structure from recovery output, return no folder suggestion; "
             "a conservative organized-by-category fallback is safer than invented reconstruction. Prefer a path rule "
             "for a well-supported category such as Snapchat over claiming an original folder location. "
+            "Return only suggestions that would change or materially clarify the current plan. Limit the response "
+            "to the 75 highest-impact folder suggestions and 25 highest-impact path rules; do not repeat already "
+            "correct explicit reviews merely to acknowledge them. "
             "Return one JSON object with folder_suggestions, path_rules, and summary. "
             "folder_suggestions must contain only exact relative_path values from the supplied data plus "
             "review_status (recognized, private, noise, or system), user_label (an empty string when unchanged), "
@@ -366,7 +369,9 @@ class AIProviderClient:
             f"Folders:\n{json.dumps(folders, ensure_ascii=False)}\n"
             f"Recovery context:\n{json.dumps(recovery_context, ensure_ascii=False)}"
         )
-        response = self._message(system, prompt, timeout=180, output_schema=STRUCTURE_ANALYSIS_SCHEMA)
+        response = self._message(
+            system, prompt, timeout=180, output_schema=STRUCTURE_ANALYSIS_SCHEMA, max_tokens=8192,
+        )
         if response.get("stop_reason") in {"max_tokens", "refusal"}:
             raw = self._response_text(response)
             raise AIProviderResponseError(
