@@ -157,10 +157,15 @@
     <span class="step-label">Recommended first</span><h4>Find decisions that would improve the plan</h4>
     <p>The AI receives folder hierarchy, your reviews and notes, representative filenames, and examples of current destinations. Media contents are not sent. Redundant, low-confidence, and zero-match suggestions are discarded before you see them.</p>
     <form class="filter-bar async-job" data-endpoint="/api/reconstruction/ai/structure">
-      <label>Folder evidence<select name="limit"><option value="60">60 folders · 1 AI call · lowest cost</option><option value="120" selected>120 folders · 2 AI calls · recommended</option><option value="300">300 folders · 5 AI calls · broad</option><option value="600">600 folders · 10 AI calls · maximum</option></select></label>
+      <label>Branches to review<select name="limit"><option value="4">4 branches · 1 compact call</option><option value="12" selected>12 branches · 3 calls · recommended</option><option value="24">24 branches · 6 calls · broader</option><option value="40">40 branches · 10 calls · maximum</option></select></label>
       <button id="start-ai-structure" {% if status.running or not ai_settings.enabled %}disabled{% endif %}>Ask AI to improve the plan</button>
     </form>
-    <p class="muted">Folders with your reviews or notes, and empty-folder evidence, are considered first. Each call returns at most 12 folder changes and 5 reusable path rules.</p>
+    <p class="muted">Each call reviews only four high-priority branches and must return one compact decision per branch: change it, create a specific rule, ask you one question, or leave it alone. Overlong batches automatically retry one branch at a time.</p>
+    <details class="review-drawer"><summary>Use the complete evidence with another AI agent</summary><div class="subcard">
+      <p>Create one text dossier containing every context clue, folder (including empty folders), filename, catalog fact, relationship, derived facet, and current proposed destination. It includes a strict JSON decision format and never includes media contents.</p>
+      <p><a class="button secondary" href="/reconstruction/ai/dossier">Build &amp; download complete AI dossier</a></p>
+      <p class="muted">A large recovery catalog may be bigger than an AI model's context window. The dossier tells the agent to work by top-level branch. Review the file before sharing it: filenames, paths, notes, captions, and other catalog metadata may be private.</p>
+    </div></details>
     <div id="ai-structure-result" class="connection-result" role="status" aria-live="polite">{% if latest_structure %}Last run: {{ latest_structure.status }}{% if latest_structure.error %} — {{ latest_structure.error }}{% elif latest_structure.status=='complete' %} — {{ structure_suggestions|length }} actionable changes and {{ attention.review_questions or 0 }} open questions{% endif %}{% else %}No folder interpretation has been run yet.{% endif %}</div>
     <details class="review-drawer" id="ai-suggestions" {% if structure_suggestions %}open{% endif %}><summary><span id="ai-suggestion-count">{{ structure_suggestions|length }}</span> AI structure suggestions awaiting review</summary><div class="suggestion-list" id="ai-suggestion-list">
       {% for item in structure_suggestions %}<article class="suggestion-card">

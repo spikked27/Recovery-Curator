@@ -608,10 +608,7 @@ class CuratorTests(unittest.TestCase):
             self.assertEqual(image["source"]["media_type"], "image/jpeg")
             self.assertEqual(analyzed, expected)
 
-        structure = {
-            "folder_suggestions": [], "path_rules": [], "questions": [],
-            "summary": "No safe changes",
-        }
+        structure = {"decisions": []}
         structure_response = MagicMock()
         structure_response.__enter__.return_value = structure_response
         structure_response.read.return_value = json.dumps({
@@ -620,8 +617,8 @@ class CuratorTests(unittest.TestCase):
         with patch("app.ai.urllib.request.urlopen", return_value=structure_response) as opener:
             self.assertEqual(client.analyze_structure([{"relative_path": "Recovered"}], []), structure)
         structure_payload = json.loads(opener.call_args.args[0].data.decode())
-        self.assertEqual(structure_payload["max_tokens"], 4096)
-        self.assertIn("12 highest-impact", structure_payload["system"])
+        self.assertEqual(structure_payload["max_tokens"], 2048)
+        self.assertIn("exactly one decision", structure_payload["system"])
         schema = structure_payload["output_config"]["format"]["schema"]
         encoded_schema = json.dumps(schema)
         self.assertNotIn('"maxItems"', encoded_schema)
@@ -749,6 +746,47 @@ class CuratorTests(unittest.TestCase):
             self.assertIn("Recovered Structure/Recovered Originals/Vacation", directory_paths)
             self.assertFalse(any("Organized By Me" in path for path in directory_paths))
 
+    def test_complete_ai_dossier_contains_context_empty_folders_files_and_plan(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            originals = source / "Original Structure"
+            (originals / "Empty Album").mkdir(parents=True)
+            (originals / "snapchat-memory.jpg").write_bytes(b"recovered media")
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+            curator.scan()
+            curator.build_reconstruction_foundation()
+            folder = curator.list_folder_context("Original Structure")[0]
+            curator.review_folder_context(
+                folder["directory_id"], "recognized", "Recovered Originals",
+                "This branch contains the original empty folder tree.",
+            )
+            curator.add_recovery_context(
+                "application", "Snapchat saves", "Saved by the Snapchat application.",
+                "snapchat", "Media/Photos/Snapchat",
+            )
+            with connect(config / "catalog.sqlite3") as db:
+                curator._build_reconstruction_proposals(db)
+                db.commit()
+
+            result = curator.export_ai_reconstruction_dossier()
+            dossier = Path(result["path"])
+            text = dossier.read_text(encoding="utf-8")
+            self.assertEqual(dossier.name, "reconstruction_ai_dossier.txt")
+            self.assertIn("REQUIRED OUTPUT", text)
+            self.assertIn('"action":"no_change|folder_status|path_rule|ask_user"', text)
+            self.assertIn('"label":"Snapchat saves"', text)
+            self.assertIn('"relative_path":"Original Structure/Empty Album"', text)
+            self.assertIn('"relative_path":"Original Structure/snapchat-memory.jpg"', text)
+            self.assertIn('"current_destination":"Recovered Structure/Recovered Originals/Empty Album"', text)
+            self.assertEqual(result["files"], 1)
+            self.assertGreaterEqual(result["directories"], 3)
+            self.assertGreater(result["bytes"], 0)
+
     def test_reconstruction_review_dry_run_and_export_are_safety_gated(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -853,11 +891,12 @@ class CuratorTests(unittest.TestCase):
                 "allow_sensitive_media": False,
             })
             response = {
-                "folder_suggestions": [{
-                    "relative_path": "Sorted Recovery", "review_status": "noise",
-                    "confidence": 96, "reason": "User says this was a temporary sorting folder",
+                "decisions": [{
+                    "focal_path": "Sorted Recovery", "action": "folder_status",
+                    "review_status": "noise", "user_label": "", "match_text": "",
+                    "destination": "", "confidence": 96,
+                    "reason": "User says this was a temporary sorting folder", "question": "",
                 }],
-                "path_rules": [], "questions": [], "summary": "Temporary sorting wrapper found",
             }
             with patch("app.ai.AIProviderClient.analyze_structure", return_value=response) as analyze:
                 curator._structure_ai_wrapper(100)
@@ -901,20 +940,27 @@ class CuratorTests(unittest.TestCase):
                 "endpoint": "http://ollama:11434/v1", "model": "vision", "enabled": True,
             })
             response = {
-                "folder_suggestions": [{
-                    "relative_path": "Recovered Photos", "review_status": "recognized",
-                    "user_label": "Family Photos", "confidence": 99, "reason": "Already correct",
-                }],
-                "path_rules": [{
-                    "label": "Imaginary", "match_text": "does-not-exist",
-                    "destination": "Media/Imaginary", "confidence": 95, "reason": "No evidence",
-                }],
-                "questions": [{
-                    "question": "Were these photos exported from a phone or copied from a camera?",
-                    "why_needed": "The answer changes the origin category.",
-                    "related_path": "Recovered Photos",
-                }],
-                "summary": "One ambiguity remains",
+                "decisions": [
+                    {
+                        "focal_path": "Recovered Photos", "action": "folder_status",
+                        "review_status": "recognized", "user_label": "Family Photos",
+                        "match_text": "", "destination": "", "confidence": 99,
+                        "reason": "Already correct", "question": "",
+                    },
+                    {
+                        "focal_path": "Recovered Photos", "action": "path_rule",
+                        "review_status": "", "user_label": "Imaginary",
+                        "match_text": "does-not-exist", "destination": "Media/Imaginary",
+                        "confidence": 95, "reason": "No evidence", "question": "",
+                    },
+                    {
+                        "focal_path": "Recovered Photos", "action": "ask_user",
+                        "review_status": "", "user_label": "", "match_text": "",
+                        "destination": "", "confidence": 80,
+                        "reason": "The answer changes the origin category.",
+                        "question": "Were these photos exported from a phone or copied from a camera?",
+                    },
+                ],
             }
             with patch("app.ai.AIProviderClient.analyze_structure", return_value=response):
                 curator._structure_ai_wrapper(100)
@@ -951,13 +997,11 @@ class CuratorTests(unittest.TestCase):
                 "endpoint": "http://ollama:11434/v1", "model": "vision",
                 "enabled": True, "allow_cloud_media": False,
             })
-            response = {
-                "folder_suggestions": [], "path_rules": [], "questions": [], "summary": "No change",
-            }
+            response = {"decisions": []}
             with patch("app.ai.AIProviderClient.analyze_structure", return_value=response) as analyze:
-                curator._structure_ai_wrapper(125)
+                curator._structure_ai_wrapper(12)
             self.assertEqual(analyze.call_count, 3)
-            self.assertEqual([len(call.args[0]) for call in analyze.call_args_list], [60, 60, 5])
+            self.assertEqual([len(call.args[0]) for call in analyze.call_args_list], [4, 4, 4])
             with connect(config / "catalog.sqlite3") as db:
                 run = db.execute(
                     "SELECT response_json,status FROM ai_runs ORDER BY id DESC LIMIT 1"
@@ -992,6 +1036,55 @@ class CuratorTests(unittest.TestCase):
             self.assertEqual(failed["status"], "failed")
             self.assertIn("Claude explanation", failed["response_preview"])
             self.assertEqual(state["next_action"]["id"], "ask_ai")
+
+    def test_structure_ai_retries_overlong_batch_one_branch_at_a_time(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+            now = "2026-01-01T00:00:00+00:00"
+            with connect(config / "catalog.sqlite3") as db:
+                db.executemany(
+                    """INSERT INTO folder_context(
+                         directory_id,name,relative_path,descendant_files,descendant_bytes,
+                         zero_files,suggestion_score,review_status,updated_at
+                       ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                    [
+                        (number, f"Folder {number}", f"Recovered/Folder {number}", 1, 100,
+                         0, 10.0, "unreviewed", now)
+                        for number in range(1, 13)
+                    ],
+                )
+                db.commit()
+            curator.save_ai_provider_settings({
+                "provider_id": "anthropic", "provider_name": "Claude",
+                "endpoint": "https://api.anthropic.com/v1", "model": "claude-test",
+                "enabled": True, "allow_cloud_media": True,
+            })
+            failed_once = False
+
+            def analyze(folders, *_):
+                nonlocal failed_once
+                if len(folders) > 1 and not failed_once:
+                    failed_once = True
+                    raise AIProviderResponseError(
+                        "The provider stopped before returning a usable structure analysis (max_tokens)."
+                    )
+                return {"decisions": []}
+
+            with patch("app.ai.AIProviderClient.analyze_structure", side_effect=analyze) as mocked:
+                curator._structure_ai_wrapper(12)
+            self.assertEqual(mocked.call_count, 7)
+            self.assertEqual(curator.status()["phase"], "complete")
+            with connect(config / "catalog.sqlite3") as db:
+                response = json.loads(db.execute(
+                    "SELECT response_json FROM ai_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()[0])
+            self.assertEqual(response["individual_retries"], 4)
 
 
 if __name__ == "__main__":

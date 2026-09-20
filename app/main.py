@@ -91,10 +91,24 @@ def api_refresh_reconstruction():
 def api_start_ai_structure():
     values = request.get_json(silent=True) or {}
     try:
-        count = curator.start_structure_ai(int(values.get("limit", 120)))
+        count = curator.start_structure_ai(int(values.get("limit", 12)))
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     return jsonify({"ok": True, "included": count, "status": curator.status()})
+
+
+@app.get("/reconstruction/ai/dossier")
+def download_ai_reconstruction_dossier():
+    try:
+        result = curator.export_ai_reconstruction_dossier()
+    except Exception as exc:
+        return render_template(
+            "message.html", title="AI dossier not created", message=str(exc),
+        ), 500
+    return send_file(
+        result["path"], as_attachment=True,
+        download_name="reconstruction_ai_dossier.txt", mimetype="text/plain",
+    )
 
 
 @app.post("/api/reconstruction/ai/batch")
@@ -520,7 +534,7 @@ def start_ai_batch():
 @app.post("/ai/structure")
 def start_ai_structure():
     try:
-        curator.start_structure_ai(int(request.form.get("limit", "120")))
+        curator.start_structure_ai(int(request.form.get("limit", "12")))
     except Exception as exc:
         return render_template("message.html", title="Folder interpretation not started", message=str(exc)), 400
     return redirect(url_for("reconstruction", step="ai") + "#ai-structure")

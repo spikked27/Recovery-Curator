@@ -45,7 +45,8 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
 - Optional filename/path rules that route matching files to a user-selected destination.
 - Searchable proposal review with destination overrides, confidence filtering, individual approval, and bulk approval for high-confidence files.
 - Optional OpenAI-compatible local or cloud vision provider with quick setup presets and cancellable batch analysis. The provider receives only reduced previews/contact sheets and structured evidence, never filesystem access or action permissions.
-- Separate AI structure interpretation for folder names, folder notes, empty-directory evidence, and free-form recovery context. Its folder classifications and path rules require human acceptance before affecting the plan.
+- Separate AI structure interpretation for folder names, folder notes, empty-directory evidence, and free-form recovery context. It uses compact four-branch decision batches with an automatic one-branch retry if a provider exhausts its output limit. Its folder classifications and path rules require human acceptance before affecting the plan.
+- On-demand complete text dossier for use with another AI agent. It contains all catalog metadata, context clues, folders, files, relationships, facets, and current destinations—but never media contents—and includes a strict JSON decision contract.
 - Exact duplicates share one AI classification, reducing local processing and cloud API use.
 - Safety-gated reconstruction export: only accepted proposals are copied, only after a current dry run and explicit confirmation. Existing output files are never overwritten.
 - Evidence-first reconstruction: original hierarchy is claimed only for known-good paths, explicitly recognized/private branches, or user-approved rules. When evidence is exhausted, files use a clearly labeled `Organized Library` fallback by type, origin, interpreted category, and date rather than an invented folder tree.
@@ -172,7 +173,9 @@ You can paste an API key directly into the password field. It is stored outside 
 
 The Unraid template includes an optional masked `RECOVERY_AI_API_KEY` variable. If the provider requires a credential, set that variable in the container and enter `RECOVERY_AI_API_KEY` as the environment-variable name on the Reconstruction page. Local providers commonly leave it empty.
 
-Use **Interpret folder structure and your context** to send a bounded set of folder names, counts, reviews, notes, empty-directory evidence, and saved context without sending media. Returned folder classifications and automatic path rules appear in a review queue and do nothing until accepted.
+Use **Ask AI to improve the plan** to send high-priority branches in compact four-branch calls. The provider must choose one short action per branch instead of writing an open-ended analysis; if a batch still ends at its output limit, Recovery Curator retries those branches individually. Returned folder classifications and automatic path rules appear in a review queue and do nothing until accepted.
+
+Use **Build & download complete AI dossier** when you want to work with a separate AI agent. The generated text file includes every saved context clue, folder—including empty folders—filename, catalog fact, relationship, derived facet, and current proposed destination. It deliberately omits file contents and media previews. Large dossiers may exceed a model's context window, so the included instructions tell the agent to process one top-level branch at a time. Inspect it before sharing because filenames, notes, captions, and paths may be private.
 
 Use **Batch classification** to analyze uncertain photos and videos, or use the Catalog's **Ask configured AI** action for one file. The batch is cancellable, skips previously analyzed media by default, and sends only one representative from each exact-duplicate set. Requests include the recovery context saved for the active scan. Any questions returned by the provider are displayed for human review rather than silently treated as facts.
 

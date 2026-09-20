@@ -2251,6 +2251,120 @@ class Curator:
                 "SELECT * FROM recovery_context ORDER BY context_type,label"
             )]
 
+    def export_ai_reconstruction_dossier(self) -> dict:
+        """Write a complete, portable text evidence package without media contents."""
+        destination = self.db_path.parent / "reconstruction_ai_dossier.txt"
+        temporary = destination.with_suffix(".tmp")
+        counts: dict[str, int] = {}
+
+        def write_record(stream, record_type: str, row) -> None:
+            payload = dict(row)
+            stream.write(record_type)
+            stream.write("\t")
+            stream.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")))
+            stream.write("\n")
+
+        with connect(self.db_path) as db, temporary.open("w", encoding="utf-8", newline="\n") as stream:
+            counts = {
+                "context": db.execute("SELECT COUNT(*) FROM recovery_context").fetchone()[0],
+                "directories": db.execute("SELECT COUNT(*) FROM directories").fetchone()[0],
+                "files": db.execute("SELECT COUNT(*) FROM files").fetchone()[0],
+                "relationships": db.execute("SELECT COUNT(*) FROM file_relationships").fetchone()[0],
+                "facets": db.execute("SELECT COUNT(*) FROM file_facets").fetchone()[0],
+            }
+            stream.write("RECOVERY CURATOR COMPLETE RECONSTRUCTION DOSSIER\n")
+            stream.write(f"generated_utc: {utcnow()}\n")
+            stream.write("format: sectioned JSON Lines; each data line begins with a record type and a tab\n")
+            stream.write("scope: catalog metadata, filenames, folder evidence, user context, and current plan; no file contents or media previews\n\n")
+            stream.write("AI TASK\n")
+            stream.write(
+                "Infer only structure supported by the evidence. Treat user reviews and context as authoritative. "
+                "Preserve recognized original hierarchy, collapse folders marked noise, separate private material, "
+                "exclude system material, and prefer safe interpreted categories when original structure cannot be established. "
+                "Do not invent people, events, dates, or original paths.\n"
+            )
+            stream.write(
+                "Work one top-level branch at a time if this dossier exceeds your context window. Return decisions as JSON, "
+                "not an essay. Every proposed path rule must match text actually present in FILE records.\n\n"
+            )
+            stream.write("REQUIRED OUTPUT\n")
+            stream.write(
+                '{"decisions":[{"focal_path":"relative/folder","action":"no_change|folder_status|path_rule|ask_user",'
+                '"review_status":"|recognized|private|noise|system","user_label":"","match_text":"",'
+                '"destination":"","confidence":0,"reason":"brief evidence-based reason","question":""}]}\n\n'
+            )
+            stream.write("COUNTS\n")
+            stream.write(json.dumps(counts, separators=(",", ":")) + "\n\n")
+
+            stream.write("RECOVERY_CONTEXT_JSONL\n")
+            for row in db.execute(
+                """SELECT id,context_type,label,details,match_text,destination,created_at,updated_at
+                   FROM recovery_context ORDER BY context_type,label,id"""
+            ):
+                write_record(stream, "CONTEXT", row)
+
+            stream.write("\nDIRECTORIES_JSONL\n")
+            for row in db.execute(
+                """SELECT d.id,d.relative_path,d.parent_relative_path,d.name,d.status,d.read_error,
+                          COALESCE(fc.descendant_files,0) descendant_files,
+                          COALESCE(fc.descendant_bytes,0) descendant_bytes,
+                          COALESCE(fc.zero_files,0) zero_files,
+                          COALESCE(fc.suggestion_score,0) suggestion_score,
+                          COALESCE(fc.review_status,'unreviewed') review_status,
+                          fc.user_label,fc.notes,
+                          rd.proposed_path current_destination,rd.confidence current_confidence,
+                          rd.basis current_basis,rd.reason current_reason,rd.status current_status
+                   FROM directories d
+                   LEFT JOIN folder_context fc ON fc.directory_id=d.id
+                   LEFT JOIN reconstruction_directories rd ON rd.directory_id=d.id
+                   ORDER BY d.relative_path"""
+            ):
+                write_record(stream, "DIRECTORY", row)
+
+            stream.write("\nFILES_JSONL\n")
+            for row in db.execute(
+                """SELECT f.id,f.relative_path,f.name,f.extension,f.size,f.mtime_ns,f.ctime_ns,
+                          f.mime,f.detected_extension,f.validation,f.validation_detail,f.content_hash,
+                          f.width,f.height,f.megapixels,f.exif_date,f.filename_date,f.date_confidence,
+                          f.date_reason,f.category,f.category_confidence,f.category_reason,f.quality_score,
+                          f.exact_group,f.similar_group,f.known_good_match,f.known_good_count,
+                          f.known_good_library,f.known_good_path,f.decision,f.ai_caption,f.ai_people,
+                          f.ai_objects,f.ai_ocr_text,f.ai_tags,f.ai_model,f.media_kind,f.media_origin,
+                          f.sensitivity,f.video_duration,f.video_width,f.video_height,f.video_fps,
+                          f.video_codec,f.audio_codec,f.video_creation_date,
+                          p.proposed_path current_destination,p.confidence current_confidence,
+                          p.basis current_basis,p.reason current_reason,p.status current_status,
+                          p.review_state,p.user_path,p.review_note
+                   FROM files f LEFT JOIN reconstruction_proposals p ON p.file_id=f.id
+                   ORDER BY f.relative_path,f.id"""
+            ):
+                write_record(stream, "FILE", row)
+
+            stream.write("\nRELATIONSHIPS_JSONL\n")
+            for row in db.execute(
+                """SELECT r.file_id,f.relative_path,r.related_file_id,related.relative_path related_path,
+                          r.relationship,r.confidence,r.evidence
+                   FROM file_relationships r
+                   JOIN files f ON f.id=r.file_id
+                   JOIN files related ON related.id=r.related_file_id
+                   ORDER BY f.relative_path,r.relationship,related.relative_path"""
+            ):
+                write_record(stream, "RELATIONSHIP", row)
+
+            stream.write("\nFACETS_JSONL\n")
+            for row in db.execute(
+                """SELECT ff.file_id,f.relative_path,ff.facet_type,ff.value,ff.confidence,ff.source,ff.reason
+                   FROM file_facets ff JOIN files f ON f.id=ff.file_id
+                   ORDER BY f.relative_path,ff.facet_type,ff.source,ff.value"""
+            ):
+                write_record(stream, "FACET", row)
+        temporary.replace(destination)
+        size = destination.stat().st_size
+        return {
+            "path": str(destination), "bytes": size, "bytes_human": human_bytes(size),
+            "estimated_tokens": math.ceil(size / 4), **counts,
+        }
+
     def delete_recovery_context(self, context_id: int) -> None:
         with connect(self.db_path) as db:
             cursor = db.execute("DELETE FROM recovery_context WHERE id=?", (context_id,))
@@ -2717,17 +2831,17 @@ class Curator:
         ))
         return folders
 
-    def start_structure_ai(self, limit: int = 120) -> int:
+    def start_structure_ai(self, limit: int = 12) -> int:
         settings = self._ai_provider_config_values()
         if not settings.get("enabled"):
             raise RuntimeError("Save and enable an AI provider before interpreting folder context.")
-        requested = max(25, min(int(limit), 1000))
+        requested = max(4, min(int(limit), 40))
         with connect(self.db_path) as db:
             available = db.execute("SELECT COUNT(*) FROM folder_context").fetchone()[0]
         if not available:
             raise RuntimeError("Build the reconstruction plan before interpreting folder context.")
         selected = min(requested, available)
-        passes = max(1, (selected + 59) // 60)
+        passes = max(1, (selected + 3) // 4)
         if not self._start_job(
             "ai_structure", f"AI context interpretation — preparing {passes} focused pass(es)", passes,
         ):
@@ -2736,8 +2850,9 @@ class Curator:
         return selected
 
     def _structure_ai_wrapper(self, limit: int) -> None:
-        from .ai import AIProviderClient, ProviderConfig
+        from .ai import AIProviderClient, AIProviderResponseError, ProviderConfig
 
+        limit = max(4, min(int(limit), 40))
         settings = self._ai_provider_config_values()
         config = ProviderConfig.from_mapping(settings)
         source = f"ai:{config.provider_name}:structure"[:100]
@@ -2763,44 +2878,70 @@ class Curator:
                 "goal": "preserve supported original structure; otherwise produce useful categories without invention",
             }
             client = AIProviderClient(config)
-            chunk_size = 60
+            chunk_size = 4
             chunks = [folders[index:index + chunk_size] for index in range(0, len(folders), chunk_size)]
-            folder_items: list[dict] = []
-            rule_items: list[dict] = []
-            question_items: list[dict] = []
-            summaries: list[str] = []
+            decision_items: list[dict] = []
+            retry_count = 0
             for pass_number, chunk in enumerate(chunks, 1):
                 self._check_cancel()
                 self._progress(
                     pass_number - 1, len(chunks),
-                    f"AI context interpretation — pass {pass_number:,} of {len(chunks):,} "
-                    f"({len(chunk):,} folders)",
+                    f"AI decisions — batch {pass_number:,} of {len(chunks):,} ({len(chunk):,} branches)",
                 )
-                pass_result = client.analyze_structure(chunk, context, plan_context)
+                try:
+                    pass_result = client.analyze_structure(chunk, context, plan_context)
+                    pass_decisions = pass_result.get("decisions")
+                    if isinstance(pass_decisions, list):
+                        decision_items.extend(item for item in pass_decisions if isinstance(item, dict))
+                except AIProviderResponseError as exc:
+                    if "max_tokens" not in str(exc) or len(chunk) == 1:
+                        raise
+                    retry_count += len(chunk)
+                    self._progress(
+                        pass_number - 1, len(chunks),
+                        f"AI response was too long — retrying batch {pass_number:,} one branch at a time",
+                    )
+                    for folder in chunk:
+                        self._check_cancel()
+                        retry_result = client.analyze_structure([folder], context, plan_context)
+                        retry_decisions = retry_result.get("decisions")
+                        if isinstance(retry_decisions, list):
+                            decision_items.extend(
+                                item for item in retry_decisions if isinstance(item, dict)
+                            )
                 self._check_cancel()
-                pass_folders = pass_result.get("folder_suggestions")
-                pass_rules = pass_result.get("path_rules")
-                if isinstance(pass_folders, list):
-                    folder_items.extend(item for item in pass_folders if isinstance(item, dict))
-                if isinstance(pass_rules, list):
-                    rule_items.extend(item for item in pass_rules if isinstance(item, dict))
-                pass_questions = pass_result.get("questions")
-                if isinstance(pass_questions, list):
-                    question_items.extend(item for item in pass_questions if isinstance(item, dict))
-                summary = str(pass_result.get("summary") or "").strip()
-                if summary:
-                    summaries.append(summary)
                 self._progress(
                     pass_number, len(chunks),
-                    f"AI context interpretation — {pass_number:,} of {len(chunks):,} passes complete",
+                    f"AI decisions — {pass_number:,} of {len(chunks):,} batches complete",
                 )
-            result = {
-                "folder_suggestions": folder_items,
-                "path_rules": rule_items,
-                "questions": question_items,
-                "summary": " ".join(summaries)[:4000],
-                "passes": len(chunks),
-            }
+            folder_items: list[dict] = []
+            rule_items: list[dict] = []
+            question_items: list[dict] = []
+            for item in decision_items:
+                focal_path = str(item.get("focal_path") or "").strip()
+                action = str(item.get("action") or "").strip()
+                if action == "folder_status":
+                    folder_items.append({
+                        "relative_path": focal_path,
+                        "review_status": item.get("review_status"),
+                        "user_label": item.get("user_label"),
+                        "confidence": item.get("confidence"),
+                        "reason": item.get("reason"),
+                    })
+                elif action == "path_rule":
+                    rule_items.append({
+                        "label": item.get("user_label") or "AI path rule",
+                        "match_text": item.get("match_text"),
+                        "destination": item.get("destination"),
+                        "confidence": item.get("confidence"),
+                        "reason": item.get("reason"),
+                    })
+                elif action == "ask_user":
+                    question_items.append({
+                        "question": item.get("question"),
+                        "why_needed": item.get("reason"),
+                        "related_path": focal_path,
+                    })
             valid_paths = {item["relative_path"]: item for item in folders}
             saved = []
             seen_suggestions: set[tuple] = set()
@@ -2900,6 +3041,15 @@ class Curator:
                     text += f" Why this matters: {why}"
                 questions.append((impact, text[:1000]))
             questions.sort(key=lambda item: item[0], reverse=True)
+            result = {
+                "decisions": decision_items,
+                "passes": len(chunks),
+                "individual_retries": retry_count,
+                "summary": (
+                    f"Reviewed {len(folders):,} high-priority branches; kept {len(saved):,} actionable "
+                    f"change(s) and {min(len(questions), 5):,} focused question(s)."
+                ),
+            }
             with connect(self.db_path) as db:
                 db.execute("DELETE FROM ai_structure_suggestions WHERE status='pending'")
                 db.execute("DELETE FROM review_questions WHERE status='open' AND source=?", (source,))
@@ -2925,7 +3075,7 @@ class Curator:
                 db.commit()
             self._set_state(
                 running=False, phase="complete", processed=len(chunks), total=len(chunks),
-                message=(f"AI interpretation complete — {len(chunks):,} focused passes, "
+                message=(f"AI decision review complete — {len(chunks):,} compact batches, "
                          f"{len(saved):,} useful suggestions and {min(len(questions), 5):,} questions"), error=None,
             )
         except ScanCancelled as exc:
