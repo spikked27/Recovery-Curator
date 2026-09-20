@@ -91,7 +91,7 @@ def api_refresh_reconstruction():
 def api_start_ai_structure():
     values = request.get_json(silent=True) or {}
     try:
-        count = curator.start_structure_ai(int(values.get("limit", 300)))
+        count = curator.start_structure_ai(int(values.get("limit", 120)))
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     return jsonify({"ok": True, "included": count, "status": curator.status()})
@@ -520,7 +520,7 @@ def start_ai_batch():
 @app.post("/ai/structure")
 def start_ai_structure():
     try:
-        curator.start_structure_ai(int(request.form.get("limit", "300")))
+        curator.start_structure_ai(int(request.form.get("limit", "120")))
     except Exception as exc:
         return render_template("message.html", title="Folder interpretation not started", message=str(exc)), 400
     return redirect(url_for("reconstruction", step="ai") + "#ai-structure")

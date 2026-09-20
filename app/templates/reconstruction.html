@@ -157,9 +157,10 @@
     <span class="step-label">Recommended first</span><h4>Interpret folder structure and your context</h4>
     <p>This asks the AI to reason over folder names, your folder reviews and notes, empty-directory evidence, and saved context. No photos or videos are sent. Every suggestion remains pending until you accept it.</p>
     <form class="filter-bar async-job" data-endpoint="/api/reconstruction/ai/structure">
-      <label>Folders to include<select name="limit"><option value="100">100 — focused</option><option value="300" selected>300 — recommended</option><option value="750">750 — broader hierarchy</option><option value="1000">1,000 — maximum</option></select></label>
+      <label>Folder evidence<select name="limit"><option value="60">60 folders · 1 AI call · lowest cost</option><option value="120" selected>120 folders · 2 AI calls · recommended</option><option value="300">300 folders · 5 AI calls · broad</option><option value="600">600 folders · 10 AI calls · maximum</option></select></label>
       <button id="start-ai-structure" {% if status.running or not ai_settings.enabled %}disabled{% endif %}>Ask AI to interpret context</button>
     </form>
+    <p class="muted">Folders with your reviews or notes, and empty-folder evidence, are considered first. Each call returns at most 12 folder changes and 5 reusable path rules.</p>
     <div id="ai-structure-result" class="connection-result" role="status" aria-live="polite">{% if ai_runs and ai_runs[0].request_kind=='structure_analysis' %}Last run: {{ ai_runs[0].status }}{% if ai_runs[0].error %} — {{ ai_runs[0].error }}{% endif %}{% else %}No folder interpretation has been run yet.{% endif %}</div>
     <details class="review-drawer" id="ai-suggestions" {% if structure_suggestions %}open{% endif %}><summary><span id="ai-suggestion-count">{{ structure_suggestions|length }}</span> AI structure suggestions awaiting review</summary><div class="suggestion-list" id="ai-suggestion-list">
       {% for item in structure_suggestions %}<article class="suggestion-card">

@@ -49,16 +49,17 @@ STRUCTURE_ANALYSIS_SCHEMA = {
     "properties": {
         "folder_suggestions": {
             "type": "array",
+            "maxItems": 12,
             "items": {
                 "type": "object",
                 "properties": {
-                    "relative_path": {"type": "string"},
+                    "relative_path": {"type": "string", "maxLength": 1000},
                     "review_status": {
                         "type": "string", "enum": ["recognized", "private", "noise", "system"],
                     },
-                    "user_label": {"type": "string"},
+                    "user_label": {"type": "string", "maxLength": 150},
                     "confidence": {"type": "integer"},
-                    "reason": {"type": "string"},
+                    "reason": {"type": "string", "maxLength": 500},
                 },
                 "required": ["relative_path", "review_status", "user_label", "confidence", "reason"],
                 "additionalProperties": False,
@@ -66,20 +67,21 @@ STRUCTURE_ANALYSIS_SCHEMA = {
         },
         "path_rules": {
             "type": "array",
+            "maxItems": 5,
             "items": {
                 "type": "object",
                 "properties": {
-                    "label": {"type": "string"},
-                    "match_text": {"type": "string"},
-                    "destination": {"type": "string"},
+                    "label": {"type": "string", "maxLength": 150},
+                    "match_text": {"type": "string", "maxLength": 300},
+                    "destination": {"type": "string", "maxLength": 500},
                     "confidence": {"type": "integer"},
-                    "reason": {"type": "string"},
+                    "reason": {"type": "string", "maxLength": 500},
                 },
                 "required": ["label", "match_text", "destination", "confidence", "reason"],
                 "additionalProperties": False,
             },
         },
-        "summary": {"type": "string"},
+        "summary": {"type": "string", "maxLength": 1000},
     },
     "required": ["folder_suggestions", "path_rules", "summary"],
     "additionalProperties": False,
@@ -370,7 +372,7 @@ class AIProviderClient:
             f"Recovery context:\n{json.dumps(recovery_context, ensure_ascii=False)}"
         )
         response = self._message(
-            system, prompt, timeout=180, output_schema=STRUCTURE_ANALYSIS_SCHEMA, max_tokens=6144,
+            system, prompt, timeout=180, output_schema=STRUCTURE_ANALYSIS_SCHEMA, max_tokens=4096,
         )
         if response.get("stop_reason") in {"max_tokens", "refusal"}:
             raw = self._response_text(response)

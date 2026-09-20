@@ -2636,7 +2636,7 @@ class Curator:
         config = ProviderConfig.from_mapping(config_values)
         return AIProviderClient(config).test_connection()
 
-    def start_structure_ai(self, limit: int = 300) -> int:
+    def start_structure_ai(self, limit: int = 120) -> int:
         settings = self._ai_provider_config_values()
         if not settings.get("enabled"):
             raise RuntimeError("Save and enable an AI provider before interpreting folder context.")
