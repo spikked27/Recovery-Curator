@@ -353,7 +353,7 @@ class AIProviderClient:
             "a conservative organized-by-category fallback is safer than invented reconstruction. Prefer a path rule "
             "for a well-supported category such as Snapchat over claiming an original folder location. "
             "Return only suggestions that would change or materially clarify the current plan. Limit the response "
-            "to the 75 highest-impact folder suggestions and 25 highest-impact path rules; do not repeat already "
+            "to the 12 highest-impact folder suggestions and 5 highest-impact path rules; do not repeat already "
             "correct explicit reviews merely to acknowledge them. "
             "Return one JSON object with folder_suggestions, path_rules, and summary. "
             "folder_suggestions must contain only exact relative_path values from the supplied data plus "
@@ -370,7 +370,7 @@ class AIProviderClient:
             f"Recovery context:\n{json.dumps(recovery_context, ensure_ascii=False)}"
         )
         response = self._message(
-            system, prompt, timeout=180, output_schema=STRUCTURE_ANALYSIS_SCHEMA, max_tokens=8192,
+            system, prompt, timeout=180, output_schema=STRUCTURE_ANALYSIS_SCHEMA, max_tokens=6144,
         )
         if response.get("stop_reason") in {"max_tokens", "refusal"}:
             raw = self._response_text(response)

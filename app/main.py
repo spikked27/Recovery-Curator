@@ -56,10 +56,10 @@ def stop_scan():
 
 @app.get("/api/status")
 def api_status():
-    return jsonify({
-        "status": curator.status(), "summary": curator.summary(),
-        "active_profile": profiles.active_profile(),
-    })
+    payload = {"status": curator.status(), "active_profile": profiles.active_profile()}
+    if request.args.get("include_summary") == "1":
+        payload["summary"] = curator.summary()
+    return jsonify(payload)
 
 
 @app.get("/api/reconstruction/workspace")
@@ -134,7 +134,7 @@ def api_review_ai_suggestion(suggestion_id: int):
 def scans():
     return render_template(
         "scans.html", profiles=profiles.list_profiles(), active_profile=profiles.active_profile(),
-        status=curator.status(), summary=curator.summary(),
+        status=curator.status(),
     )
 
 
@@ -173,7 +173,13 @@ def switch_scan():
 def groups(kind: str):
     if kind not in {"exact", "similar"}:
         abort(404)
-    return render_template("groups.html", kind=kind, groups=curator.group_rows(kind), summary=curator.summary())
+    page = max(1, request.args.get("page", 1, type=int))
+    page_size = 25
+    rows = curator.group_rows(kind, limit=page_size + 1, offset=(page - 1) * page_size)
+    return render_template(
+        "groups.html", kind=kind, groups=rows[:page_size], page=page,
+        has_next=len(rows) > page_size,
+    )
 
 
 @app.get("/files")
@@ -183,9 +189,16 @@ def files():
     known_good_value = request.args.get("known_good")
     known_good = None if known_good_value is None else known_good_value == "1"
     media_kind = request.args.get("media_kind") or None
+    page = max(1, request.args.get("page", 1, type=int))
+    page_size = 100
+    rows = curator.list_files(
+        category, validation, known_good, media_kind, limit=page_size + 1,
+        offset=(page - 1) * page_size,
+    )
     return render_template(
-        "files.html", files=curator.list_files(category, validation, known_good, media_kind), category=category,
-        validation=validation, known_good=known_good, media_kind=media_kind, summary=curator.summary(),
+        "files.html", files=rows[:page_size], category=category,
+        validation=validation, known_good=known_good, media_kind=media_kind,
+        page=page, has_next=len(rows) > page_size,
     )
 
 
@@ -196,9 +209,9 @@ def references():
         browser = curator.browse_reference_directories(relative)
     except Exception as exc:
         return render_template(
-            "references.html", browser=None, error=str(exc), summary=curator.summary(),
+            "references.html", browser=None, error=str(exc),
         ), 400
-    return render_template("references.html", browser=browser, error=None, summary=curator.summary())
+    return render_template("references.html", browser=browser, error=None)
 
 
 @app.post("/references/add")
@@ -251,31 +264,74 @@ def preview(file_id: int):
 
 @app.get("/reconstruction")
 def reconstruction():
+    requested_step = request.args.get("step", "").strip()
     folder_query = request.args.get("folder_q", "").strip()
     proposal_query = request.args.get("proposal_q", "").strip()
     review_state = request.args.get("review_state", "").strip() or None
     proposal_status = request.args.get("status", "").strip() or None
     basis = request.args.get("basis", "").strip() or None
     ai_settings = curator.ai_provider_settings()
+    reconstruction_summary = curator.reconstruction_summary()
+    attention = curator.reconstruction_attention_counts()
+    ai_runs = curator.recent_ai_runs(limit=8)
+    latest_structure = next(
+        (run for run in ai_runs if run.get("request_kind") == "structure_analysis"), None,
+    )
+    if not reconstruction_summary.get("proposals"):
+        recommended_step = "baseline"
+    elif attention.get("structure_suggestions") or attention.get("review_questions"):
+        recommended_step = "review"
+    elif ai_settings.get("enabled") and (
+        not latest_structure or latest_structure.get("status") == "failed"
+    ):
+        recommended_step = "ai"
+    elif not reconstruction_summary.get("reviewed_folders") and not reconstruction_summary.get("context_items"):
+        recommended_step = "evidence"
+    elif reconstruction_summary.get("pending_proposals"):
+        recommended_step = "review"
+    elif reconstruction_summary.get("accepted_proposals"):
+        recommended_step = "export"
+    else:
+        recommended_step = "evidence"
+    active_step = requested_step if requested_step in {"baseline", "evidence", "ai", "review", "export"} else recommended_step
+    proposal_page = max(1, request.args.get("proposal_page", 1, type=int))
+    proposal_page_size = 50
+    proposal_rows = []
+    if active_step == "review":
+        proposal_rows = curator.list_reconstruction_proposals(
+            limit=proposal_page_size + 1, query=proposal_query or None,
+            review_state=review_state, status=proposal_status, basis=basis,
+            offset=(proposal_page - 1) * proposal_page_size,
+        )
+    export_preview = (
+        curator.reconstruction_export_preview()
+        if active_step == "export"
+        else {
+            "accepted": reconstruction_summary.get("accepted_proposals", 0), "directories": 0,
+            "ready": 0, "collisions": 0, "blocked": 0, "unavailable": 0,
+            "bytes_human": "—", "authorized": False, "token": "",
+        }
+    )
     return render_template(
-        "reconstruction.html", summary=curator.summary(), status=curator.status(),
-        reconstruction=curator.reconstruction_summary(),
-        folders=curator.list_folder_context(query=folder_query or None), folder_query=folder_query,
-        context_items=curator.list_recovery_context(),
-        review_questions=curator.list_review_questions(),
-        proposals=curator.list_reconstruction_proposals(
-            query=proposal_query or None, review_state=review_state,
-            status=proposal_status, basis=basis,
-        ),
+        "reconstruction.html", allow_actions=curator.allow_actions, status=curator.status(),
+        reconstruction=reconstruction_summary, attention=attention,
+        active_step=active_step, recommended_step=recommended_step,
+        folders=(curator.list_folder_context(query=folder_query or None, limit=100)
+                 if active_step == "evidence" else []), folder_query=folder_query,
+        context_items=(curator.list_recovery_context() if active_step == "evidence" else []),
+        review_questions=(curator.list_review_questions(limit=20) if active_step == "review" else []),
+        proposals=proposal_rows[:proposal_page_size], proposal_page=proposal_page,
+        proposal_has_next=len(proposal_rows) > proposal_page_size,
         proposal_query=proposal_query, selected_review_state=review_state or "",
         selected_status=proposal_status or "", selected_basis=basis or "",
-        proposal_options=curator.proposal_filter_options(),
-        proposal_tree=curator.reconstruction_tree(),
-        directory_proposals=curator.list_reconstruction_directories(),
-        export_preview=curator.reconstruction_export_preview(),
-        ai_settings=ai_settings, ai_runs=curator.recent_ai_runs(),
-        ai_candidate_count=curator.ai_batch_candidate_count(),
-        structure_suggestions=curator.list_structure_suggestions(),
+        proposal_options=(curator.proposal_filter_options() if active_step == "review" else {"statuses": [], "bases": []}),
+        proposal_tree=[],
+        directory_proposals=(curator.list_reconstruction_directories(limit=50) if active_step == "review" else []),
+        export_preview=export_preview,
+        ai_settings=ai_settings, ai_runs=ai_runs,
+        ai_candidate_count=reconstruction_summary.get("ai_pending", 0),
+        structure_suggestions=(curator.list_structure_suggestions(limit=100)
+                               if active_step in {"ai", "review"} else []),
     )
 
 
@@ -313,7 +369,7 @@ def add_context():
         )
     except Exception as exc:
         return render_template("message.html", title="Recovery context not saved", message=str(exc)), 400
-    return redirect(url_for("reconstruction") + "#recovery-context")
+    return redirect(url_for("reconstruction", step="evidence") + "#recovery-context")
 
 
 @app.post("/context/<int:context_id>/delete")
@@ -322,7 +378,7 @@ def delete_context(context_id: int):
         curator.delete_recovery_context(context_id)
     except Exception as exc:
         return render_template("message.html", title="Context clue not removed", message=str(exc)), 400
-    return redirect(url_for("reconstruction") + "#recovery-context")
+    return redirect(url_for("reconstruction", step="evidence") + "#recovery-context")
 
 
 @app.post("/reconstruction/proposal/<int:file_id>")
@@ -352,7 +408,7 @@ def accept_safe_reconstruction_proposals():
 @app.post("/reconstruction/export/preview")
 def preview_reconstruction_export():
     curator.reconstruction_export_preview(authorize=True)
-    return redirect(url_for("reconstruction") + "#export-plan")
+    return redirect(url_for("reconstruction", step="export") + "#export-plan")
 
 
 @app.post("/reconstruction/export")
@@ -381,7 +437,7 @@ def answer_question():
         )
     except Exception as exc:
         return render_template("message.html", title="Answer not saved", message=str(exc)), 400
-    return redirect(url_for("reconstruction") + "#review-questions")
+    return redirect(url_for("reconstruction", step="review") + "#review-questions")
 
 
 @app.post("/facet/<int:file_id>")
@@ -413,7 +469,7 @@ def save_ai_provider():
         })
     except Exception as exc:
         return render_template("message.html", title="AI provider not saved", message=str(exc)), 400
-    return redirect(url_for("reconstruction") + "#ai-provider")
+    return redirect(url_for("reconstruction", step="ai") + "#ai-provider")
 
 
 @app.post("/api/ai/provider/save")
@@ -458,7 +514,7 @@ def start_ai_batch():
         )
     except Exception as exc:
         return render_template("message.html", title="AI batch not started", message=str(exc)), 400
-    return redirect(url_for("reconstruction") + "#ai-batch")
+    return redirect(url_for("reconstruction", step="ai") + "#ai-batch")
 
 
 @app.post("/ai/structure")
@@ -467,7 +523,7 @@ def start_ai_structure():
         curator.start_structure_ai(int(request.form.get("limit", "300")))
     except Exception as exc:
         return render_template("message.html", title="Folder interpretation not started", message=str(exc)), 400
-    return redirect(url_for("reconstruction") + "#ai-structure")
+    return redirect(url_for("reconstruction", step="ai") + "#ai-structure")
 
 
 @app.post("/ai/structure/<int:suggestion_id>")
@@ -480,7 +536,7 @@ def review_ai_structure(suggestion_id: int):
             curator.start_reconstruction_plan_refresh()
     except Exception as exc:
         return render_template("message.html", title="AI suggestion not updated", message=str(exc)), 400
-    return redirect(url_for("reconstruction") + "#ai-structure")
+    return redirect(url_for("reconstruction", step="review") + "#ai-structure")
 
 
 @app.post("/ai/analyze/<int:file_id>")

@@ -7,18 +7,19 @@
 
 <section class="card workflow-card workspace-overview">
   <div class="workflow-steps" id="workflow-stages" aria-label="Reconstruction workflow">
-    <a href="#baseline" data-stage="baseline"><strong>1</strong><span>Baseline</span><small>Analyze what survived</small></a>
-    <a href="#evidence" data-stage="evidence"><strong>2</strong><span>Evidence</span><small>Add what you know</small></a>
-    <a href="#ai-provider" data-stage="ai"><strong>3</strong><span>AI assist</span><small>Interpret, never apply</small></a>
-    <a href="#proposed-tree" data-stage="review"><strong>4</strong><span>Review</span><small>Approve destinations</small></a>
-    <a href="#export-plan" data-stage="export"><strong>5</strong><span>Dry run</span><small>Verify before copy</small></a>
+    {% for id,label,detail in [('baseline','Baseline','Analyze what survived'),('evidence','Evidence','Add what you know'),('ai','AI assist','Interpret, never apply'),('review','Review','Approve destinations'),('export','Dry run','Verify before copy')] %}
+    <a href="/reconstruction?step={{ id }}" data-stage="{{ id }}" class="{% if active_step==id %}active-stage{% endif %} {% if recommended_step==id %}recommended-stage{% endif %}"><strong>{{ loop.index }}</strong><span>{{ label }}</span><small>{{ detail }}</small></a>
+    {% endfor %}
   </div>
   <div class="workspace-grid">
     <div class="next-action" id="next-action">
-      <span class="step-label">Recommended next</span>
-      <h3 id="next-action-title">Loading your next step…</h3>
-      <p id="next-action-detail" class="muted">Checking the current plan and recent activity.</p>
-      <a id="next-action-link" class="button" href="#live-job">View status</a>
+      <span class="step-label">Step {{ {'baseline':1,'evidence':2,'ai':3,'review':4,'export':5}[active_step] }} of 5{% if active_step==recommended_step %} · Recommended now{% endif %}</span>
+      {% if active_step=='baseline' %}<h3 id="next-action-title">Build a factual baseline</h3><p id="next-action-detail" class="muted">Analyze metadata and surviving folders before asking you—or AI—to interpret anything.</p>
+      {% elif active_step=='evidence' %}<h3 id="next-action-title">Add what only you know</h3><p id="next-action-detail" class="muted">Mark recognizable folders and explain recovery-created noise. Save first; apply the feedback when you are ready.</p>
+      {% elif active_step=='ai' %}<h3 id="next-action-title">Let AI interpret your evidence</h3><p id="next-action-detail" class="muted">AI proposes a small set of meaningful changes in focused passes. It cannot apply or move anything.</p>
+      {% elif active_step=='review' %}<h3 id="next-action-title">Approve the plan</h3><p id="next-action-detail" class="muted">Handle AI suggestions and questions first, then approve only the destinations you trust.</p>
+      {% else %}<h3 id="next-action-title">Verify before copying</h3><p id="next-action-detail" class="muted">Generate a current dry run, check blocked files and collisions, then explicitly authorize export.</p>{% endif %}
+      <a id="next-action-link" class="button secondary" href="/reconstruction?step={{ recommended_step }}">Go to recommended step</a>
     </div>
     <div class="live-job {{ 'is-running' if status.running }}" id="live-job" aria-live="polite">
       <div class="job-heading"><div><span class="step-label">Current activity</span><h3 id="reconstruction-message">{{ status.message }}</h3></div><span id="job-state-pill" class="pill {{ 'good' if status.running else '' }}">{{ 'Running' if status.running else status.phase|replace('_',' ')|title }}</span></div>
@@ -26,8 +27,11 @@
       <p class="muted" id="reconstruction-detail">{{ status.processed }}/{{ status.total }} · {{ status.rate or 0 }} items/s</p>
       <p id="reconstruction-error" class="job-error bad" {% if not status.error %}hidden{% endif %}>{{ status.error or '' }}</p>
       <div class="scan-actions">
+        {% if active_step=='baseline' %}
         <form class="async-job" data-endpoint="/api/reconstruction/start"><button id="start-reconstruction" {% if status.running %}disabled{% endif %}>Run full analysis</button></form>
+        {% elif active_step=='evidence' %}
         <form class="async-job" data-endpoint="/api/reconstruction/refresh"><button id="refresh-reconstruction" class="secondary" {% if status.running %}disabled{% endif %}>Apply saved feedback</button></form>
+        {% endif %}
         <button id="cancel-reconstruction" class="danger" {% if not status.running %}disabled{% endif %}>Cancel</button>
       </div>
     </div>
@@ -40,6 +44,7 @@
   </div>
 </section>
 
+{% if active_step=='baseline' %}
 <section class="card evidence-plan" id="baseline">
   <div class="section-heading"><div><span class="step-label">Conservative strategy</span><h3>Reconstruct only what the evidence supports</h3></div><span class="safety-badge">No invented hierarchy</span></div>
   <p>Recovery Curator exhausts known-good paths, your explicit folder reviews, approved rules, metadata, and optional AI suggestions. When that still is not enough, it stops trying to recreate the original tree and uses a clean <code>Organized Library</code> grouped by media type, origin, interpreted category, and date.</p>
@@ -50,15 +55,18 @@
     <div><div class="metric warn">{{ reconstruction.low_evidence_proposals or 0 }}</div><div class="muted">low-evidence files to review</div></div>
   </div>
 </section>
+{% endif %}
 
+{% if active_step=='evidence' %}
 <section class="card" id="evidence">
   <div class="section-heading"><div><span class="step-label">Step 2 · Evidence</span><h3>Teach Recovery Curator what you recognize</h3></div>
     <form class="async-job" data-endpoint="/api/reconstruction/refresh"><button class="secondary" {% if status.running %}disabled{% endif %}>Apply saved feedback</button></form></div>
   <p>Folder reviews now directly affect the plan: useful folders are preserved, private folders go under <code>Private</code>, recovery noise is stripped away, and system/application branches are excluded.</p>
   <details class="review-drawer" id="folder-clues" {% if folder_query %}open{% endif %}><summary>Browse and review {{ reconstruction.folder_suggestions or 0 }} discovered folders</summary>
   <form method="get" action="/reconstruction" class="filter-bar">
+    <input type="hidden" name="step" value="evidence">
     <label>Find a folder <input name="folder_q" value="{{ folder_query }}" placeholder="Name or surviving path"></label>
-    <button class="secondary">Search</button>{% if folder_query %}<a class="button ghost" href="/reconstruction#folder-clues">Clear</a>{% endif %}
+    <button class="secondary">Search</button>{% if folder_query %}<a class="button ghost" href="/reconstruction?step=evidence#folder-clues">Clear</a>{% endif %}
   </form>
   {% if not folders %}<p class="empty-state">Run the full analysis to discover folder names.</p>{% endif %}
   <div class="table-wrap"><table><tr><th>Folder found</th><th>Contents</th><th>What should it mean?</th></tr>
@@ -96,7 +104,9 @@
     {% for item in context_items %}<tr><td><span class="pill">{{ item.context_type }}</span></td><td><strong>{{ item.label }}</strong><br><span class="muted">{{ item.details or '' }}</span></td><td>{% if item.match_text %}<code>{{ item.match_text }}</code> → <code>{{ item.destination }}</code>{% else %}<span class="muted">AI context only</span>{% endif %}</td><td><form method="post" action="/context/{{ item.id }}/delete" onsubmit="return confirm('Remove this context clue?');"><button class="danger">Remove</button></form></td></tr>{% endfor %}
   </table></div></details>{% endif %}
 </section>
+{% endif %}
 
+{% if active_step=='ai' %}
 <section class="card" id="ai-provider">
   <div class="section-heading"><div><span class="step-label">Step 3 · Optional AI assist</span><h3>Interpret the evidence you supplied</h3></div><span id="ai-provider-state" class="pill {{ 'good' if ai_settings.enabled else 'warn' }}">{{ 'Enabled' if ai_settings.enabled else 'Not configured' }}</span></div>
   <p>AI can interpret your explanations and propose classifications, but nothing is applied until you approve it. It never gets filesystem access or permission to move files.</p>
@@ -162,9 +172,10 @@
     </div><p class="empty-state" id="ai-suggestion-empty" {% if structure_suggestions %}hidden{% endif %}>No AI suggestions are waiting. A successful run may also return zero suggestions when the evidence is not strong enough—that is a valid, safer result.</p></details>
   </div>
 
-  <div class="subcard" id="ai-batch">
-    <h4>Batch classification</h4>
-    <p><strong>{{ ai_candidate_count }}</strong> representative files currently match the recommended filters. Exact duplicates reuse one AI result, reducing time and API cost.</p>
+  <details class="review-drawer" id="ai-batch"><summary>Optional: classify uncertain photos and videos</summary>
+    <div class="subcard">
+    <h4>Media classification</h4>
+    <p><strong>{{ ai_candidate_count }}</strong> photo/video records have not been analyzed by AI. The selected filters and exact-duplicate reuse may make the actual batch smaller.</p>
     <form class="filter-bar async-job" data-endpoint="/api/reconstruction/ai/batch">
       <label>Media<select name="media_kind"><option value="all">Photos and videos</option><option value="photo">Photos only</option><option value="video">Videos only</option></select></label>
       <label>Maximum<select name="limit"><option>25</option><option selected>100</option><option>500</option><option>1000</option></select></label>
@@ -172,12 +183,26 @@
       <label class="checkbox-label"><input type="checkbox" name="uncertain_only" value="1" checked> Focus on uncertain media</label>
       <button id="start-ai-batch" {% if status.running or not ai_settings.enabled %}disabled{% endif %}>Start AI batch</button>
     </form>
-  </div>
+    </div>
+  </details>
   <details class="review-drawer"><summary>Recent AI activity</summary><div class="table-wrap"><table><thead><tr><th>Task</th><th>Provider / model</th><th>Status</th><th>Result</th></tr></thead><tbody id="ai-run-list">
     {% for run in ai_runs %}<tr><td>{{ 'Folder interpretation' if run.request_kind=='structure_analysis' else (run.name or 'Media analysis') }}</td><td>{{ run.provider_name }} / {{ run.model }}</td><td>{{ run.status }}</td><td>{{ run.error or ('Completed' if run.status=='complete' else '') }}</td></tr>{% endfor %}
   </tbody></table></div></details>
 </section>
+{% endif %}
 
+{% if active_step=='review' %}
+{% if structure_suggestions %}<section class="card" id="ai-suggestions">
+  <div class="section-heading"><div><span class="step-label">Review these first</span><h3>AI suggestions awaiting your decision</h3></div><span class="pill warn"><span id="ai-suggestion-count">{{ structure_suggestions|length }}</span> pending</span></div>
+  <p>These are proposals only. Accepting one updates your saved evidence and then rebuilds the destination plan.</p>
+  <div class="suggestion-list" id="ai-suggestion-list">{% for item in structure_suggestions %}<article class="suggestion-card">
+    <div><span class="pill">{{ item.suggestion_type }}</span><span class="pill">{{ item.confidence }}% confidence</span>
+      {% if item.suggestion_type=='folder' %}<strong class="path">{{ item.relative_path }}</strong><span>Mark as <strong>{{ item.review_status }}</strong>{% if item.user_label %} and name it <strong>{{ item.user_label }}</strong>{% endif %}</span>
+      {% else %}<strong>{{ item.user_label }}</strong><span><code>{{ item.match_text }}</code> → <code>{{ item.destination }}</code></span>{% endif %}
+      <span class="muted">{{ item.reason or 'No additional explanation supplied.' }}</span></div>
+    <form class="suggestion-review" data-id="{{ item.id }}"><button name="decision" value="accepted">Accept &amp; apply</button> <button class="secondary" name="decision" value="rejected">Reject</button></form>
+  </article>{% endfor %}</div><p id="ai-suggestion-empty" class="empty-state" hidden>All AI suggestions have been reviewed.</p>
+</section>{% endif %}
 {% if review_questions %}<section class="card" id="review-questions">
   <details class="review-drawer"><summary>{{ review_questions|length }} questions from the AI</summary><p>Answers become context for later files; they are never silently treated as facts.</p>
   <div class="items">{% for question in review_questions %}<article class="item">
@@ -197,11 +222,12 @@
   </table></div></details>{% endif %}
   <details class="review-drawer" {% if proposal_query or selected_review_state or selected_status or selected_basis %}open{% endif %}><summary>Browse and review individual file proposals</summary>
   <form method="get" action="/reconstruction" class="filter-bar">
+    <input type="hidden" name="step" value="review">
     <label>Search <input name="proposal_q" value="{{ proposal_query }}" placeholder="Source or proposed path"></label>
     <label>Review<select name="review_state"><option value="">All</option>{% for value in ['pending','accepted','excluded'] %}<option value="{{ value }}" {% if selected_review_state==value %}selected{% endif %}>{{ value|title }}</option>{% endfor %}</select></label>
     <label>File status<select name="status"><option value="">All</option>{% for value in proposal_options.statuses %}<option value="{{ value }}" {% if selected_status==value %}selected{% endif %}>{{ value|replace('_',' ')|title }}</option>{% endfor %}</select></label>
     <label>Basis<select name="basis"><option value="">All</option>{% for value in proposal_options.bases %}<option value="{{ value }}" {% if selected_basis==value %}selected{% endif %}>{{ value|replace('_',' ')|title }}</option>{% endfor %}</select></label>
-    <button class="secondary">Filter</button><a class="button ghost" href="/reconstruction#proposed-tree">Clear</a>
+    <button class="secondary">Filter</button><a class="button ghost" href="/reconstruction?step=review#proposed-tree">Clear</a>
   </form>
   {% if not proposals %}<p class="empty-state">No proposals match these filters.</p>{% endif %}
   <div class="proposal-list">{% for item in proposals %}<article class="proposal-card {{ item.review_state }}">
@@ -214,9 +240,12 @@
       <button class="secondary" name="review_state" value="pending">Reset</button>
       <button class="danger" name="review_state" value="excluded">Exclude</button>
     </form>
-  </article>{% endfor %}</div></details>
+  </article>{% endfor %}</div>
+  <div class="pager">{% if proposal_page>1 %}<a class="button secondary" href="{{ url_for('reconstruction',step='review',proposal_page=proposal_page-1,proposal_q=proposal_query,review_state=selected_review_state,status=selected_status,basis=selected_basis) }}#proposed-tree">Previous 50</a>{% endif %}<span>Page {{ proposal_page }}</span>{% if proposal_has_next %}<a class="button secondary" href="{{ url_for('reconstruction',step='review',proposal_page=proposal_page+1,proposal_q=proposal_query,review_state=selected_review_state,status=selected_status,basis=selected_basis) }}#proposed-tree">Next 50</a>{% endif %}</div></details>
 </section>
+{% endif %}
 
+{% if active_step=='export' %}
 <section class="card" id="export-plan">
   <div class="section-heading"><div><span class="step-label">Step 5 · Verify</span><h3>Dry run and export accepted files</h3></div><span class="safety-badge">Explicit confirmation required</span></div>
   <div class="metric-grid compact">
@@ -231,14 +260,15 @@
   <form method="post" action="/reconstruction/export/preview"><button>Generate fresh dry run</button></form>
   {% if export_preview.authorized %}
     <div class="notice good"><strong>Dry run is current.</strong> Any proposal change will invalidate it.</div>
-    {% if not summary.allow_actions %}<div class="notice"><strong>Export is still locked.</strong> Set <code>Allow Write Actions</code> to <code>true</code> in the Unraid container, then restart it. The source can remain read-only.</div>{% endif %}
+    {% if not allow_actions %}<div class="notice"><strong>Export is still locked.</strong> Set <code>Allow Write Actions</code> to <code>true</code> in the Unraid container, then restart it. The source can remain read-only.</div>{% endif %}
     <form method="post" action="/reconstruction/export" class="confirm-form" onsubmit="return confirm('Copy every accepted, ready file to the curated output? The source will not be changed.');">
       <input type="hidden" name="token" value="{{ export_preview.token }}">
       <label>Type <strong>EXPORT</strong> <input name="confirmation" required pattern="EXPORT" autocomplete="off"></label>
-      <button {% if not summary.allow_actions or not export_preview.ready %}disabled{% endif %}>Export accepted files</button>
+      <button {% if not allow_actions or not export_preview.ready %}disabled{% endif %}>Export accepted files</button>
     </form>
   {% else %}<p class="muted">Generate a dry run after your latest review before export becomes available.</p>{% endif %}
 </section>
+{% endif %}
 
 <script>
 const reconstructionMessage = document.getElementById('reconstruction-message');
@@ -307,7 +337,8 @@ function appendText(parent,tag,text,className=''){
 }
 function renderSuggestions(items){
   const list=document.getElementById('ai-suggestion-list');const empty=document.getElementById('ai-suggestion-empty');
-  document.getElementById('ai-suggestion-count').textContent=items.length;list.replaceChildren();empty.hidden=Boolean(items.length);
+  const count=document.getElementById('ai-suggestion-count');if(!list||!empty||!count)return;
+  count.textContent=items.length;list.replaceChildren();empty.hidden=Boolean(items.length);
   for(const item of items){
     const article=document.createElement('article');article.className='suggestion-card';const copy=document.createElement('div');
     appendText(copy,'span',item.suggestion_type,'pill');appendText(copy,'span',`${item.confidence}% confidence`,'pill');
@@ -323,14 +354,15 @@ function renderSuggestions(items){
     article.appendChild(form);list.appendChild(article);
   }
 }
-document.getElementById('ai-suggestions').addEventListener('submit',async event=>{
+const suggestionsPanel=document.getElementById('ai-suggestions');
+if(suggestionsPanel)suggestionsPanel.addEventListener('submit',async event=>{
   const form=event.target.closest('.suggestion-review');if(!form)return;event.preventDefault();
   const button=event.submitter;button.disabled=true;
   try{await jsonRequest(`/api/reconstruction/ai/suggestion/${form.dataset.id}`,{decision:button.value});setStarting(button.value==='accepted'?'Suggestion accepted — rebuilding the plan…':'Suggestion rejected');await refreshWorkspace(true)}
   catch(error){reconstructionError.textContent=error.message;reconstructionError.hidden=false;button.disabled=false}
 });
 function renderRuns(runs){
-  const body=document.getElementById('ai-run-list');body.replaceChildren();
+  const body=document.getElementById('ai-run-list');if(!body)return;body.replaceChildren();
   for(const run of runs){
     const row=document.createElement('tr');appendText(row,'td',run.request_kind==='structure_analysis'?'Folder interpretation':(run.name||'Media analysis'));
     appendText(row,'td',`${run.provider_name||''} / ${run.model||''}`);appendText(row,'td',run.status,`run-${run.status}`);
@@ -352,26 +384,25 @@ function renderWorkspace(data){
   renderLiveStatus(data.status);providerEnabled=Boolean(data.provider.enabled);
   for(const [key,value] of Object.entries(data.reconstruction)){const node=document.querySelector(`[data-metric="${key}"]`);if(node)node.textContent=Number(value||0).toLocaleString()}
   for(const stage of data.stages){const node=document.querySelector(`[data-stage="${stage.id}"]`);if(node){node.dataset.state=stage.state;node.classList.toggle('stage-complete',stage.state==='complete')}}
-  document.getElementById('next-action-title').textContent=data.next_action.title;document.getElementById('next-action-detail').textContent=data.next_action.detail;
-  const nextLink=document.getElementById('next-action-link');nextLink.href=data.next_action.target;nextLink.textContent=data.next_action.button;
-  document.getElementById('provider-summary-name').textContent=data.provider.enabled?`${data.provider.provider_name} · ${data.provider.model}`:'No AI provider enabled';
-  document.getElementById('ai-provider-state').textContent=data.provider.enabled?'Enabled':'Not configured';
-  document.getElementById('ai-provider-state').className=`pill ${data.provider.enabled?'good':'warn'}`;
+  const providerSummary=document.getElementById('provider-summary-name');if(providerSummary)providerSummary.textContent=data.provider.enabled?`${data.provider.provider_name} · ${data.provider.model}`:'No AI provider enabled';
+  const providerBadge=document.getElementById('ai-provider-state');if(providerBadge){providerBadge.textContent=data.provider.enabled?'Enabled':'Not configured';providerBadge.className=`pill ${data.provider.enabled?'good':'warn'}`}
   const latest=data.ai_runs.find(run=>run.request_kind==='structure_analysis');const structureResult=document.getElementById('ai-structure-result');
-  if(latest){structureResult.textContent=latest.status==='complete'?`Completed — ${data.suggestion_count} suggestion${data.suggestion_count===1?'':'s'} ready for review.${latest.result_summary?` ${latest.result_summary}`:''}`:latest.status==='running'?'AI is interpreting your evidence now…':`Failed — ${latest.error||'No usable result was returned.'}`;structureResult.className=`connection-result ${latest.status==='complete'?'success':latest.status==='failed'?'error':''}`}
+  if(latest&&structureResult){structureResult.textContent=latest.status==='complete'?`Completed — ${data.suggestion_count} suggestion${data.suggestion_count===1?'':'s'} ready for review.${latest.result_summary?` ${latest.result_summary}`:''}`:latest.status==='running'?'AI is interpreting your evidence now…':`Failed — ${latest.error||'No usable result was returned.'}`;structureResult.className=`connection-result ${latest.status==='complete'?'success':latest.status==='failed'?'error':''}`}
   renderSuggestions(data.suggestions);renderRuns(data.ai_runs);updateJobButtons();
 }
 async function refreshWorkspace(immediate=false){
   clearTimeout(workspaceTimer);
   try{
-    const lightweight=reconstructionRunning;const response=await fetch(lightweight?'/api/status':'/api/reconstruction/workspace',{headers:{'Accept':'application/json'}});
+    const wasRunning=reconstructionRunning;const response=await fetch('/api/status',{headers:{'Accept':'application/json'}});
     if(!response.ok)throw new Error(`Status request failed (${response.status})`);const data=await response.json();
-    if(lightweight){renderLiveStatus(data.status);if(!data.status.running){reconstructionRunning=false;return refreshWorkspace(true)}}else{renderWorkspace(data)}
-    workspaceTimer=setTimeout(refreshWorkspace,data.status.running?1500:7000)
+    renderLiveStatus(data.status);
+    if(data.status.running){workspaceTimer=setTimeout(refreshWorkspace,1500)}
+    else if(wasRunning){const full=await fetch('/api/reconstruction/workspace',{headers:{'Accept':'application/json'}});if(full.ok)renderWorkspace(await full.json())}
   }
   catch(error){reconstructionDetail.textContent=`Live status unavailable — retrying (${error.message})`;workspaceTimer=setTimeout(refreshWorkspace,3000)}
 }
-refreshWorkspace(true);
+updateJobButtons();if(reconstructionRunning)refreshWorkspace(true);
+{% if active_step=='ai' %}
 const providerPresets = {
   openai:{name:'OpenAI',endpoint:'https://api.openai.com/v1',key:'Paste your OpenAI API key'},
   anthropic:{name:'Anthropic Claude',endpoint:'https://api.anthropic.com/v1',key:'Paste your Anthropic API key'},
@@ -452,5 +483,6 @@ providerForm.addEventListener('submit',async event=>{
   }catch(error){showProviderResult(error.message,'error')}
   finally{saveProvider.disabled=false;saveProvider.textContent='Save connection'}
 });
+{% endif %}
 </script>
 {% endblock %}

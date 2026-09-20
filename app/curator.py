@@ -245,6 +245,7 @@ def initialize(db_path: Path) -> None:
               updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_reconstruction_status ON reconstruction_proposals(status);
+            CREATE INDEX IF NOT EXISTS idx_reconstruction_basis ON reconstruction_proposals(basis);
             CREATE TABLE IF NOT EXISTS reconstruction_directories (
               directory_id INTEGER PRIMARY KEY,
               proposed_path TEXT NOT NULL,
@@ -383,6 +384,17 @@ def initialize(db_path: Path) -> None:
         db.execute("CREATE INDEX IF NOT EXISTS idx_files_media_kind ON files(media_kind)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_files_media_origin ON files(media_origin)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_reconstruction_review ON reconstruction_proposals(review_state)")
+        migrated_file_columns = {row[1] for row in db.execute("PRAGMA table_info(files)")}
+        performance_indexes = (
+            ("quality_score", "CREATE INDEX IF NOT EXISTS idx_files_quality ON files(quality_score DESC,id)"),
+            ("validation", "CREATE INDEX IF NOT EXISTS idx_files_validation_quality ON files(validation,quality_score DESC,id)"),
+            ("category", "CREATE INDEX IF NOT EXISTS idx_files_category_quality ON files(category,quality_score DESC,id)"),
+            ("media_kind", "CREATE INDEX IF NOT EXISTS idx_files_media_quality ON files(media_kind,quality_score DESC,id)"),
+            ("known_good_match", "CREATE INDEX IF NOT EXISTS idx_files_known_good_quality ON files(known_good_match,quality_score DESC,id)"),
+        )
+        for leading_column, statement in performance_indexes:
+            if {leading_column, "quality_score", "id"}.issubset(migrated_file_columns):
+                db.execute(statement)
         video_extensions = tuple(sorted(VIDEO_EXTENSIONS))
         placeholders = ",".join("?" for _ in video_extensions)
         db.execute(
@@ -854,6 +866,8 @@ class Curator:
         self.lock = threading.Lock()
         self.stop_event = threading.Event()
         self.phase_started = time.monotonic()
+        self._summary_cache: tuple[float, dict] | None = None
+        self._reconstruction_summary_cache: tuple[float, dict] | None = None
         self.state = {
             "running": False, "phase": "idle", "processed": 0, "total": 0,
             "rate": 0.0, "message": "Ready", "error": None, "job_id": 0,
@@ -888,6 +902,8 @@ class Curator:
                 raise RuntimeError("Cancel the active scan and wait for it to stop before switching saved scans.")
             self.db_path = db_path
             initialize(self.db_path)
+            self._summary_cache = None
+            self._reconstruction_summary_cache = None
             self.stop_event.clear()
             self.state.update(
                 running=False, phase="idle", processed=0, total=0, rate=0.0,
@@ -899,7 +915,14 @@ class Curator:
         with self.lock:
             if values.get("running") is False and self.state.get("running"):
                 values.setdefault("completed_at", utcnow())
+                self._summary_cache = None
+                self._reconstruction_summary_cache = None
             self.state.update(values)
+
+    def _invalidate_summaries(self) -> None:
+        with self.lock:
+            self._summary_cache = None
+            self._reconstruction_summary_cache = None
 
     def _start_job(self, phase: str, message: str, total: int = 0) -> bool:
         with self.lock:
@@ -999,6 +1022,7 @@ class Curator:
             running=False, phase="idle", processed=0, total=0, rate=0.0,
             message="Catalog cleared. Ready for a new scan.", error=None,
         )
+        self._invalidate_summaries()
         return {
             "files": file_count, "directories": directory_count,
             "reference_files": reference_count, "reports": removed_reports,
@@ -1095,6 +1119,7 @@ class Curator:
                 (json.dumps(sorted(selections)),),
             )
             db.commit()
+        self._invalidate_summaries()
         return normalized
 
     def remove_reference_selection(self, relative: str) -> None:
@@ -1109,6 +1134,7 @@ class Curator:
             db.execute("DELETE FROM reference_files WHERE library=?", (normalized,))
             self._mark_known_good_matches(db, update_progress=False)
             db.commit()
+        self._invalidate_summaries()
 
     def _configured_reference_roots(self, db: sqlite3.Connection | None = None) -> list[tuple[str, Path]]:
         configured = []
@@ -2098,7 +2124,13 @@ class Curator:
                 proposals,
             )
 
-    def reconstruction_summary(self) -> dict:
+    def reconstruction_summary(self, force: bool = False) -> dict:
+        now = time.monotonic()
+        with self.lock:
+            if not force and self._reconstruction_summary_cache:
+                cached_at, cached = self._reconstruction_summary_cache
+                if now - cached_at < 10:
+                    return cached
         with connect(self.db_path) as db:
             media = [dict(row) for row in db.execute(
                 "SELECT COALESCE(media_kind,'other') media_kind,COUNT(*) count,SUM(size) bytes FROM files GROUP BY media_kind ORDER BY count DESC"
@@ -2106,35 +2138,51 @@ class Curator:
             proposal_status = [dict(row) for row in db.execute(
                 "SELECT status,COUNT(*) count FROM reconstruction_proposals GROUP BY status ORDER BY count DESC"
             )]
-            row = db.execute(
+            proposals = dict(db.execute(
                 """SELECT
-                     (SELECT COUNT(*) FROM reconstruction_proposals) proposals,
-                     (SELECT COUNT(*) FROM folder_context) folder_suggestions,
-                     (SELECT COUNT(*) FROM folder_context WHERE review_status!='unreviewed') reviewed_folders,
+                     COUNT(*) proposals,
+                     COALESCE(SUM(basis IN ('recognized_folder','private_folder','user_context_rule')),0) preserved_structure,
+                     COALESCE(SUM(basis LIKE 'interpreted_category%'),0) interpreted_categories,
+                     COALESCE(SUM(basis LIKE 'sanitized_category%'),0) sanitized_categories,
+                     COALESCE(SUM(status='proposed' AND confidence<70),0) low_evidence_proposals,
+                     COALESCE(SUM(review_state='accepted'),0) accepted_proposals,
+                     COALESCE(SUM(review_state='pending'),0) pending_proposals,
+                     COALESCE(SUM(review_state='excluded'),0) excluded_proposals
+                   FROM reconstruction_proposals"""
+            ).fetchone())
+            folders = dict(db.execute(
+                """SELECT COUNT(*) folder_suggestions,
+                          COALESCE(SUM(review_status!='unreviewed'),0) reviewed_folders
+                   FROM folder_context"""
+            ).fetchone())
+            files = dict(db.execute(
+                """SELECT COALESCE(SUM(media_kind='video'),0) videos,
+                          COALESCE(SUM(media_kind='video' AND COALESCE(video_analysis_version,0)<?),0) pending_videos,
+                          COALESCE(SUM(media_kind IN ('photo','video') AND size>0 AND ai_updated_at IS NULL),0) ai_pending
+                   FROM files""",
+                (VIDEO_ANALYSIS_VERSION,),
+            ).fetchone())
+            counts = dict(db.execute(
+                """SELECT
                      (SELECT COUNT(*) FROM file_relationships) relationships,
                      (SELECT COUNT(*) FROM known_good_matches) known_good_path_matches,
-                     (SELECT COUNT(*) FROM files WHERE media_kind='video') videos,
-                     (SELECT COUNT(*) FROM files WHERE media_kind='video' AND COALESCE(video_analysis_version,0)<?) pending_videos,
                      (SELECT COUNT(*) FROM recovery_context) context_items,
-                     (SELECT COUNT(*) FROM reconstruction_directories WHERE status='included') directory_proposals,
-                     (SELECT COUNT(*) FROM reconstruction_proposals
-                       WHERE basis IN ('recognized_folder','private_folder','user_context_rule')) preserved_structure,
-                     (SELECT COUNT(*) FROM reconstruction_proposals
-                       WHERE basis LIKE 'interpreted_category%') interpreted_categories,
-                     (SELECT COUNT(*) FROM reconstruction_proposals
-                       WHERE basis LIKE 'sanitized_category%') sanitized_categories,
-                     (SELECT COUNT(*) FROM reconstruction_proposals
-                       WHERE status='proposed' AND confidence<70) low_evidence_proposals,
-                     (SELECT COUNT(*) FROM reconstruction_proposals WHERE review_state='accepted') accepted_proposals,
-                     (SELECT COUNT(*) FROM reconstruction_proposals WHERE review_state='pending') pending_proposals,
-                     (SELECT COUNT(*) FROM reconstruction_proposals WHERE review_state='excluded') excluded_proposals,
-                     (SELECT COUNT(*) FROM files WHERE media_kind IN ('photo','video') AND size>0 AND ai_updated_at IS NULL) ai_pending""",
-                (VIDEO_ANALYSIS_VERSION,),
-            ).fetchone()
-        result = dict(row)
+                     (SELECT COUNT(*) FROM reconstruction_directories WHERE status='included') directory_proposals"""
+            ).fetchone())
+        result = {**proposals, **folders, **files, **counts}
         result["media"] = media
         result["proposal_status"] = proposal_status
+        with self.lock:
+            self._reconstruction_summary_cache = (now, result)
         return result
+
+    def reconstruction_attention_counts(self) -> dict:
+        with connect(self.db_path) as db:
+            return dict(db.execute(
+                """SELECT
+                     (SELECT COUNT(*) FROM ai_structure_suggestions WHERE status='pending') structure_suggestions,
+                     (SELECT COUNT(*) FROM review_questions WHERE status='open') review_questions"""
+            ).fetchone())
 
     def list_folder_context(self, query: str | None = None, limit: int = 250) -> list[dict]:
         clauses, params = [], []
@@ -2165,6 +2213,7 @@ class Curator:
                 (review_status, label, notes.strip()[:1000] or None, utcnow(), directory_id),
             )
             db.commit()
+        self._invalidate_summaries()
 
     def add_recovery_context(
         self, context_type: str, label: str, details: str = "",
@@ -2191,7 +2240,9 @@ class Curator:
                 ),
             )
             db.commit()
-            return int(cursor.lastrowid)
+            context_id = int(cursor.lastrowid)
+        self._invalidate_summaries()
+        return context_id
 
     def list_recovery_context(self) -> list[dict]:
         with connect(self.db_path) as db:
@@ -2205,10 +2256,11 @@ class Curator:
             if cursor.rowcount == 0:
                 raise FileNotFoundError("context clue not found")
             db.commit()
+        self._invalidate_summaries()
 
     def list_reconstruction_proposals(
         self, limit: int = 200, query: str | None = None, review_state: str | None = None,
-        status: str | None = None, basis: str | None = None,
+        status: str | None = None, basis: str | None = None, offset: int = 0,
     ) -> list[dict]:
         clauses, params = [], []
         if query:
@@ -2228,7 +2280,7 @@ class Curator:
             clauses.append("p.basis=?")
             params.append(basis)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        params.append(max(1, min(int(limit), 1000)))
+        params.extend((max(1, min(int(limit), 1000)), max(0, int(offset))))
         with connect(self.db_path) as db:
             return [dict(row) for row in db.execute(
                 f"""SELECT p.*,COALESCE(p.user_path,p.proposed_path) effective_path,
@@ -2236,7 +2288,7 @@ class Curator:
                             f.size,f.validation,f.decision,f.exact_group,f.similar_group
                    FROM reconstruction_proposals p JOIN files f ON f.id=p.file_id{where}
                    ORDER BY CASE p.status WHEN 'needs_review' THEN 0 WHEN 'duplicate_review' THEN 1 ELSE 2 END,
-                            p.confidence ASC,f.id LIMIT ?""",
+                            p.confidence ASC,f.id LIMIT ? OFFSET ?""",
                 params,
             )]
 
@@ -2287,6 +2339,7 @@ class Curator:
                 (review_state, cleaned, note.strip()[:1000] or None, utcnow(), utcnow(), file_id),
             )
             db.commit()
+        self._invalidate_summaries()
 
     def bulk_accept_reconstruction(self, minimum_confidence: int = 85) -> int:
         threshold = max(0, min(int(minimum_confidence), 100))
@@ -2297,7 +2350,10 @@ class Curator:
                 (utcnow(), utcnow(), threshold),
             )
             db.commit()
-            return max(0, cursor.rowcount)
+            accepted = max(0, cursor.rowcount)
+        if accepted:
+            self._invalidate_summaries()
+        return accepted
 
     def reconstruction_tree(self, limit: int = 100) -> list[dict]:
         branches: dict[str, dict] = {}
@@ -2589,12 +2645,14 @@ class Curator:
             available = db.execute("SELECT COUNT(*) FROM folder_context").fetchone()[0]
         if not available:
             raise RuntimeError("Build the reconstruction plan before interpreting folder context.")
+        selected = min(requested, available)
+        passes = max(1, (selected + 59) // 60)
         if not self._start_job(
-            "ai_structure", "AI is interpreting folder reviews, empty directories, and context", 1,
+            "ai_structure", f"AI context interpretation — preparing {passes} focused pass(es)", passes,
         ):
             raise RuntimeError("Another scan or analysis job is already running.")
         threading.Thread(target=self._structure_ai_wrapper, args=(requested,), daemon=True).start()
-        return min(requested, available)
+        return selected
 
     def _structure_ai_wrapper(self, limit: int) -> None:
         from .ai import AIProviderClient, ProviderConfig
@@ -2620,17 +2678,44 @@ class Curator:
             ).lastrowid)
             db.commit()
         try:
-            self._check_cancel()
-            result = AIProviderClient(config).analyze_structure(folders, self.list_recovery_context())
-            self._check_cancel()
+            context = self.list_recovery_context()
+            client = AIProviderClient(config)
+            chunk_size = 60
+            chunks = [folders[index:index + chunk_size] for index in range(0, len(folders), chunk_size)]
+            folder_items: list[dict] = []
+            rule_items: list[dict] = []
+            summaries: list[str] = []
+            for pass_number, chunk in enumerate(chunks, 1):
+                self._check_cancel()
+                self._progress(
+                    pass_number - 1, len(chunks),
+                    f"AI context interpretation — pass {pass_number:,} of {len(chunks):,} "
+                    f"({len(chunk):,} folders)",
+                )
+                pass_result = client.analyze_structure(chunk, context)
+                self._check_cancel()
+                pass_folders = pass_result.get("folder_suggestions")
+                pass_rules = pass_result.get("path_rules")
+                if isinstance(pass_folders, list):
+                    folder_items.extend(item for item in pass_folders if isinstance(item, dict))
+                if isinstance(pass_rules, list):
+                    rule_items.extend(item for item in pass_rules if isinstance(item, dict))
+                summary = str(pass_result.get("summary") or "").strip()
+                if summary:
+                    summaries.append(summary)
+                self._progress(
+                    pass_number, len(chunks),
+                    f"AI context interpretation — {pass_number:,} of {len(chunks):,} passes complete",
+                )
+            result = {
+                "folder_suggestions": folder_items,
+                "path_rules": rule_items,
+                "summary": " ".join(summaries)[:4000],
+                "passes": len(chunks),
+            }
             valid_paths = {item["relative_path"]: item for item in folders}
-            folder_items = result.get("folder_suggestions")
-            rule_items = result.get("path_rules")
-            if not isinstance(folder_items, list):
-                folder_items = []
-            if not isinstance(rule_items, list):
-                rule_items = []
             saved = []
+            seen_suggestions: set[tuple] = set()
             now = utcnow()
             def confidence_of(item: dict) -> int:
                 try:
@@ -2645,6 +2730,10 @@ class Curator:
                 target = valid_paths.get(relative)
                 if not target or status not in {"recognized", "private", "noise", "system"}:
                     continue
+                key = ("folder", relative.casefold(), status)
+                if key in seen_suggestions:
+                    continue
+                seen_suggestions.add(key)
                 label_text = str(item.get("user_label") or "").strip()
                 saved.append((
                     "folder", target["directory_id"], relative, status,
@@ -2659,6 +2748,10 @@ class Curator:
                 destination = self._clean_relative_path(str(item.get("destination") or "").strip())[:500]
                 if not match_text or not destination or destination == ".":
                     continue
+                key = ("rule", match_text.casefold(), destination.casefold())
+                if key in seen_suggestions:
+                    continue
+                seen_suggestions.add(key)
                 saved.append((
                     "rule", None, None, None, str(item.get("label") or "AI path rule")[:150],
                     match_text, destination, confidence_of(item),
@@ -2680,8 +2773,9 @@ class Curator:
                 )
                 db.commit()
             self._set_state(
-                running=False, phase="complete", processed=1, total=1,
-                message=f"AI folder interpretation ready — {len(saved):,} suggestions to review", error=None,
+                running=False, phase="complete", processed=len(chunks), total=len(chunks),
+                message=(f"AI interpretation complete — {len(chunks):,} focused passes, "
+                         f"{len(saved):,} suggestions to review"), error=None,
             )
         except ScanCancelled as exc:
             with connect(self.db_path) as db:
@@ -2744,6 +2838,7 @@ class Curator:
                 (decision, utcnow(), suggestion_id),
             )
             db.commit()
+        self._invalidate_summaries()
         return decision == "accepted"
 
     def analyze_file_with_ai(self, file_id: int) -> dict:
@@ -2871,6 +2966,7 @@ class Curator:
                         ),
                     )
             db.commit()
+        self._invalidate_summaries()
         return result
 
     def _ai_batch_candidates(
@@ -3014,7 +3110,9 @@ class Curator:
         latest_structure = next(
             (run for run in runs if run.get("request_kind") == "structure_analysis"), None,
         )
-        export = self.reconstruction_export_preview()
+        # Full dry-run validation touches every accepted source and destination path.
+        # Keep it out of live status; it runs only when the user opens/generates Export.
+        export = {"authorized": False, "accepted": reconstruction.get("accepted_proposals", 0)}
         status = self.status()
         if status["running"]:
             next_action = {
@@ -3080,7 +3178,7 @@ class Curator:
             "suggestion_count": len(suggestions),
             "open_questions": open_questions,
             "ai_runs": runs,
-            "ai_candidate_count": self.ai_batch_candidate_count(),
+            "ai_candidate_count": reconstruction.get("ai_pending", 0),
             "provider": {
                 "enabled": bool(settings.get("enabled")),
                 "provider_name": settings.get("provider_name") or "AI provider",
@@ -3170,7 +3268,13 @@ class Curator:
                 group_number += 1
             db.commit()
 
-    def summary(self) -> dict:
+    def summary(self, force: bool = False) -> dict:
+        now = time.monotonic()
+        with self.lock:
+            if not force and self._summary_cache:
+                cached_at, cached = self._summary_cache
+                if now - cached_at < 15:
+                    return cached
         with connect(self.db_path) as db:
             row = db.execute(
                 """SELECT COUNT(*) files,COALESCE(SUM(size),0) bytes,
@@ -3210,13 +3314,17 @@ class Curator:
                 pass
         result["bytes_human"] = human_bytes(result["bytes"])
         result["allow_actions"] = self.allow_actions
+        with self.lock:
+            self._summary_cache = (now, result)
         return result
 
-    def group_rows(self, kind: str, limit: int = 100) -> list[dict]:
+    def group_rows(self, kind: str, limit: int = 25, offset: int = 0) -> list[dict]:
         column = "exact_group" if kind == "exact" else "similar_group"
         with connect(self.db_path) as db:
             group_ids = [row[0] for row in db.execute(
-                f"SELECT {column} FROM files WHERE {column} IS NOT NULL GROUP BY {column} ORDER BY SUM(size) DESC LIMIT ?", (limit,)
+                f"""SELECT {column} FROM files WHERE {column} IS NOT NULL
+                    GROUP BY {column} ORDER BY SUM(size) DESC LIMIT ? OFFSET ?""",
+                (max(1, min(int(limit), 100)), max(0, int(offset))),
             )]
             groups = []
             for group_id in group_ids:
@@ -3228,7 +3336,8 @@ class Curator:
 
     def list_files(
         self, category: str | None = None, validation: str | None = None,
-        known_good: bool | None = None, media_kind: str | None = None, limit: int = 500,
+        known_good: bool | None = None, media_kind: str | None = None, limit: int = 100,
+        offset: int = 0,
     ) -> list[dict]:
         clauses, params = [], []
         if category:
@@ -3244,9 +3353,11 @@ class Curator:
             clauses.append("media_kind=?")
             params.append(media_kind)
         where = " WHERE " + " AND ".join(clauses) if clauses else ""
-        params.append(limit)
+        params.extend((max(1, min(int(limit), 500)), max(0, int(offset))))
         with connect(self.db_path) as db:
-            return [dict(row) for row in db.execute(f"SELECT * FROM files{where} ORDER BY quality_score DESC,id LIMIT ?", params)]
+            return [dict(row) for row in db.execute(
+                f"SELECT * FROM files{where} ORDER BY quality_score DESC,id LIMIT ? OFFSET ?", params,
+            )]
 
     def get_file(self, file_id: int) -> sqlite3.Row | None:
         with connect(self.db_path) as db:
@@ -3321,6 +3432,7 @@ class Curator:
                 "UPDATE files SET category=?,category_confidence=100,category_reason='manual override',updated_at=? WHERE id=?",
                 (category, utcnow(), file_id),
             )
+        self._invalidate_summaries()
 
     def auto_decide_exact(self) -> int:
         with connect(self.db_path) as db:

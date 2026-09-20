@@ -616,8 +616,8 @@ class CuratorTests(unittest.TestCase):
         with patch("app.ai.urllib.request.urlopen", return_value=structure_response) as opener:
             self.assertEqual(client.analyze_structure([{"relative_path": "Recovered"}], []), structure)
         structure_payload = json.loads(opener.call_args.args[0].data.decode())
-        self.assertEqual(structure_payload["max_tokens"], 8192)
-        self.assertIn("75 highest-impact", structure_payload["system"])
+        self.assertEqual(structure_payload["max_tokens"], 6144)
+        self.assertIn("12 highest-impact", structure_payload["system"])
 
     def test_ai_json_parser_accepts_fenced_and_explained_objects(self):
         expected = {"folder_suggestions": [], "path_rules": [], "summary": "No safe inference"}
@@ -847,6 +847,48 @@ class CuratorTests(unittest.TestCase):
             curator.review_structure_suggestion(suggestions[0]["id"], "accepted")
             updated = curator.list_folder_context("Sorted Recovery")[0]
             self.assertEqual(updated["review_status"], "noise")
+
+    def test_structure_ai_uses_bounded_passes_and_reports_progress(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+            now = "2026-01-01T00:00:00+00:00"
+            with connect(config / "catalog.sqlite3") as db:
+                db.executemany(
+                    """INSERT INTO folder_context(
+                         directory_id,name,relative_path,descendant_files,descendant_bytes,
+                         zero_files,suggestion_score,review_status,updated_at
+                       ) VALUES(?,?,?,?,?,?,?,?,?)""",
+                    [
+                        (number, f"Folder {number}", f"Recovered/Folder {number}", 1, 100,
+                         0, 10.0, "unreviewed", now)
+                        for number in range(1, 126)
+                    ],
+                )
+                db.commit()
+            curator.save_ai_provider_settings({
+                "provider_id": "ollama", "provider_name": "Local AI",
+                "endpoint": "http://ollama:11434/v1", "model": "vision",
+                "enabled": True, "allow_cloud_media": False,
+            })
+            response = {"folder_suggestions": [], "path_rules": [], "summary": "No change"}
+            with patch("app.ai.AIProviderClient.analyze_structure", return_value=response) as analyze:
+                curator._structure_ai_wrapper(125)
+            self.assertEqual(analyze.call_count, 3)
+            self.assertEqual([len(call.args[0]) for call in analyze.call_args_list], [60, 60, 5])
+            with connect(config / "catalog.sqlite3") as db:
+                run = db.execute(
+                    "SELECT response_json,status FROM ai_runs ORDER BY id DESC LIMIT 1"
+                ).fetchone()
+            self.assertEqual(run["status"], "complete")
+            self.assertEqual(json.loads(run["response_json"])["passes"], 3)
+            status = curator.status()
+            self.assertEqual((status["processed"], status["total"]), (3, 3))
 
     def test_failed_structure_ai_keeps_provider_reply_and_live_workflow_context(self):
         with tempfile.TemporaryDirectory() as temp:

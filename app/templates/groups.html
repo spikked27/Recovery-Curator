@@ -10,4 +10,5 @@
 <form method="post" action="/decision/{{ item.id }}"><input type="hidden" name="decision" value="keep"><button>Keep</button></form>
 <form method="post" action="/decision/{{ item.id }}"><input type="hidden" name="decision" value="reject"><button class="secondary">Reject</button></form>
 </article>{% endfor %}</div></section>{% else %}<p>No groups yet. Run a scan first.</p>{% endfor %}
+<div class="pager">{% if page>1 %}<a class="button secondary" href="{{ url_for('groups',kind=kind,page=page-1) }}">Previous 25 groups</a>{% endif %}<span>Page {{ page }}</span>{% if has_next %}<a class="button secondary" href="{{ url_for('groups',kind=kind,page=page+1) }}">Next 25 groups</a>{% endif %}</div>
 {% endblock %}
