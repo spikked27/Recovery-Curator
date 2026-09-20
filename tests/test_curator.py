@@ -5,7 +5,7 @@ import stat
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import MagicMock, Mock, patch
 
 from PIL import Image
 
@@ -556,6 +556,69 @@ class CuratorTests(unittest.TestCase):
         self.assertEqual(ollama._base_v1(), "http://ollama:11434/v1")
         with self.assertRaisesRegex(ValueError, "Paste the actual secret"):
             ProviderConfig(api_key_env="sk-actual-key").validate()
+
+    def test_anthropic_uses_native_headers_messages_and_vision_payload(self):
+        config = ProviderConfig(
+            provider_id="anthropic", provider_name="Anthropic Claude",
+            endpoint="https://api.anthropic.com/v1", model="claude-vision-test",
+            api_key="sk-ant-test", enabled=True, allow_cloud_media=True,
+        )
+        client = AIProviderClient(config)
+        model_response = MagicMock()
+        model_response.__enter__.return_value = model_response
+        model_response.read.return_value = json.dumps({
+            "data": [{"id": "claude-vision-test"}, {"id": "claude-other"}],
+        }).encode()
+        with patch("app.ai.urllib.request.urlopen", return_value=model_response) as opener:
+            result = client.test_connection()
+        request = opener.call_args.args[0]
+        headers = {key.lower(): value for key, value in request.header_items()}
+        self.assertEqual(request.full_url, "https://api.anthropic.com/v1/models")
+        self.assertEqual(headers["x-api-key"], "sk-ant-test")
+        self.assertEqual(headers["anthropic-version"], "2023-06-01")
+        self.assertNotIn("authorization", headers)
+        self.assertIn("claude-vision-test", result["models"])
+
+        with tempfile.TemporaryDirectory() as temp:
+            preview = Path(temp) / "preview.jpg"
+            preview.write_bytes(b"reduced-preview")
+            expected = {
+                "caption": "Recovered photo", "origin": "camera", "sensitivity": "normal",
+                "topics": [], "people_labels": [], "confidence": 90, "reason": "visual evidence",
+                "questions": [],
+            }
+            message_response = MagicMock()
+            message_response.__enter__.return_value = message_response
+            message_response.read.return_value = json.dumps({
+                "content": [{"type": "text", "text": json.dumps(expected)}],
+            }).encode()
+            with patch("app.ai.urllib.request.urlopen", return_value=message_response) as opener:
+                analyzed = client.analyze_media(preview, {"sensitivity": "normal"}, [])
+            request = opener.call_args.args[0]
+            payload = json.loads(request.data.decode())
+            self.assertEqual(request.full_url, "https://api.anthropic.com/v1/messages")
+            self.assertEqual(payload["system"].split()[0], "You")
+            image = payload["messages"][0]["content"][0]
+            self.assertEqual(image["type"], "image")
+            self.assertEqual(image["source"]["type"], "base64")
+            self.assertEqual(image["source"]["media_type"], "image/jpeg")
+            self.assertEqual(analyzed, expected)
+
+    def test_anthropic_endpoint_is_recognized_for_existing_custom_settings(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+            settings = curator.save_ai_provider_settings({
+                "provider_id": "custom", "provider_name": "Claude",
+                "endpoint": "https://api.anthropic.com/v1", "model": "claude-test",
+                "enabled": True, "allow_cloud_media": True,
+            })
+            self.assertEqual(settings["provider_id"], "anthropic")
 
     def test_folder_feedback_context_rules_and_facets_change_reconstruction(self):
         with tempfile.TemporaryDirectory() as temp:

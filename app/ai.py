@@ -86,21 +86,33 @@ class AIProviderClient:
             return endpoint
         return endpoint + "/v1"
 
+    def _is_anthropic(self) -> bool:
+        host = (urllib.parse.urlparse(self.config.endpoint).hostname or "").lower()
+        return self.config.provider_id == "anthropic" or host == "api.anthropic.com"
+
+    def _token(self) -> str:
+        token = self.config.api_key
+        if not token and self.config.api_key_env:
+            token = os.environ.get(self.config.api_key_env, "")
+            if not token:
+                raise AIProviderError(
+                    f"Environment variable {self.config.api_key_env} is not available inside the container."
+                )
+        return token
+
     def _request(self, url: str, payload: dict | None = None, timeout: int = 45) -> dict:
         headers = {"Accept": "application/json"}
         body = None
         if payload is not None:
             headers["Content-Type"] = "application/json"
             body = json.dumps(payload).encode("utf-8")
-        token = self.config.api_key
-        if not token and self.config.api_key_env:
-            token = os.environ.get(self.config.api_key_env)
-            if not token:
-                raise AIProviderError(
-                    f"Environment variable {self.config.api_key_env} is not available inside the container."
-                )
+        token = self._token()
         if token:
-            headers["Authorization"] = f"Bearer {token}"
+            if self._is_anthropic():
+                headers["x-api-key"] = token
+                headers["anthropic-version"] = "2023-06-01"
+            else:
+                headers["Authorization"] = f"Bearer {token}"
         request = urllib.request.Request(url, data=body, headers=headers, method="POST" if body else "GET")
         try:
             with urllib.request.urlopen(request, timeout=timeout) as response:
@@ -123,6 +135,57 @@ class AIProviderClient:
         payload = self._request(self._base_v1() + "/models", timeout=10)
         model_ids = sorted({str(item.get("id")) for item in payload.get("data", []) if item.get("id")})
         return {"ok": True, "local": endpoint_is_local(self.config.endpoint), "models": model_ids[:500]}
+
+    @staticmethod
+    def _response_text(response: dict) -> str:
+        try:
+            if "choices" in response:
+                content = response["choices"][0]["message"]["content"]
+            else:
+                content = response["content"]
+            if isinstance(content, list):
+                content = "".join(
+                    str(item.get("text") or "")
+                    for item in content
+                    if isinstance(item, dict) and item.get("type", "text") == "text"
+                )
+            return str(content).strip()
+        except (KeyError, IndexError, TypeError) as exc:
+            raise AIProviderError("The provider returned an unsupported message response.") from exc
+
+    @staticmethod
+    def _json_object(text: str, error: str) -> dict:
+        if text.startswith("```"):
+            text = text.strip("`")
+            if text.lstrip().startswith("json"):
+                text = text.lstrip()[4:].lstrip()
+        try:
+            result = json.loads(text)
+        except json.JSONDecodeError as exc:
+            raise AIProviderError(error) from exc
+        if not isinstance(result, dict):
+            raise AIProviderError(error)
+        return result
+
+    def _message(self, system: str, user_content: str | list[dict], timeout: int) -> dict:
+        if self._is_anthropic():
+            payload = {
+                "model": self.config.model,
+                "max_tokens": 4096,
+                "temperature": 0.1,
+                "system": system,
+                "messages": [{"role": "user", "content": user_content}],
+            }
+            return self._request(self._base_v1() + "/messages", payload, timeout=timeout)
+        payload = {
+            "model": self.config.model,
+            "temperature": 0.1,
+            "messages": [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user_content},
+            ],
+        }
+        return self._request(self._base_v1() + "/chat/completions", payload, timeout=timeout)
 
     def analyze_media(self, preview: Path, metadata: dict, recovery_context: list[dict]) -> dict:
         self.config.validate(require_model=True)
@@ -153,36 +216,23 @@ class AIProviderClient:
             f"File metadata: {json.dumps(metadata, ensure_ascii=False)}\n"
             f"Recovery context supplied by the user:\n{context_text}"
         )
-        payload = {
-            "model": self.config.model,
-            "temperature": 0.1,
-            "messages": [
-                {"role": "system", "content": system},
+        if self._is_anthropic():
+            user_content = [
                 {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}},
-                    ],
+                    "type": "image",
+                    "source": {"type": "base64", "media_type": "image/jpeg", "data": image_data},
                 },
-            ],
-        }
-        response = self._request(self._base_v1() + "/chat/completions", payload, timeout=120)
-        try:
-            content = response["choices"][0]["message"]["content"]
-            if isinstance(content, list):
-                content = "".join(str(item.get("text") or "") for item in content if isinstance(item, dict))
-            text = str(content).strip()
-            if text.startswith("```"):
-                text = text.strip("`")
-                if text.lstrip().startswith("json"):
-                    text = text.lstrip()[4:].lstrip()
-            result = json.loads(text)
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-            raise AIProviderError("The provider did not return the required JSON analysis object.") from exc
-        if not isinstance(result, dict):
-            raise AIProviderError("The provider returned an unsupported analysis response.")
-        return result
+                {"type": "text", "text": prompt},
+            ]
+        else:
+            user_content = [
+                {"type": "text", "text": prompt},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{image_data}"}},
+            ]
+        response = self._message(system, user_content, timeout=120)
+        return self._json_object(
+            self._response_text(response), "The provider did not return the required JSON analysis object."
+        )
 
     def analyze_structure(self, folders: list[dict], recovery_context: list[dict]) -> dict:
         self.config.validate(require_model=True)
@@ -216,27 +266,7 @@ class AIProviderClient:
             f"Folders:\n{json.dumps(folders, ensure_ascii=False)}\n"
             f"Recovery context:\n{json.dumps(recovery_context, ensure_ascii=False)}"
         )
-        payload = {
-            "model": self.config.model,
-            "temperature": 0.1,
-            "messages": [
-                {"role": "system", "content": system},
-                {"role": "user", "content": prompt},
-            ],
-        }
-        response = self._request(self._base_v1() + "/chat/completions", payload, timeout=180)
-        try:
-            content = response["choices"][0]["message"]["content"]
-            if isinstance(content, list):
-                content = "".join(str(item.get("text") or "") for item in content if isinstance(item, dict))
-            text = str(content).strip()
-            if text.startswith("```"):
-                text = text.strip("`")
-                if text.lstrip().startswith("json"):
-                    text = text.lstrip()[4:].lstrip()
-            result = json.loads(text)
-        except (KeyError, IndexError, TypeError, json.JSONDecodeError) as exc:
-            raise AIProviderError("The provider did not return the required JSON structure analysis.") from exc
-        if not isinstance(result, dict):
-            raise AIProviderError("The provider returned an unsupported structure response.")
-        return result
+        response = self._message(system, prompt, timeout=180)
+        return self._json_object(
+            self._response_text(response), "The provider did not return the required JSON structure analysis."
+        )

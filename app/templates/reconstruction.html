@@ -99,11 +99,12 @@
       <label>Provider
         <select id="provider-id" name="provider_id">
           <option value="openai" {% if ai_settings.provider_id=='openai' %}selected{% endif %}>OpenAI</option>
+          <option value="anthropic" {% if ai_settings.provider_id=='anthropic' %}selected{% endif %}>Anthropic Claude</option>
           <option value="gemini" {% if ai_settings.provider_id=='gemini' %}selected{% endif %}>Google Gemini</option>
           <option value="openrouter" {% if ai_settings.provider_id=='openrouter' %}selected{% endif %}>OpenRouter</option>
           <option value="ollama" {% if ai_settings.provider_id=='ollama' %}selected{% endif %}>Ollama (local)</option>
           <option value="lmstudio" {% if ai_settings.provider_id=='lmstudio' %}selected{% endif %}>LM Studio (local)</option>
-          <option value="custom" {% if ai_settings.provider_id not in ['openai','gemini','openrouter','ollama','lmstudio'] %}selected{% endif %}>Other OpenAI-compatible provider</option>
+          <option value="custom" {% if ai_settings.provider_id not in ['openai','anthropic','gemini','openrouter','ollama','lmstudio'] %}selected{% endif %}>Other OpenAI-compatible provider</option>
         </select>
       </label>
       <label>API endpoint<input id="provider-endpoint" name="endpoint" value="{{ ai_settings.endpoint or '' }}" placeholder="Choose a provider to fill this in" spellcheck="false"></label>
@@ -239,6 +240,7 @@ async function refreshReconstruction(){try{const response=await fetch('/api/stat
 refreshReconstruction();
 const providerPresets = {
   openai:{name:'OpenAI',endpoint:'https://api.openai.com/v1',key:'Paste your OpenAI API key'},
+  anthropic:{name:'Anthropic Claude',endpoint:'https://api.anthropic.com/v1',key:'Paste your Anthropic API key'},
   gemini:{name:'Google Gemini',endpoint:'https://generativelanguage.googleapis.com/v1beta/openai',key:'Paste your Gemini API key'},
   openrouter:{name:'OpenRouter',endpoint:'https://openrouter.ai/api/v1',key:'Paste your OpenRouter API key'},
   ollama:{name:'Ollama',endpoint:'http://YOUR-AI-SERVER:11434/v1',key:'Usually no API key is needed'},

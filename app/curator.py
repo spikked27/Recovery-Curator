@@ -2488,6 +2488,8 @@ class Curator:
             "api_key_env": "",
             "enabled": 0, "allow_cloud_media": 0, "allow_sensitive_media": 0, "updated_at": None,
         }
+        if result.get("provider_id") == "custom" and "api.anthropic.com" in str(result.get("endpoint") or "").lower():
+            result["provider_id"] = "anthropic"
         result["is_local"] = endpoint_is_local(result.get("endpoint") or "") if result.get("endpoint") else None
         result["has_api_key"] = bool(self._load_ai_secret())
         return result
