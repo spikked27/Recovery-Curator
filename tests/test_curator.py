@@ -364,6 +364,7 @@ class CuratorTests(unittest.TestCase):
                 ).fetchone()
             self.assertIn("media_kind", columns)
             self.assertIn("media_origin", columns)
+            self.assertIn("idx_files_relative_path", indexes)
             self.assertIn("idx_files_media_kind", indexes)
             self.assertIn("idx_files_media_origin", indexes)
             self.assertEqual(tuple(migrated), ("video", "unknown", "Videos"))
@@ -607,7 +608,10 @@ class CuratorTests(unittest.TestCase):
             self.assertEqual(image["source"]["media_type"], "image/jpeg")
             self.assertEqual(analyzed, expected)
 
-        structure = {"folder_suggestions": [], "path_rules": [], "summary": "No safe changes"}
+        structure = {
+            "folder_suggestions": [], "path_rules": [], "questions": [],
+            "summary": "No safe changes",
+        }
         structure_response = MagicMock()
         structure_response.__enter__.return_value = structure_response
         structure_response.read.return_value = json.dumps({
@@ -830,7 +834,9 @@ class CuratorTests(unittest.TestCase):
                 directory.mkdir()
             organized = source / "Sorted Recovery"
             organized.mkdir()
-            (organized / "file.txt").write_text("recovered", encoding="utf-8")
+            original = organized / "Original Albums"
+            original.mkdir()
+            (original / "family-reunion-2012.jpg").write_text("recovered", encoding="utf-8")
             curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
             curator.scan()
             curator.build_reconstruction_foundation()
@@ -851,16 +857,71 @@ class CuratorTests(unittest.TestCase):
                     "relative_path": "Sorted Recovery", "review_status": "noise",
                     "confidence": 96, "reason": "User says this was a temporary sorting folder",
                 }],
-                "path_rules": [], "summary": "Temporary sorting wrapper found",
+                "path_rules": [], "questions": [], "summary": "Temporary sorting wrapper found",
             }
-            with patch("app.ai.AIProviderClient.analyze_structure", return_value=response):
+            with patch("app.ai.AIProviderClient.analyze_structure", return_value=response) as analyze:
                 curator._structure_ai_wrapper(100)
+            evidence, _, plan = analyze.call_args.args
+            sorted_recovery = next(item for item in evidence if item["relative_path"] == "Sorted Recovery")
+            self.assertEqual(sorted_recovery["current_outcome"], "preserve this surviving hierarchy under Recovered Structure")
+            self.assertIn("Original Albums", [item["name"] for item in sorted_recovery["child_folders"]])
+            self.assertIn(
+                "family-reunion-2012.jpg",
+                [item["name"] for item in sorted_recovery["representative_files"]],
+            )
+            self.assertIn("currently_using_safe_category_fallback", plan)
             suggestions = curator.list_structure_suggestions()
             self.assertEqual(len(suggestions), 1)
             self.assertEqual(suggestions[0]["review_status"], "noise")
             curator.review_structure_suggestion(suggestions[0]["id"], "accepted")
-            updated = curator.list_folder_context("Sorted Recovery")[0]
+            updated = next(
+                item for item in curator.list_folder_context("Sorted Recovery")
+                if item["relative_path"] == "Sorted Recovery"
+            )
             self.assertEqual(updated["review_status"], "noise")
+
+    def test_structure_ai_discards_noops_and_zero_match_rules_but_keeps_useful_questions(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            photos = source / "Recovered Photos"
+            photos.mkdir()
+            (photos / "IMG_20190101_120000.jpg").write_bytes(b"not-an-image")
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+            curator.scan()
+            curator.build_reconstruction_foundation()
+            folder = curator.list_folder_context("Recovered Photos")[0]
+            curator.review_folder_context(folder["directory_id"], "recognized", "Family Photos")
+            curator.save_ai_provider_settings({
+                "provider_id": "ollama", "provider_name": "Local AI",
+                "endpoint": "http://ollama:11434/v1", "model": "vision", "enabled": True,
+            })
+            response = {
+                "folder_suggestions": [{
+                    "relative_path": "Recovered Photos", "review_status": "recognized",
+                    "user_label": "Family Photos", "confidence": 99, "reason": "Already correct",
+                }],
+                "path_rules": [{
+                    "label": "Imaginary", "match_text": "does-not-exist",
+                    "destination": "Media/Imaginary", "confidence": 95, "reason": "No evidence",
+                }],
+                "questions": [{
+                    "question": "Were these photos exported from a phone or copied from a camera?",
+                    "why_needed": "The answer changes the origin category.",
+                    "related_path": "Recovered Photos",
+                }],
+                "summary": "One ambiguity remains",
+            }
+            with patch("app.ai.AIProviderClient.analyze_structure", return_value=response):
+                curator._structure_ai_wrapper(100)
+            self.assertEqual(curator.list_structure_suggestions(), [])
+            questions = curator.list_review_questions()
+            self.assertEqual(len(questions), 1)
+            self.assertIn("origin category", questions[0]["question"])
 
     def test_structure_ai_uses_bounded_passes_and_reports_progress(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -890,7 +951,9 @@ class CuratorTests(unittest.TestCase):
                 "endpoint": "http://ollama:11434/v1", "model": "vision",
                 "enabled": True, "allow_cloud_media": False,
             })
-            response = {"folder_suggestions": [], "path_rules": [], "summary": "No change"}
+            response = {
+                "folder_suggestions": [], "path_rules": [], "questions": [], "summary": "No change",
+            }
             with patch("app.ai.AIProviderClient.analyze_structure", return_value=response) as analyze:
                 curator._structure_ai_wrapper(125)
             self.assertEqual(analyze.call_count, 3)

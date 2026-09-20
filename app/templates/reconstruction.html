@@ -154,14 +154,14 @@
   </form></details>
 
   <div class="subcard recommended" id="ai-structure">
-    <span class="step-label">Recommended first</span><h4>Interpret folder structure and your context</h4>
-    <p>This asks the AI to reason over folder names, your folder reviews and notes, empty-directory evidence, and saved context. No photos or videos are sent. Every suggestion remains pending until you accept it.</p>
+    <span class="step-label">Recommended first</span><h4>Find decisions that would improve the plan</h4>
+    <p>The AI receives folder hierarchy, your reviews and notes, representative filenames, and examples of current destinations. Media contents are not sent. Redundant, low-confidence, and zero-match suggestions are discarded before you see them.</p>
     <form class="filter-bar async-job" data-endpoint="/api/reconstruction/ai/structure">
       <label>Folder evidence<select name="limit"><option value="60">60 folders · 1 AI call · lowest cost</option><option value="120" selected>120 folders · 2 AI calls · recommended</option><option value="300">300 folders · 5 AI calls · broad</option><option value="600">600 folders · 10 AI calls · maximum</option></select></label>
-      <button id="start-ai-structure" {% if status.running or not ai_settings.enabled %}disabled{% endif %}>Ask AI to interpret context</button>
+      <button id="start-ai-structure" {% if status.running or not ai_settings.enabled %}disabled{% endif %}>Ask AI to improve the plan</button>
     </form>
     <p class="muted">Folders with your reviews or notes, and empty-folder evidence, are considered first. Each call returns at most 12 folder changes and 5 reusable path rules.</p>
-    <div id="ai-structure-result" class="connection-result" role="status" aria-live="polite">{% if ai_runs and ai_runs[0].request_kind=='structure_analysis' %}Last run: {{ ai_runs[0].status }}{% if ai_runs[0].error %} — {{ ai_runs[0].error }}{% endif %}{% else %}No folder interpretation has been run yet.{% endif %}</div>
+    <div id="ai-structure-result" class="connection-result" role="status" aria-live="polite">{% if latest_structure %}Last run: {{ latest_structure.status }}{% if latest_structure.error %} — {{ latest_structure.error }}{% elif latest_structure.status=='complete' %} — {{ structure_suggestions|length }} actionable changes and {{ attention.review_questions or 0 }} open questions{% endif %}{% else %}No folder interpretation has been run yet.{% endif %}</div>
     <details class="review-drawer" id="ai-suggestions" {% if structure_suggestions %}open{% endif %}><summary><span id="ai-suggestion-count">{{ structure_suggestions|length }}</span> AI structure suggestions awaiting review</summary><div class="suggestion-list" id="ai-suggestion-list">
       {% for item in structure_suggestions %}<article class="suggestion-card">
         <div><span class="pill">{{ item.suggestion_type }}</span><span class="pill">{{ item.confidence }}% confidence</span>
@@ -170,7 +170,7 @@
           <span class="muted">{{ item.reason or 'No additional explanation supplied.' }}</span></div>
         <form class="suggestion-review" data-id="{{ item.id }}"><button name="decision" value="accepted">Accept &amp; apply</button> <button class="secondary" name="decision" value="rejected">Reject</button></form>
       </article>{% endfor %}
-    </div><p class="empty-state" id="ai-suggestion-empty" {% if structure_suggestions %}hidden{% endif %}>No AI suggestions are waiting. A successful run may also return zero suggestions when the evidence is not strong enough—that is a valid, safer result.</p></details>
+    </div><p class="empty-state" id="ai-suggestion-empty" {% if structure_suggestions %}hidden{% endif %}>No actionable AI changes are waiting. The AI may instead ask a focused question on the Review step, or conclude that the safe category fallback is the best available result.</p></details>
   </div>
 
   <details class="review-drawer" id="ai-batch"><summary>Optional: classify uncertain photos and videos</summary>
@@ -388,7 +388,7 @@ function renderWorkspace(data){
   const providerSummary=document.getElementById('provider-summary-name');if(providerSummary)providerSummary.textContent=data.provider.enabled?`${data.provider.provider_name} · ${data.provider.model}`:'No AI provider enabled';
   const providerBadge=document.getElementById('ai-provider-state');if(providerBadge){providerBadge.textContent=data.provider.enabled?'Enabled':'Not configured';providerBadge.className=`pill ${data.provider.enabled?'good':'warn'}`}
   const latest=data.ai_runs.find(run=>run.request_kind==='structure_analysis');const structureResult=document.getElementById('ai-structure-result');
-  if(latest&&structureResult){structureResult.textContent=latest.status==='complete'?`Completed — ${data.suggestion_count} suggestion${data.suggestion_count===1?'':'s'} ready for review.${latest.result_summary?` ${latest.result_summary}`:''}`:latest.status==='running'?'AI is interpreting your evidence now…':`Failed — ${latest.error||'No usable result was returned.'}`;structureResult.className=`connection-result ${latest.status==='complete'?'success':latest.status==='failed'?'error':''}`}
+  if(latest&&structureResult){structureResult.textContent=latest.status==='complete'?`Completed — ${data.suggestion_count} actionable change${data.suggestion_count===1?'':'s'} and ${data.open_questions} open question${data.open_questions===1?'':'s'}.${latest.result_summary?` ${latest.result_summary}`:''}`:latest.status==='running'?'AI is interpreting your evidence now…':`Failed — ${latest.error||'No usable result was returned.'}`;structureResult.className=`connection-result ${latest.status==='complete'?'success':latest.status==='failed'?'error':''}`}
   renderSuggestions(data.suggestions);renderRuns(data.ai_runs);updateJobButtons();
 }
 async function refreshWorkspace(immediate=false){

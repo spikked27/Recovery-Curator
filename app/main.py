@@ -328,7 +328,7 @@ def reconstruction():
         proposal_tree=[],
         directory_proposals=(curator.list_reconstruction_directories(limit=50) if active_step == "review" else []),
         export_preview=export_preview,
-        ai_settings=ai_settings, ai_runs=ai_runs,
+        ai_settings=ai_settings, ai_runs=ai_runs, latest_structure=latest_structure,
         ai_candidate_count=reconstruction_summary.get("ai_pending", 0),
         structure_suggestions=(curator.list_structure_suggestions(limit=100)
                                if active_step in {"ai", "review"} else []),

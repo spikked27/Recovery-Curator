@@ -160,6 +160,7 @@ def initialize(db_path: Path) -> None:
               updated_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_files_size ON files(size);
+            CREATE INDEX IF NOT EXISTS idx_files_relative_path ON files(relative_path);
             CREATE INDEX IF NOT EXISTS idx_files_hash ON files(content_hash);
             CREATE INDEX IF NOT EXISTS idx_files_size_hash ON files(size,content_hash);
             CREATE INDEX IF NOT EXISTS idx_files_exact ON files(exact_group);
@@ -2636,6 +2637,86 @@ class Curator:
         config = ProviderConfig.from_mapping(config_values)
         return AIProviderClient(config).test_connection()
 
+    def _structure_ai_evidence(self, db: sqlite3.Connection, limit: int) -> list[dict]:
+        """Build compact, decision-oriented folder evidence without sending media content."""
+        folders = [dict(row) for row in db.execute(
+            """SELECT directory_id,relative_path,name,descendant_files,descendant_bytes,zero_files,
+                      review_status,user_label,notes,suggestion_score
+               FROM folder_context
+               ORDER BY (review_status!='unreviewed') DESC,(notes IS NOT NULL) DESC,
+                        (descendant_files=0) DESC,suggestion_score DESC,directory_id
+               LIMIT ?""",
+            (limit,),
+        )]
+        if not folders:
+            return []
+        for rank, folder in enumerate(folders, 1):
+            folder["evidence_rank"] = rank
+
+        selected_paths = [item["relative_path"] for item in folders]
+        children: dict[str, list[dict]] = defaultdict(list)
+        for start in range(0, len(selected_paths), 400):
+            values = selected_paths[start:start + 400]
+            markers = ",".join("?" for _ in values)
+            for row in db.execute(
+                f"""SELECT d.parent_relative_path,d.relative_path,d.name,
+                            COALESCE(f.review_status,'unreviewed') review_status,
+                            COALESCE(f.descendant_files,0) descendant_files,
+                            COALESCE(f.zero_files,0) zero_files
+                     FROM directories d LEFT JOIN folder_context f ON f.directory_id=d.id
+                     WHERE d.parent_relative_path IN ({markers})
+                     ORDER BY d.parent_relative_path,d.name LIMIT 5000""",
+                values,
+            ):
+                bucket = children[row["parent_relative_path"]]
+                if len(bucket) < 8:
+                    bucket.append({
+                        "name": row["name"], "relative_path": row["relative_path"],
+                        "review_status": row["review_status"],
+                        "descendant_files": row["descendant_files"], "zero_files": row["zero_files"],
+                    })
+
+        reviewed = {row["relative_path"]: dict(row) for row in db.execute(
+            """SELECT relative_path,review_status,COALESCE(NULLIF(user_label,''),name) label,notes
+               FROM folder_context WHERE review_status!='unreviewed'"""
+        )}
+        outcomes = {
+            "recognized": "preserve this surviving hierarchy under Recovered Structure",
+            "private": "preserve this hierarchy separately under Private",
+            "noise": "remove this wrapper and organize its files using stronger evidence or safe categories",
+            "system": "exclude this system/application branch from the proposed library",
+            "unreviewed": "use a sanitized media/file category unless stronger descendant evidence applies",
+        }
+        for folder in folders:
+            relative = folder["relative_path"]
+            ancestors = []
+            parent = PurePosixPath(relative).parent
+            while str(parent) not in ("", ".", "/") and len(ancestors) < 6:
+                item = reviewed.get(str(parent))
+                if item:
+                    ancestors.append(item)
+                parent = parent.parent
+            lower_bound = relative + "/"
+            upper_bound = relative + "0"
+            samples = [dict(row) for row in db.execute(
+                """SELECT f.name,f.relative_path,f.media_kind,f.validation,
+                          p.proposed_path current_destination,p.basis current_basis
+                   FROM files f LEFT JOIN reconstruction_proposals p ON p.file_id=f.id
+                   WHERE f.relative_path>=? AND f.relative_path<? AND f.size>0
+                   ORDER BY f.relative_path LIMIT 2""",
+                (lower_bound, upper_bound),
+            )]
+            folder["depth"] = len(PurePosixPath(relative).parts)
+            folder["current_outcome"] = outcomes.get(folder["review_status"], outcomes["unreviewed"])
+            folder["reviewed_ancestors"] = ancestors
+            folder["child_folders"] = children.get(relative, [])
+            folder["representative_files"] = samples
+        folders.sort(key=lambda item: (
+            PurePosixPath(item["relative_path"]).parts[0].casefold(),
+            item["relative_path"].casefold(),
+        ))
+        return folders
+
     def start_structure_ai(self, limit: int = 120) -> int:
         settings = self._ai_provider_config_values()
         if not settings.get("enabled"):
@@ -2659,17 +2740,9 @@ class Curator:
 
         settings = self._ai_provider_config_values()
         config = ProviderConfig.from_mapping(settings)
-        source = f"ai:{config.provider_name}"[:100]
+        source = f"ai:{config.provider_name}:structure"[:100]
         with connect(self.db_path) as db:
-            folders = [dict(row) for row in db.execute(
-                """SELECT directory_id,relative_path,name,descendant_files,descendant_bytes,zero_files,
-                          review_status,user_label,notes,suggestion_score
-                   FROM folder_context
-                   ORDER BY (review_status!='unreviewed') DESC,(notes IS NOT NULL) DESC,
-                            (descendant_files=0) DESC,suggestion_score DESC,directory_id
-                   LIMIT ?""",
-                (limit,),
-            )]
+            folders = self._structure_ai_evidence(db, limit)
             run_id = int(db.execute(
                 """INSERT INTO ai_runs(
                      file_id,provider_name,model,status,request_kind,created_at
@@ -2679,11 +2752,22 @@ class Curator:
             db.commit()
         try:
             context = self.list_recovery_context()
+            reconstruction = self.reconstruction_summary()
+            plan_context = {
+                "files_with_destinations": reconstruction.get("proposals", 0),
+                "currently_preserved_by_structure": reconstruction.get("preserved_structure", 0),
+                "currently_using_safe_category_fallback": reconstruction.get("sanitized_categories", 0),
+                "currently_using_interpreted_categories": reconstruction.get("interpreted_categories", 0),
+                "folders_reviewed_by_user": reconstruction.get("reviewed_folders", 0),
+                "saved_context_clues": reconstruction.get("context_items", 0),
+                "goal": "preserve supported original structure; otherwise produce useful categories without invention",
+            }
             client = AIProviderClient(config)
             chunk_size = 60
             chunks = [folders[index:index + chunk_size] for index in range(0, len(folders), chunk_size)]
             folder_items: list[dict] = []
             rule_items: list[dict] = []
+            question_items: list[dict] = []
             summaries: list[str] = []
             for pass_number, chunk in enumerate(chunks, 1):
                 self._check_cancel()
@@ -2692,7 +2776,7 @@ class Curator:
                     f"AI context interpretation — pass {pass_number:,} of {len(chunks):,} "
                     f"({len(chunk):,} folders)",
                 )
-                pass_result = client.analyze_structure(chunk, context)
+                pass_result = client.analyze_structure(chunk, context, plan_context)
                 self._check_cancel()
                 pass_folders = pass_result.get("folder_suggestions")
                 pass_rules = pass_result.get("path_rules")
@@ -2700,6 +2784,9 @@ class Curator:
                     folder_items.extend(item for item in pass_folders if isinstance(item, dict))
                 if isinstance(pass_rules, list):
                     rule_items.extend(item for item in pass_rules if isinstance(item, dict))
+                pass_questions = pass_result.get("questions")
+                if isinstance(pass_questions, list):
+                    question_items.extend(item for item in pass_questions if isinstance(item, dict))
                 summary = str(pass_result.get("summary") or "").strip()
                 if summary:
                     summaries.append(summary)
@@ -2710,6 +2797,7 @@ class Curator:
             result = {
                 "folder_suggestions": folder_items,
                 "path_rules": rule_items,
+                "questions": question_items,
                 "summary": " ".join(summaries)[:4000],
                 "passes": len(chunks),
             }
@@ -2730,35 +2818,91 @@ class Curator:
                 target = valid_paths.get(relative)
                 if not target or status not in {"recognized", "private", "noise", "system"}:
                     continue
+                confidence = confidence_of(item)
+                if confidence < 60:
+                    continue
+                label_text = str(item.get("user_label") or "").strip()
+                cleaned_label = sanitize_component(label_text)[:150] if label_text else None
+                current_label = str(target.get("user_label") or target.get("name") or "").casefold()
+                label_changes = bool(cleaned_label and cleaned_label.casefold() != current_label)
+                if status == target.get("review_status") and not label_changes:
+                    continue
                 key = ("folder", relative.casefold(), status)
                 if key in seen_suggestions:
                     continue
                 seen_suggestions.add(key)
-                label_text = str(item.get("user_label") or "").strip()
+                impact = int(target.get("descendant_files") or 0)
+                reason = str(item.get("reason") or "").strip()
+                reason = f"Affects {impact:,} current file(s). {reason}".strip()
                 saved.append((
                     "folder", target["directory_id"], relative, status,
-                    sanitize_component(label_text)[:150] if label_text else None,
-                    None, None, confidence_of(item),
-                    str(item.get("reason") or "")[:1000] or None, source, "pending", now, now,
+                    cleaned_label, None, None, confidence,
+                    reason[:1000] or None, source, "pending", now, now,
                 ))
+            existing_rules = {
+                (str(item.get("match_text") or "").strip().casefold(),
+                 self._clean_relative_path(str(item.get("destination") or "").strip()).casefold())
+                for item in context if item.get("match_text") and item.get("destination")
+            }
+            rule_candidates = []
             for item in rule_items[:200]:
                 if not isinstance(item, dict):
                     continue
                 match_text = str(item.get("match_text") or "").strip()[:300]
                 destination = self._clean_relative_path(str(item.get("destination") or "").strip())[:500]
-                if not match_text or not destination or destination == ".":
+                confidence = confidence_of(item)
+                if len(match_text) < 4 or not destination or destination == "." or confidence < 60:
                     continue
                 key = ("rule", match_text.casefold(), destination.casefold())
-                if key in seen_suggestions:
+                if key in seen_suggestions or (key[1], key[2]) in existing_rules:
                     continue
                 seen_suggestions.add(key)
+                rule_candidates.append((item, match_text, destination, confidence))
+            match_counts = []
+            if rule_candidates:
+                expressions = ",".join(
+                    f"COALESCE(SUM(instr(lower(relative_path),lower(?))>0),0) AS count_{index}"
+                    for index in range(len(rule_candidates))
+                )
+                with connect(self.db_path) as db:
+                    match_counts = list(db.execute(
+                        f"SELECT {expressions} FROM files",
+                        [item[1] for item in rule_candidates],
+                    ).fetchone())
+            for (item, match_text, destination, confidence), match_count in zip(
+                rule_candidates, match_counts,
+            ):
+                match_count = int(match_count or 0)
+                if not match_count:
+                    continue
+                reason = str(item.get("reason") or "").strip()
+                reason = f"Matches {match_count:,} current file(s). {reason}".strip()
                 saved.append((
                     "rule", None, None, None, str(item.get("label") or "AI path rule")[:150],
-                    match_text, destination, confidence_of(item),
-                    str(item.get("reason") or "")[:1000] or None, source, "pending", now, now,
+                    match_text, destination, confidence,
+                    reason[:1000] or None, source, "pending", now, now,
                 ))
+            questions = []
+            seen_questions: set[str] = set()
+            for item in question_items:
+                question = str(item.get("question") or "").strip()
+                related = str(item.get("related_path") or "").strip()
+                target = valid_paths.get(related)
+                if not question or not target or question.casefold() in seen_questions:
+                    continue
+                why = str(item.get("why_needed") or "").strip()
+                impact = int(target.get("descendant_files") or 0)
+                if impact == 0 and int(target.get("zero_files") or 0) == 0:
+                    continue
+                seen_questions.add(question.casefold())
+                text = f"{question} [Folder: {related}]"
+                if why:
+                    text += f" Why this matters: {why}"
+                questions.append((impact, text[:1000]))
+            questions.sort(key=lambda item: item[0], reverse=True)
             with connect(self.db_path) as db:
                 db.execute("DELETE FROM ai_structure_suggestions WHERE status='pending'")
+                db.execute("DELETE FROM review_questions WHERE status='open' AND source=?", (source,))
                 if saved:
                     db.executemany(
                         """INSERT INTO ai_structure_suggestions(
@@ -2766,6 +2910,13 @@ class Curator:
                              match_text,destination,confidence,reason,source,status,created_at,updated_at
                            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                         saved,
+                    )
+                for _, question in questions[:5]:
+                    db.execute(
+                        """INSERT INTO review_questions(
+                             file_id,source,question,status,created_at,updated_at
+                           ) VALUES(NULL,?,?,'open',?,?)""",
+                        (source, question, now, now),
                     )
                 db.execute(
                     """UPDATE ai_runs SET status='complete',response_json=?,completed_at=? WHERE id=?""",
@@ -2775,7 +2926,7 @@ class Curator:
             self._set_state(
                 running=False, phase="complete", processed=len(chunks), total=len(chunks),
                 message=(f"AI interpretation complete — {len(chunks):,} focused passes, "
-                         f"{len(saved):,} suggestions to review"), error=None,
+                         f"{len(saved):,} useful suggestions and {min(len(questions), 5):,} questions"), error=None,
             )
         except ScanCancelled as exc:
             with connect(self.db_path) as db:
