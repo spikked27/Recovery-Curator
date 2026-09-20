@@ -172,7 +172,6 @@ class AIProviderClient:
             payload = {
                 "model": self.config.model,
                 "max_tokens": 4096,
-                "temperature": 0.1,
                 "system": system,
                 "messages": [{"role": "user", "content": user_content}],
             }

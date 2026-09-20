@@ -597,6 +597,7 @@ class CuratorTests(unittest.TestCase):
             request = opener.call_args.args[0]
             payload = json.loads(request.data.decode())
             self.assertEqual(request.full_url, "https://api.anthropic.com/v1/messages")
+            self.assertNotIn("temperature", payload)
             self.assertEqual(payload["system"].split()[0], "You")
             image = payload["messages"][0]["content"][0]
             self.assertEqual(image["type"], "image")
