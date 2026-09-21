@@ -392,15 +392,31 @@ class CuratorTests(unittest.TestCase):
                          details TEXT,created_at TEXT NOT NULL,updated_at TEXT NOT NULL
                        )"""
                 )
+                db.execute(
+                    """CREATE TABLE ai_structure_suggestions(
+                         id INTEGER PRIMARY KEY,suggestion_type TEXT NOT NULL,
+                         source TEXT NOT NULL,status TEXT NOT NULL DEFAULT 'pending',
+                         confidence INTEGER NOT NULL DEFAULT 0,created_at TEXT NOT NULL,
+                         updated_at TEXT NOT NULL
+                       )"""
+                )
                 db.commit()
 
             Curator(source, output, quarantine, db_path)
             with connect(db_path) as db:
                 proposal_columns = {row[1] for row in db.execute("PRAGMA table_info(reconstruction_proposals)")}
                 context_columns = {row[1] for row in db.execute("PRAGMA table_info(recovery_context)")}
+                suggestion_columns = {
+                    row[1] for row in db.execute("PRAGMA table_info(ai_structure_suggestions)")
+                }
                 indexes = {row[1] for row in db.execute("PRAGMA index_list(reconstruction_proposals)")}
+                packet_table = db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_packet_imports'"
+                ).fetchone()
             self.assertTrue({"review_state", "user_path", "review_note", "reviewed_at"} <= proposal_columns)
             self.assertTrue({"match_text", "destination"} <= context_columns)
+            self.assertTrue({"validation_state", "dossier_id", "packet_id"} <= suggestion_columns)
+            self.assertIsNotNone(packet_table)
             self.assertIn("idx_reconstruction_review", indexes)
 
     def test_video_metadata_and_discovered_folder_reconstruction(self):
@@ -786,6 +802,110 @@ class CuratorTests(unittest.TestCase):
             self.assertEqual(result["files"], 1)
             self.assertGreaterEqual(result["directories"], 3)
             self.assertGreater(result["bytes"], 0)
+
+    def test_ai_work_packets_are_branch_aware_importable_and_apply_only_after_complete_coverage(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            for branch in ("Camera Roll", "Recovered Downloads"):
+                folder = source / branch
+                folder.mkdir()
+                (folder / ("IMG_20200101_120000.jpg" if branch == "Camera Roll" else "wallpaper-space.jpg")).write_bytes(b"evidence")
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+            curator.scan()
+            curator.build_reconstruction_foundation()
+            folder_rows = {
+                item["relative_path"]: item for item in curator.list_folder_context(limit=100)
+            }
+            original_builder = curator._ai_branch_evidence
+
+            def oversized_branch(db, branch):
+                units = original_builder(db, branch)
+                self.assertEqual(len(units), 1)
+                units[0]["representative_files"].append({"name": "x" * 50000})
+                return units
+
+            with patch.object(curator, "_ai_branch_evidence", side_effect=oversized_branch):
+                package = curator.generate_ai_work_package(target_tokens=10000)
+            self.assertEqual(package["packet_count"], 2)
+            self.assertEqual(package["imported_count"], 0)
+            first_packet = json.loads(
+                curator.ai_work_packet_path("packet-001").read_text(encoding="utf-8")
+            )
+            self.assertEqual(first_packet["schema_version"], 1)
+            self.assertEqual(first_packet["dossier_id"], package["dossier_id"])
+            self.assertIn("required_output", first_packet)
+            first_path = first_packet["evidence_units"][0]["folders"][0]["relative_path"]
+            response_one = {
+                "schema_version": 1, "dossier_id": package["dossier_id"],
+                "packet_id": "packet-001", "coverage_complete": True,
+                "decisions": [{
+                    "focal_path": first_path, "action": "folder_status",
+                    "review_status": "recognized", "user_label": "Original Camera Media",
+                    "match_text": "", "destination": "", "confidence": 94,
+                    "reason": "The branch name and camera filename pattern support preserving it.",
+                    "question": "",
+                }],
+            }
+            imported_one = curator.import_ai_work_packet_response(json.dumps(response_one))
+            self.assertEqual(imported_one["valid"], 1)
+            self.assertEqual(imported_one["package"]["imported_count"], 1)
+            suggestion = curator.list_structure_suggestions()[0]
+            with self.assertRaisesRegex(RuntimeError, "Import every packet"):
+                curator.review_structure_suggestions_batch([suggestion["id"]], "accepted")
+
+            response_two = {
+                "schema_version": 1, "dossier_id": package["dossier_id"],
+                "packet_id": "packet-002", "coverage_complete": True, "decisions": [],
+            }
+            imported_two = curator.import_ai_work_packet_response(json.dumps(response_two))
+            self.assertTrue(imported_two["package"]["complete"])
+            applied = curator.review_structure_suggestions_batch([suggestion["id"]], "accepted")
+            self.assertEqual(applied, {"reviewed": 1, "accepted": 1})
+            updated = curator.list_folder_context(first_path)[0]
+            self.assertEqual(updated["review_status"], "recognized")
+            self.assertEqual(updated["user_label"], "Original Camera Media")
+            self.assertFalse(curator.ai_work_package_status()["current"])
+            self.assertIn(first_path, folder_rows)
+
+    def test_ai_work_packet_import_rejects_stale_or_incomplete_responses(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            branch = source / "Recovered"
+            branch.mkdir()
+            (branch / "snapsave-image.jpg").write_bytes(b"evidence")
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+            curator.scan()
+            curator.build_reconstruction_foundation()
+            package = curator.generate_ai_work_package()
+            response = {
+                "schema_version": 1, "dossier_id": package["dossier_id"],
+                "packet_id": "packet-001", "coverage_complete": False, "decisions": [],
+            }
+            with self.assertRaisesRegex(ValueError, "complete packet"):
+                curator.import_ai_work_packet_response(json.dumps(response))
+            response["coverage_complete"] = True
+            response["decisions"] = [{
+                "focal_path": "Recovered", "action": "path_rule", "review_status": "",
+                "user_label": "Invented", "match_text": "not-visible-in-this-packet",
+                "destination": "Media/Invented", "confidence": 99, "reason": "Unsupported",
+                "question": "",
+            }]
+            imported = curator.import_ai_work_packet_response(json.dumps(response))
+            self.assertEqual(imported["ignored"], 1)
+            self.assertEqual(curator.list_structure_suggestions(), [])
+            curator.add_recovery_context("application", "SnapSave", "Recovered Snapchat saves")
+            with self.assertRaisesRegex(RuntimeError, "stale"):
+                curator.import_ai_work_packet_response(json.dumps(response))
 
     def test_reconstruction_review_dry_run_and_export_are_safety_gated(self):
         with tempfile.TemporaryDirectory() as temp:

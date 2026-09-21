@@ -111,6 +111,40 @@ def download_ai_reconstruction_dossier():
     )
 
 
+@app.post("/api/reconstruction/ai/work-package")
+def api_generate_ai_work_package():
+    values = request.get_json(silent=True) or {}
+    try:
+        curator.start_ai_work_package(int(values.get("target_tokens", 40000)))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "status": curator.status()})
+
+
+@app.get("/api/reconstruction/ai/work-package")
+def api_ai_work_package_status():
+    return jsonify({"ok": True, "package": curator.ai_work_package_status()})
+
+
+@app.get("/reconstruction/ai/work-package/<packet_id>")
+def download_ai_work_packet(packet_id: str):
+    try:
+        path = curator.ai_work_packet_path(packet_id)
+    except FileNotFoundError:
+        abort(404)
+    return send_file(path, as_attachment=True, download_name=path.name, mimetype="application/json")
+
+
+@app.post("/api/reconstruction/ai/work-package/import")
+def api_import_ai_work_packet():
+    values = request.get_json(silent=True) or {}
+    try:
+        result = curator.import_ai_work_packet_response(str(values.get("response_text") or ""))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "result": result})
+
+
 @app.post("/api/reconstruction/ai/batch")
 def api_start_ai_batch():
     values = request.get_json(silent=True) or {}
@@ -142,6 +176,23 @@ def api_review_ai_suggestion(suggestion_id: int):
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     return jsonify({"ok": True, "status": curator.status()})
+
+
+@app.post("/api/reconstruction/ai/suggestions")
+def api_review_ai_suggestions():
+    values = request.get_json(silent=True) or {}
+    try:
+        result = curator.review_structure_suggestions_batch(
+            values.get("ids") if isinstance(values.get("ids"), list) else [],
+            str(values.get("decision") or "rejected"),
+        )
+        if result["accepted"] and not curator.start_reconstruction_plan_refresh():
+            raise RuntimeError(
+                "Suggestions were saved, but another job is running. Apply saved feedback after it finishes."
+            )
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "result": result, "status": curator.status()})
 
 
 @app.get("/scans")
@@ -343,6 +394,7 @@ def reconstruction():
         directory_proposals=(curator.list_reconstruction_directories(limit=50) if active_step == "review" else []),
         export_preview=export_preview,
         ai_settings=ai_settings, ai_runs=ai_runs, latest_structure=latest_structure,
+        ai_work_package=(curator.ai_work_package_status() if active_step in {"ai", "review"} else None),
         ai_candidate_count=reconstruction_summary.get("ai_pending", 0),
         structure_suggestions=(curator.list_structure_suggestions(limit=100)
                                if active_step in {"ai", "review"} else []),

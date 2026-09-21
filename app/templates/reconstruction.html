@@ -154,28 +154,62 @@
   </form></details>
 
   <div class="subcard recommended" id="ai-structure">
-    <span class="step-label">Recommended first</span><h4>Find decisions that would improve the plan</h4>
+    <span class="step-label">Connected provider</span><h4>Review priority branches automatically</h4>
     <p>The AI receives folder hierarchy, your reviews and notes, representative filenames, and examples of current destinations. Media contents are not sent. Redundant, low-confidence, and zero-match suggestions are discarded before you see them.</p>
     <form class="filter-bar async-job" data-endpoint="/api/reconstruction/ai/structure">
       <label>Branches to review<select name="limit"><option value="4">4 branches · 1 compact call</option><option value="12" selected>12 branches · 3 calls · recommended</option><option value="24">24 branches · 6 calls · broader</option><option value="40">40 branches · 10 calls · maximum</option></select></label>
       <button id="start-ai-structure" {% if status.running or not ai_settings.enabled %}disabled{% endif %}>Ask AI to improve the plan</button>
     </form>
     <p class="muted">Each call reviews only four high-priority branches and must return one compact decision per branch: change it, create a specific rule, ask you one question, or leave it alone. Overlong batches automatically retry one branch at a time.</p>
-    <details class="review-drawer"><summary>Use the complete evidence with another AI agent</summary><div class="subcard">
-      <p>Create one text dossier containing every context clue, folder (including empty folders), filename, catalog fact, relationship, derived facet, and current proposed destination. It includes a strict JSON decision format and never includes media contents.</p>
-      <p><a class="button secondary" href="/reconstruction/ai/dossier">Build &amp; download complete AI dossier</a></p>
-      <p class="muted">A large recovery catalog may be bigger than an AI model's context window. The dossier tells the agent to work by top-level branch. Review the file before sharing it: filenames, paths, notes, captions, and other catalog metadata may be private.</p>
-    </div></details>
     <div id="ai-structure-result" class="connection-result" role="status" aria-live="polite">{% if latest_structure %}Last run: {{ latest_structure.status }}{% if latest_structure.error %} — {{ latest_structure.error }}{% elif latest_structure.status=='complete' %} — {{ structure_suggestions|length }} actionable changes and {{ attention.review_questions or 0 }} open questions{% endif %}{% else %}No folder interpretation has been run yet.{% endif %}</div>
     <details class="review-drawer" id="ai-suggestions" {% if structure_suggestions %}open{% endif %}><summary><span id="ai-suggestion-count">{{ structure_suggestions|length }}</span> AI structure suggestions awaiting review</summary><div class="suggestion-list" id="ai-suggestion-list">
       {% for item in structure_suggestions %}<article class="suggestion-card">
-        <div><span class="pill">{{ item.suggestion_type }}</span><span class="pill">{{ item.confidence }}% confidence</span>
+        <div><span class="pill">{{ item.suggestion_type }}</span><span class="pill">{{ item.confidence }}% confidence</span>{% if item.validation_state=='conflict' %}<span class="pill bad">Conflicts with your review</span>{% endif %}
           {% if item.suggestion_type=='folder' %}<strong class="path">{{ item.relative_path }}</strong><span>Mark as <strong>{{ item.review_status }}</strong>{% if item.user_label %} and name it <strong>{{ item.user_label }}</strong>{% endif %}</span>
           {% else %}<strong>{{ item.user_label }}</strong><span><code>{{ item.match_text }}</code> → <code>{{ item.destination }}</code></span>{% endif %}
           <span class="muted">{{ item.reason or 'No additional explanation supplied.' }}</span></div>
-        <form class="suggestion-review" data-id="{{ item.id }}"><button name="decision" value="accepted">Accept &amp; apply</button> <button class="secondary" name="decision" value="rejected">Reject</button></form>
+        <form class="suggestion-review" data-id="{{ item.id }}"><button name="decision" value="accepted" {% if item.dossier_id and (not ai_work_package.complete or not ai_work_package.current) %}disabled title="Complete a current work package first"{% endif %}>Accept &amp; apply</button> <button class="secondary" name="decision" value="rejected">Reject</button></form>
       </article>{% endfor %}
     </div><p class="empty-state" id="ai-suggestion-empty" {% if structure_suggestions %}hidden{% endif %}>No actionable AI changes are waiting. The AI may instead ask a focused question on the Review step, or conclude that the safe category fallback is the best available result.</p></details>
+  </div>
+
+  <div class="subcard" id="ai-work-package">
+    <span class="step-label">External AI agent</span><h4>Analyze one manageable work packet at a time</h4>
+    <p>Recovery Curator summarizes the catalog by real top-level branch, repeats your authoritative context in every packet, and keeps each upload within a bounded token target. Import every response before applying any suggestions so the remaining packets stay current.</p>
+    <div class="metric-grid compact" id="packet-metrics">
+      <div><div class="metric" id="packet-total">{{ ai_work_package.packet_count or 0 }}</div><div class="muted">packets</div></div>
+      <div><div class="metric good" id="packet-imported">{{ ai_work_package.imported_count or 0 }}</div><div class="muted">responses imported</div></div>
+      <div><div class="metric warn" id="packet-remaining">{{ ai_work_package.remaining_count or 0 }}</div><div class="muted">remaining</div></div>
+      <div><div class="metric" id="packet-size">{{ ai_work_package.bytes_human or '—' }}</div><div class="muted">total packet data</div></div>
+    </div>
+    <div id="packet-package-state" class="connection-result {{ 'success' if ai_work_package.exists and ai_work_package.current else 'error' if ai_work_package.exists else '' }}" role="status" aria-live="polite">
+      {% if not ai_work_package.exists %}No AI work package has been generated for this scan.
+      {% elif not ai_work_package.current %}This work package is stale because the catalog or reconstruction evidence changed. Generate fresh packets.
+      {% elif ai_work_package.complete %}All {{ ai_work_package.packet_count }} packet responses are imported and ready for review.
+      {% else %}Packet {{ ai_work_package.imported_count + 1 }} of {{ ai_work_package.packet_count }} is next.{% endif %}
+    </div>
+    <div class="provider-actions">
+      <button type="button" id="generate-ai-packets">{{ 'Regenerate fresh packets' if ai_work_package.exists else 'Generate AI work package' }}</button>
+      <button type="button" class="secondary" id="copy-packet-prompt" {% if not ai_work_package.exists %}disabled{% endif %}>Copy prompt</button>
+      <a class="button secondary" id="download-next-packet" {% if ai_work_package.next_packet and ai_work_package.current %}href="{{ ai_work_package.next_packet.download_url }}"{% else %}hidden{% endif %}>Download next packet</a>
+    </div>
+    <div id="packet-next-detail" class="notice" {% if not ai_work_package.next_packet or not ai_work_package.current %}hidden{% endif %}>
+      {% if ai_work_package.next_packet %}<strong>{{ ai_work_package.next_packet.packet_id }}</strong> · {{ ai_work_package.next_packet.bytes_human }} · about {{ ai_work_package.next_packet.estimated_tokens }} tokens<br><span class="muted">{{ ai_work_package.next_packet.branches|join(', ') }}</span>{% endif %}
+    </div>
+    <label class="full-label">AI response
+      <textarea id="packet-response-text" rows="10" placeholder="Paste the complete JSON response here, or choose the saved response file below."></textarea>
+    </label>
+    <div class="provider-actions">
+      <label class="button ghost" for="packet-response-file">Choose response file</label><input id="packet-response-file" type="file" accept=".json,.txt,application/json,text/plain" hidden>
+      <span class="muted" id="packet-response-file-name">No response file selected</span>
+      <button type="button" id="import-packet-response" {% if not ai_work_package.exists or not ai_work_package.current %}disabled{% endif %}>Validate &amp; import response</button>
+    </div>
+    <div id="packet-import-result" class="connection-result" role="status" aria-live="polite">Imported decisions remain pending until you review and accept them.</div>
+    <details class="review-drawer" id="packet-coverage" {% if ai_work_package.packets %}open{% endif %}><summary>Packet coverage</summary><div id="packet-list" class="suggestion-list">
+      {% for packet in ai_work_package.packets %}<article class="suggestion-card"><div><span class="pill {{ 'good' if packet.imported else 'warn' }}">{{ 'Imported' if packet.imported else 'Waiting' }}</span><strong>{{ packet.packet_id }}</strong><span>{{ packet.bytes_human }} · approximately {{ packet.estimated_tokens }} tokens</span><span class="muted">{{ packet.branches|join(', ') }}</span></div>{% if not packet.imported and ai_work_package.current %}<a class="button secondary" href="{{ packet.download_url }}">Download</a>{% endif %}</article>{% endfor %}
+    </div></details>
+    <details class="advanced-settings"><summary>Advanced: complete audit export</summary><p>The full text dossier contains every catalog record and can be too large for a chat. Keep it for offline inspection or specialist tools; use the bounded packets above for AI analysis.</p><a class="button ghost" href="/reconstruction/ai/dossier">Download complete audit dossier</a></details>
+    <p class="muted">Packets contain filenames, paths, notes, captions, and metadata that may be private. They never contain the media files or previews themselves.</p>
   </div>
 
   <details class="review-drawer" id="ai-batch"><summary>Optional: classify uncertain photos and videos</summary>
@@ -200,13 +234,14 @@
 {% if active_step=='review' %}
 {% if structure_suggestions %}<section class="card" id="ai-suggestions">
   <div class="section-heading"><div><span class="step-label">Review these first</span><h3>AI suggestions awaiting your decision</h3></div><span class="pill warn"><span id="ai-suggestion-count">{{ structure_suggestions|length }}</span> pending</span></div>
-  <p>These are proposals only. Accepting one updates your saved evidence and then rebuilds the destination plan.</p>
+  <p>These are proposals only. For an external work package, import every packet first. Then select the useful changes and rebuild the destination plan once.</p>
+  <div class="provider-actions" id="bulk-suggestion-actions"><label><input type="checkbox" id="select-all-suggestions"> Select all shown</label><button type="button" id="accept-selected-suggestions">Accept selected &amp; rebuild once</button><button type="button" class="secondary" id="reject-selected-suggestions">Reject selected</button></div>
   <div class="suggestion-list" id="ai-suggestion-list">{% for item in structure_suggestions %}<article class="suggestion-card">
-    <div><span class="pill">{{ item.suggestion_type }}</span><span class="pill">{{ item.confidence }}% confidence</span>
+    <input type="checkbox" class="suggestion-select" value="{{ item.id }}" aria-label="Select suggestion"><div><span class="pill">{{ item.suggestion_type }}</span><span class="pill">{{ item.confidence }}% confidence</span>{% if item.validation_state=='conflict' %}<span class="pill bad">Conflicts with your review</span>{% endif %}
       {% if item.suggestion_type=='folder' %}<strong class="path">{{ item.relative_path }}</strong><span>Mark as <strong>{{ item.review_status }}</strong>{% if item.user_label %} and name it <strong>{{ item.user_label }}</strong>{% endif %}</span>
       {% else %}<strong>{{ item.user_label }}</strong><span><code>{{ item.match_text }}</code> → <code>{{ item.destination }}</code></span>{% endif %}
       <span class="muted">{{ item.reason or 'No additional explanation supplied.' }}</span></div>
-    <form class="suggestion-review" data-id="{{ item.id }}"><button name="decision" value="accepted">Accept &amp; apply</button> <button class="secondary" name="decision" value="rejected">Reject</button></form>
+    <form class="suggestion-review" data-id="{{ item.id }}"><button name="decision" value="accepted" {% if item.dossier_id and (not ai_work_package.complete or not ai_work_package.current) %}disabled title="Complete a current work package first"{% endif %}>Accept &amp; apply</button> <button class="secondary" name="decision" value="rejected">Reject</button></form>
   </article>{% endfor %}</div><p id="ai-suggestion-empty" class="empty-state" hidden>All AI suggestions have been reviewed.</p>
 </section>{% endif %}
 {% if review_questions %}<section class="card" id="review-questions">
@@ -287,6 +322,7 @@ const jobButtons = [...document.querySelectorAll('.async-job button')];
 const cancelReconstruction = document.getElementById('cancel-reconstruction');
 let reconstructionRunning = {{ 'true' if status.running else 'false' }};
 let providerEnabled = {{ 'true' if ai_settings.enabled else 'false' }};
+let packetPackage = {{ (ai_work_package or {})|tojson }};
 let workspaceTimer;
 
 function updateJobButtons(){
@@ -347,7 +383,8 @@ function renderSuggestions(items){
   count.textContent=items.length;list.replaceChildren();empty.hidden=Boolean(items.length);
   for(const item of items){
     const article=document.createElement('article');article.className='suggestion-card';const copy=document.createElement('div');
-    appendText(copy,'span',item.suggestion_type,'pill');appendText(copy,'span',`${item.confidence}% confidence`,'pill');
+    if(document.getElementById('bulk-suggestion-actions')){const select=document.createElement('input');select.type='checkbox';select.className='suggestion-select';select.value=item.id;select.setAttribute('aria-label','Select suggestion');article.appendChild(select)}
+    appendText(copy,'span',item.suggestion_type,'pill');appendText(copy,'span',`${item.confidence}% confidence`,'pill');if(item.validation_state==='conflict')appendText(copy,'span','Conflicts with your review','pill bad');
     if(item.suggestion_type==='folder'){
       appendText(copy,'strong',item.relative_path,'path');appendText(copy,'span',`Mark as ${item.review_status}${item.user_label?` and name it ${item.user_label}`:''}`);
     }else{
@@ -355,7 +392,7 @@ function renderSuggestions(items){
     }
     appendText(copy,'span',item.reason||'No additional explanation supplied.','muted');article.appendChild(copy);
     const form=document.createElement('form');form.className='suggestion-review';form.dataset.id=item.id;
-    const accept=appendText(form,'button','Accept & apply');accept.name='decision';accept.value='accepted';
+    const accept=appendText(form,'button','Accept & apply');accept.name='decision';accept.value='accepted';if(item.dossier_id&&(!packetPackage?.complete||!packetPackage?.current)){accept.disabled=true;accept.title='Complete a current work package first'}
     const reject=appendText(form,'button','Reject','secondary');reject.name='decision';reject.value='rejected';
     article.appendChild(form);list.appendChild(article);
   }
@@ -367,6 +404,18 @@ if(suggestionsPanel)suggestionsPanel.addEventListener('submit',async event=>{
   try{await jsonRequest(`/api/reconstruction/ai/suggestion/${form.dataset.id}`,{decision:button.value});setStarting(button.value==='accepted'?'Suggestion accepted — rebuilding the plan…':'Suggestion rejected');await refreshWorkspace(true)}
   catch(error){reconstructionError.textContent=error.message;reconstructionError.hidden=false;button.disabled=false}
 });
+const selectAllSuggestions=document.getElementById('select-all-suggestions');
+if(selectAllSuggestions)selectAllSuggestions.addEventListener('change',()=>document.querySelectorAll('.suggestion-select').forEach(item=>item.checked=selectAllSuggestions.checked));
+async function reviewSelectedSuggestions(decision){
+  const ids=[...document.querySelectorAll('.suggestion-select:checked')].map(item=>Number(item.value));
+  if(!ids.length){reconstructionError.textContent='Select at least one AI suggestion.';reconstructionError.hidden=false;return}
+  const acceptButton=document.getElementById('accept-selected-suggestions');const rejectButton=document.getElementById('reject-selected-suggestions');acceptButton.disabled=true;rejectButton.disabled=true;
+  try{const data=await jsonRequest('/api/reconstruction/ai/suggestions',{ids,decision});setStarting(decision==='accepted'?`Applying ${data.result.accepted} selected AI decisions and rebuilding once…`:`Rejected ${data.result.reviewed} selected AI suggestions.`);await refreshWorkspace(true)}
+  catch(error){reconstructionRunning=false;reconstructionError.textContent=error.message;reconstructionError.hidden=false;liveJob.classList.remove('is-running');updateJobButtons()}
+  finally{if(!reconstructionRunning){acceptButton.disabled=false;rejectButton.disabled=false}}
+}
+const acceptSelectedSuggestions=document.getElementById('accept-selected-suggestions');if(acceptSelectedSuggestions)acceptSelectedSuggestions.addEventListener('click',()=>reviewSelectedSuggestions('accepted'));
+const rejectSelectedSuggestions=document.getElementById('reject-selected-suggestions');if(rejectSelectedSuggestions)rejectSelectedSuggestions.addEventListener('click',()=>reviewSelectedSuggestions('rejected'));
 function renderRuns(runs){
   const body=document.getElementById('ai-run-list');if(!body)return;body.replaceChildren();
   for(const run of runs){
@@ -394,7 +443,7 @@ function renderWorkspace(data){
   const providerBadge=document.getElementById('ai-provider-state');if(providerBadge){providerBadge.textContent=data.provider.enabled?'Enabled':'Not configured';providerBadge.className=`pill ${data.provider.enabled?'good':'warn'}`}
   const latest=data.ai_runs.find(run=>run.request_kind==='structure_analysis');const structureResult=document.getElementById('ai-structure-result');
   if(latest&&structureResult){structureResult.textContent=latest.status==='complete'?`Completed — ${data.suggestion_count} actionable change${data.suggestion_count===1?'':'s'} and ${data.open_questions} open question${data.open_questions===1?'':'s'}.${latest.result_summary?` ${latest.result_summary}`:''}`:latest.status==='running'?'AI is interpreting your evidence now…':`Failed — ${latest.error||'No usable result was returned.'}`;structureResult.className=`connection-result ${latest.status==='complete'?'success':latest.status==='failed'?'error':''}`}
-  renderSuggestions(data.suggestions);renderRuns(data.ai_runs);updateJobButtons();
+  renderSuggestions(data.suggestions);renderRuns(data.ai_runs);if(typeof renderPacketStatus==='function'&&data.work_package)renderPacketStatus(data.work_package);updateJobButtons();
 }
 async function refreshWorkspace(immediate=false){
   clearTimeout(workspaceTimer);
@@ -434,6 +483,14 @@ const manualModelToggle = document.getElementById('manual-model-toggle');
 const testProvider = document.getElementById('test-ai-provider');
 const saveProvider = document.getElementById('save-ai-provider');
 const forgetKey = document.getElementById('forget-api-key');
+const generatePackets = document.getElementById('generate-ai-packets');
+const copyPacketPrompt = document.getElementById('copy-packet-prompt');
+const downloadNextPacket = document.getElementById('download-next-packet');
+const packetResponseText = document.getElementById('packet-response-text');
+const packetResponseFile = document.getElementById('packet-response-file');
+const packetResponseFileName = document.getElementById('packet-response-file-name');
+const importPacketResponse = document.getElementById('import-packet-response');
+const packetImportResult = document.getElementById('packet-import-result');
 let hasSavedKey = {{ 'true' if ai_settings.has_api_key else 'false' }};
 let clearSavedKey = false;
 const draftKey = 'recovery-curator-ai-provider-draft';
@@ -447,6 +504,34 @@ function providerValues(){return {
   allow_sensitive_media:providerForm.elements.allow_sensitive_media.checked,clear_api_key:clearSavedKey
 }}
 function showProviderResult(message,state=''){providerResult.textContent=message;providerResult.className='connection-result '+state}
+function showPacketResult(message,state=''){packetImportResult.textContent=message;packetImportResult.className='connection-result '+state}
+function renderPacketStatus(value){
+  packetPackage=value||{};
+  document.getElementById('packet-total').textContent=Number(packetPackage.packet_count||0).toLocaleString();
+  document.getElementById('packet-imported').textContent=Number(packetPackage.imported_count||0).toLocaleString();
+  document.getElementById('packet-remaining').textContent=Number(packetPackage.remaining_count||0).toLocaleString();
+  document.getElementById('packet-size').textContent=packetPackage.bytes_human||'—';
+  const packageState=document.getElementById('packet-package-state');
+  if(!packetPackage.exists){packageState.textContent='No AI work package has been generated for this scan.';packageState.className='connection-result'}
+  else if(!packetPackage.current){packageState.textContent='This work package is stale because the catalog or reconstruction evidence changed. Generate fresh packets.';packageState.className='connection-result error'}
+  else if(packetPackage.complete){packageState.textContent=`All ${packetPackage.packet_count} packet responses are imported and ready for review.`;packageState.className='connection-result success'}
+  else{packageState.textContent=`Packet ${Number(packetPackage.imported_count||0)+1} of ${packetPackage.packet_count} is next.`;packageState.className='connection-result success'}
+  generatePackets.disabled=reconstructionRunning;
+  generatePackets.textContent=packetPackage.exists?'Regenerate fresh packets':'Generate AI work package';
+  copyPacketPrompt.disabled=!packetPackage.exists||!packetPackage.current;
+  importPacketResponse.disabled=!packetPackage.exists||!packetPackage.current;
+  const next=packetPackage.next_packet;const detail=document.getElementById('packet-next-detail');
+  downloadNextPacket.hidden=!next||!packetPackage.current;
+  if(next&&packetPackage.current){downloadNextPacket.href=next.download_url;downloadNextPacket.textContent=`Download ${next.packet_id}`;detail.hidden=false;detail.replaceChildren();appendText(detail,'strong',next.packet_id);appendText(detail,'span',` · ${next.bytes_human} · about ${Number(next.estimated_tokens||0).toLocaleString()} tokens`);appendText(detail,'div',(next.branches||[]).join(', '),'muted')}else{detail.hidden=true}
+  const list=document.getElementById('packet-list');list.replaceChildren();
+  for(const packet of packetPackage.packets||[]){
+    const article=document.createElement('article');article.className='suggestion-card';const copy=document.createElement('div');
+    appendText(copy,'span',packet.imported?'Imported':'Waiting',`pill ${packet.imported?'good':'warn'}`);appendText(copy,'strong',packet.packet_id);appendText(copy,'span',`${packet.bytes_human} · approximately ${Number(packet.estimated_tokens||0).toLocaleString()} tokens`);appendText(copy,'span',(packet.branches||[]).join(', '),'muted');article.appendChild(copy);
+    if(!packet.imported&&packetPackage.current){const link=appendText(article,'a','Download','button secondary');link.href=packet.download_url}
+    list.appendChild(article);
+  }
+  if(packetImportResult&&packetPackage.exists&&packetPackage.current&&packetImportResult.textContent.startsWith('Packet generation is running'))showPacketResult(`Created ${packetPackage.packet_count} packet${packetPackage.packet_count===1?'':'s'}. Download the next packet and use the copied prompt.`,'success');
+}
 function saveDraft(){const values=providerValues();delete values.api_key;delete values.clear_api_key;sessionStorage.setItem(draftKey,JSON.stringify(values))}
 function addModelOption(value,label=value){const option=document.createElement('option');option.value=value;option.textContent=label;providerModel.appendChild(option);return option}
 function setModelOptions(models,current=''){
@@ -489,6 +574,33 @@ providerForm.addEventListener('submit',async event=>{
   }catch(error){showProviderResult(error.message,'error')}
   finally{saveProvider.disabled=false;saveProvider.textContent='Save connection'}
 });
+generatePackets.addEventListener('click',async()=>{
+  generatePackets.disabled=true;generatePackets.textContent='Building packets…';showPacketResult('Summarizing branches and creating bounded AI work packets…');
+  try{await providerRequest('/api/reconstruction/ai/work-package',{target_tokens:40000});setStarting('Generating branch-aware AI work packets…');showPacketResult('Packet generation is running. Progress appears above and this section will update automatically.','success');await refreshWorkspace(true)}
+  catch(error){showPacketResult(error.message,'error')}
+  finally{if(!reconstructionRunning){generatePackets.disabled=false;generatePackets.textContent=packetPackage.exists?'Regenerate fresh packets':'Generate AI work package'}}
+});
+copyPacketPrompt.addEventListener('click',async()=>{
+  try{await navigator.clipboard.writeText(packetPackage.cover_prompt||'');showPacketResult('Prompt copied. Attach the next packet to your AI chat and paste the prompt.','success')}
+  catch(error){showPacketResult('The browser could not access the clipboard. Copy the prompt from the instructions inside the downloaded packet.','error')}
+});
+packetResponseFile.addEventListener('change',async()=>{
+  const file=packetResponseFile.files[0];if(!file)return;packetResponseFileName.textContent=file.name;
+  try{packetResponseText.value=await file.text();showPacketResult(`Loaded ${file.name}. Validate it when ready.`,'success')}
+  catch(error){showPacketResult(`Could not read ${file.name}: ${error.message}`,'error')}
+});
+importPacketResponse.addEventListener('click',async()=>{
+  importPacketResponse.disabled=true;importPacketResponse.textContent='Validating…';showPacketResult('Checking packet identity, coverage, folder paths, rules, and conflicts…');
+  try{
+    const data=await providerRequest('/api/reconstruction/ai/work-package/import',{response_text:packetResponseText.value});
+    renderPacketStatus(data.result.package);packetResponseText.value='';packetResponseFile.value='';packetResponseFileName.textContent='No response file selected';
+    const issueNote=data.result.issues.length?` ${data.result.issues.length} validation note${data.result.issues.length===1?'':'s'} recorded.`:'';
+    showPacketResult(`Imported ${data.result.packet_id}: ${data.result.valid} valid change${data.result.valid===1?'':'s'}, ${data.result.conflicts} conflict${data.result.conflicts===1?'':'s'}, ${data.result.questions} question${data.result.questions===1?'':'s'}, and ${data.result.ignored} ignored.${issueNote}`,'success');
+    const full=await fetch('/api/reconstruction/workspace',{headers:{'Accept':'application/json'}});if(full.ok)renderWorkspace(await full.json());
+  }catch(error){showPacketResult(error.message,'error')}
+  finally{importPacketResponse.disabled=!packetPackage.exists||!packetPackage.current;importPacketResponse.textContent='Validate & import response'}
+});
+renderPacketStatus(packetPackage);
 {% endif %}
 </script>
 {% endblock %}
