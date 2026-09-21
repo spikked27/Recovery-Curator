@@ -65,6 +65,8 @@ VIDEO_ANALYSIS_VERSION = 1
 AI_PACKET_SCHEMA_VERSION = 1
 AI_PACKET_TARGET_CHARS = 160_000
 AI_PACKET_MAX_RESPONSE_BYTES = 5 * 1024 * 1024
+AI_PACKET_BULK_MAX_FILES = 1000
+AI_PACKET_BULK_MAX_BYTES = 100 * 1024 * 1024
 
 
 @dataclass
@@ -3054,6 +3056,58 @@ class Curator:
             "packet_id": packet_id, "valid": valid_count, "conflicts": conflict_count,
             "ignored": ignored_count, "questions": min(len(questions), 30),
             "issues": issues[:50], "package": package_status,
+        }
+
+    def import_ai_work_packet_responses(self, responses: list[tuple[str, str]]) -> dict:
+        """Import independent response files while preserving a result for every file."""
+        from .ai import AIProviderClient
+
+        if not responses:
+            raise ValueError("Choose at least one AI response file to import.")
+        if len(responses) > AI_PACKET_BULK_MAX_FILES:
+            raise ValueError(
+                f"A bulk import can contain at most {AI_PACKET_BULK_MAX_FILES:,} response files."
+            )
+        total_bytes = sum(len(text.encode("utf-8")) for _, text in responses)
+        if total_bytes > AI_PACKET_BULK_MAX_BYTES:
+            raise ValueError("The combined AI responses exceed the 100 MB bulk import limit.")
+
+        results = []
+        imported_packet_ids: set[str] = set()
+        for supplied_name, response_text in responses:
+            name = str(supplied_name or "Unnamed response")[:500]
+            supplied_packet_id = ""
+            try:
+                if len(response_text.encode("utf-8")) > AI_PACKET_MAX_RESPONSE_BYTES:
+                    raise ValueError("The AI response exceeds the 5 MB import limit.")
+                parsed = AIProviderClient._json_object(
+                    response_text, "The imported response does not contain a usable JSON object.",
+                )
+                supplied_packet_id = str(parsed.get("packet_id") or "")
+                if supplied_packet_id and supplied_packet_id in imported_packet_ids:
+                    results.append({
+                        "name": name, "status": "error", "packet_id": supplied_packet_id,
+                        "error": f"{supplied_packet_id} was supplied more than once in this import.",
+                    })
+                    continue
+                result = self.import_ai_work_packet_response(response_text)
+                packet_id = result["packet_id"]
+                imported_packet_ids.add(packet_id)
+                results.append({
+                    "name": name, "status": "imported",
+                    **{key: value for key, value in result.items() if key != "package"},
+                })
+            except Exception as exc:
+                item = {"name": name, "status": "error", "error": str(exc)}
+                if supplied_packet_id:
+                    item["packet_id"] = supplied_packet_id
+                results.append(item)
+
+        imported = sum(item["status"] == "imported" for item in results)
+        return {
+            "total": len(results), "imported": imported,
+            "failed": len(results) - imported, "results": results,
+            "package": self.ai_work_package_status(),
         }
 
     def delete_recovery_context(self, context_id: int) -> None:

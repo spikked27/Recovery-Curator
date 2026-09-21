@@ -197,14 +197,15 @@
       {% if ai_work_package.next_packet %}<strong>{{ ai_work_package.next_packet.packet_id }}</strong> · {{ ai_work_package.next_packet.bytes_human }} · about {{ ai_work_package.next_packet.estimated_tokens }} tokens<br><span class="muted">{{ ai_work_package.next_packet.branches|join(', ') }}</span>{% endif %}
     </div>
     <label class="full-label">AI response
-      <textarea id="packet-response-text" rows="10" placeholder="Paste the complete JSON response here, or choose the saved response file below."></textarea>
+      <textarea id="packet-response-text" rows="8" placeholder="Paste one complete JSON response here, or choose multiple response files below to import them together."></textarea>
     </label>
     <div class="provider-actions">
-      <label class="button ghost" for="packet-response-file">Choose response file</label><input id="packet-response-file" type="file" accept=".json,.txt,application/json,text/plain" hidden>
-      <span class="muted" id="packet-response-file-name">No response file selected</span>
-      <button type="button" id="import-packet-response" {% if not ai_work_package.exists or not ai_work_package.current %}disabled{% endif %}>Validate &amp; import response</button>
+      <label class="button ghost" for="packet-response-file">Choose responses</label><input id="packet-response-file" type="file" accept=".json,.txt,.zip,application/json,text/plain,application/zip" multiple hidden>
+      <span class="muted" id="packet-response-file-name">Select multiple .json/.txt files or one ZIP bundle</span>
+      <button type="button" id="import-packet-response" {% if not ai_work_package.exists or not ai_work_package.current %}disabled{% endif %}>Validate &amp; import</button>
     </div>
-    <div id="packet-import-result" class="connection-result" role="status" aria-live="polite">Imported decisions remain pending until you review and accept them.</div>
+    <div id="packet-import-result" class="connection-result" role="status" aria-live="polite">Bulk import validates every response independently. Imported decisions remain pending until you review and accept them.</div>
+    <div id="packet-bulk-results" class="suggestion-list" hidden></div>
     <details class="review-drawer" id="packet-coverage" {% if ai_work_package.packets %}open{% endif %}><summary>Packet coverage</summary><div id="packet-list" class="suggestion-list">
       {% for packet in ai_work_package.packets %}<article class="suggestion-card"><div><span class="pill {{ 'good' if packet.imported else 'warn' }}">{{ 'Imported' if packet.imported else 'Waiting' }}</span><strong>{{ packet.packet_id }}</strong><span>{{ packet.bytes_human }} · approximately {{ packet.estimated_tokens }} tokens</span><span class="muted">{{ packet.branches|join(', ') }}</span></div>{% if not packet.imported and ai_work_package.current %}<a class="button secondary" href="{{ packet.download_url }}">Download</a>{% endif %}</article>{% endfor %}
     </div></details>
@@ -491,6 +492,7 @@ const packetResponseFile = document.getElementById('packet-response-file');
 const packetResponseFileName = document.getElementById('packet-response-file-name');
 const importPacketResponse = document.getElementById('import-packet-response');
 const packetImportResult = document.getElementById('packet-import-result');
+const packetBulkResults = document.getElementById('packet-bulk-results');
 let hasSavedKey = {{ 'true' if ai_settings.has_api_key else 'false' }};
 let clearSavedKey = false;
 const draftKey = 'recovery-curator-ai-provider-draft';
@@ -505,6 +507,24 @@ function providerValues(){return {
 }}
 function showProviderResult(message,state=''){providerResult.textContent=message;providerResult.className='connection-result '+state}
 function showPacketResult(message,state=''){packetImportResult.textContent=message;packetImportResult.className='connection-result '+state}
+function renderBulkImportResults(result){
+  packetBulkResults.replaceChildren();packetBulkResults.hidden=false;
+  for(const item of result.results||[]){
+    const article=document.createElement('article');article.className='suggestion-card';const copy=document.createElement('div');
+    appendText(copy,'span',item.status==='imported'?'Imported':'Failed',`pill ${item.status==='imported'?'good':'bad'}`);
+    appendText(copy,'strong',item.packet_id?`${item.packet_id} · ${item.name}`:item.name);
+    if(item.status==='imported'){
+      appendText(copy,'span',`${item.valid||0} valid · ${item.conflicts||0} conflicts · ${item.questions||0} questions · ${item.ignored||0} ignored`);
+      if((item.issues||[]).length)appendText(copy,'span',`${item.issues.length} validation note${item.issues.length===1?'':'s'} recorded.`,'muted');
+    }else appendText(copy,'span',item.error||'This response could not be imported.','muted');
+    article.appendChild(copy);packetBulkResults.appendChild(article);
+  }
+  if(result.ignored_file_count){
+    const article=document.createElement('article');article.className='suggestion-card';const copy=document.createElement('div');
+    appendText(copy,'span','Skipped files','pill warn');appendText(copy,'strong',`${result.ignored_file_count} unsupported file${result.ignored_file_count===1?'':'s'}`);
+    appendText(copy,'span',(result.ignored_files||[]).join(', '),'muted');article.appendChild(copy);packetBulkResults.appendChild(article);
+  }
+}
 function renderPacketStatus(value){
   packetPackage=value||{};
   document.getElementById('packet-total').textContent=Number(packetPackage.packet_count||0).toLocaleString();
@@ -546,6 +566,13 @@ async function providerRequest(url,values){
   if(!response.ok||data.ok===false)throw new Error(data.error||`Request failed (${response.status}).`);
   return data;
 }
+async function uploadPacketResponses(files){
+  const form=new FormData();for(const file of files)form.append('files',file,file.name);
+  const response=await fetch('/api/reconstruction/ai/work-package/bulk-import',{method:'POST',body:form});
+  let data={};try{data=await response.json()}catch(error){throw new Error(`Server returned ${response.status} without a readable response.`)}
+  if(!response.ok||data.ok===false)throw new Error(data.error||`Bulk import failed (${response.status}).`);
+  return data;
+}
 restoreDraft();
 providerId.addEventListener('change',()=>{const preset=providerPresets[providerId.value];providerName.value=preset.name;providerEndpoint.value=preset.endpoint;setModelOptions([]);manualModel.value='';manualModelRow.hidden=true;manualModelToggle.textContent='Enter model ID manually';providerKey.placeholder=preset.key;providerForm.elements.enabled.checked=true;saveDraft();providerEndpoint.focus()});
 providerForm.addEventListener('input',saveDraft);
@@ -585,20 +612,29 @@ copyPacketPrompt.addEventListener('click',async()=>{
   catch(error){showPacketResult('The browser could not access the clipboard. Copy the prompt from the instructions inside the downloaded packet.','error')}
 });
 packetResponseFile.addEventListener('change',async()=>{
-  const file=packetResponseFile.files[0];if(!file)return;packetResponseFileName.textContent=file.name;
-  try{packetResponseText.value=await file.text();showPacketResult(`Loaded ${file.name}. Validate it when ready.`,'success')}
-  catch(error){showPacketResult(`Could not read ${file.name}: ${error.message}`,'error')}
+  const files=[...packetResponseFile.files];if(!files.length)return;
+  const preview=files.slice(0,3).map(file=>file.name).join(', ');const extra=files.length>3?` and ${files.length-3} more`:'';
+  packetResponseFileName.textContent=`${files.length} selected: ${preview}${extra}`;
+  importPacketResponse.textContent=files.length===1?'Validate & import file':`Import all ${files.length} selections`;
+  showPacketResult(`Ready to validate ${files.length} selected ${files.length===1?'file':'files'}. ZIP bundles are expanded safely on the server.`,'success');
 });
 importPacketResponse.addEventListener('click',async()=>{
-  importPacketResponse.disabled=true;importPacketResponse.textContent='Validating…';showPacketResult('Checking packet identity, coverage, folder paths, rules, and conflicts…');
+  const selectedFiles=[...packetResponseFile.files];importPacketResponse.disabled=true;importPacketResponse.textContent=selectedFiles.length?'Importing all…':'Validating…';packetBulkResults.hidden=true;showPacketResult(selectedFiles.length?`Uploading and validating ${selectedFiles.length} selection${selectedFiles.length===1?'':'s'}…`:'Checking packet identity, coverage, folder paths, rules, and conflicts…');
   try{
-    const data=await providerRequest('/api/reconstruction/ai/work-package/import',{response_text:packetResponseText.value});
-    renderPacketStatus(data.result.package);packetResponseText.value='';packetResponseFile.value='';packetResponseFileName.textContent='No response file selected';
-    const issueNote=data.result.issues.length?` ${data.result.issues.length} validation note${data.result.issues.length===1?'':'s'} recorded.`:'';
-    showPacketResult(`Imported ${data.result.packet_id}: ${data.result.valid} valid change${data.result.valid===1?'':'s'}, ${data.result.conflicts} conflict${data.result.conflicts===1?'':'s'}, ${data.result.questions} question${data.result.questions===1?'':'s'}, and ${data.result.ignored} ignored.${issueNote}`,'success');
+    if(selectedFiles.length){
+      const data=await uploadPacketResponses(selectedFiles);renderPacketStatus(data.result.package);renderBulkImportResults(data.result);
+      const skipped=data.result.ignored_file_count?` ${data.result.ignored_file_count} unsupported file${data.result.ignored_file_count===1?' was':'s were'} skipped.`:'';
+      showPacketResult(`Imported ${data.result.imported} of ${data.result.total} AI response${data.result.total===1?'':'s'}. ${data.result.failed} failed.${skipped}`,data.result.failed?'error':'success');
+      if(!data.result.failed){packetResponseFile.value='';packetResponseFileName.textContent='Select multiple .json/.txt files or one ZIP bundle'}
+    }else{
+      const data=await providerRequest('/api/reconstruction/ai/work-package/import',{response_text:packetResponseText.value});
+      renderPacketStatus(data.result.package);packetResponseText.value='';
+      const issueNote=data.result.issues.length?` ${data.result.issues.length} validation note${data.result.issues.length===1?'':'s'} recorded.`:'';
+      showPacketResult(`Imported ${data.result.packet_id}: ${data.result.valid} valid change${data.result.valid===1?'':'s'}, ${data.result.conflicts} conflict${data.result.conflicts===1?'':'s'}, ${data.result.questions} question${data.result.questions===1?'':'s'}, and ${data.result.ignored} ignored.${issueNote}`,'success');
+    }
     const full=await fetch('/api/reconstruction/workspace',{headers:{'Accept':'application/json'}});if(full.ok)renderWorkspace(await full.json());
   }catch(error){showPacketResult(error.message,'error')}
-  finally{importPacketResponse.disabled=!packetPackage.exists||!packetPackage.current;importPacketResponse.textContent='Validate & import response'}
+  finally{importPacketResponse.disabled=!packetPackage.exists||!packetPackage.current;importPacketResponse.textContent=packetResponseFile.files.length>1?`Import all ${packetResponseFile.files.length} selections`:packetResponseFile.files.length===1?'Validate & import file':'Validate & import'}
 });
 renderPacketStatus(packetPackage);
 {% endif %}

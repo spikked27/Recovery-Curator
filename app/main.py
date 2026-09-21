@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import io
 import os
+import zipfile
 from pathlib import Path
 
 from flask import Flask, abort, jsonify, redirect, render_template, request, send_file, url_for
 
-from .curator import Curator, human_bytes
+from .curator import AI_PACKET_BULK_MAX_BYTES, AI_PACKET_BULK_MAX_FILES, Curator, human_bytes
 from .profiles import ScanProfileManager
 
 
@@ -140,6 +142,77 @@ def api_import_ai_work_packet():
     values = request.get_json(silent=True) or {}
     try:
         result = curator.import_ai_work_packet_response(str(values.get("response_text") or ""))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "result": result})
+
+
+def _uploaded_ai_responses() -> tuple[list[tuple[str, str]], list[str]]:
+    uploads = request.files.getlist("files")
+    if not uploads:
+        raise ValueError("Choose one or more AI response files, or a ZIP containing them.")
+    if request.content_length and request.content_length > AI_PACKET_BULK_MAX_BYTES + 1024 * 1024:
+        raise ValueError("The upload exceeds the 100 MB bulk import limit.")
+
+    responses: list[tuple[str, str]] = []
+    ignored: list[str] = []
+    total_bytes = 0
+
+    def add_response(name: str, raw: bytes) -> None:
+        nonlocal total_bytes
+        if len(responses) >= AI_PACKET_BULK_MAX_FILES:
+            raise ValueError(
+                f"A bulk import can contain at most {AI_PACKET_BULK_MAX_FILES:,} response files."
+            )
+        total_bytes += len(raw)
+        if total_bytes > AI_PACKET_BULK_MAX_BYTES:
+            raise ValueError("The expanded AI responses exceed the 100 MB bulk import limit.")
+        try:
+            text = raw.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise ValueError(f"{name} is not a UTF-8 text response.") from exc
+        responses.append((name[:500], text))
+
+    for upload in uploads:
+        name = Path(upload.filename or "response").name
+        suffix = Path(name).suffix.casefold()
+        raw = upload.read()
+        if suffix == ".zip":
+            try:
+                with zipfile.ZipFile(io.BytesIO(raw)) as bundle:
+                    entries = [
+                        entry for entry in bundle.infolist()
+                        if not entry.is_dir() and not entry.filename.startswith("__MACOSX/")
+                    ]
+                    supported = [
+                        entry for entry in entries
+                        if Path(entry.filename).suffix.casefold() in {".json", ".txt"}
+                    ]
+                    ignored.extend(f"{name} / {entry.filename}" for entry in entries if entry not in supported)
+                    if sum(entry.file_size for entry in supported) + total_bytes > AI_PACKET_BULK_MAX_BYTES:
+                        raise ValueError("The expanded AI responses exceed the 100 MB bulk import limit.")
+                    for entry in supported:
+                        if entry.flag_bits & 0x1:
+                            raise ValueError(f"{name} / {entry.filename} is encrypted and cannot be read.")
+                        add_response(f"{name} / {entry.filename}", bundle.read(entry))
+            except zipfile.BadZipFile as exc:
+                raise ValueError(f"{name} is not a readable ZIP file.") from exc
+        elif suffix in {".json", ".txt"}:
+            add_response(name, raw)
+        else:
+            ignored.append(name)
+    if not responses:
+        raise ValueError("No .json or .txt AI response files were found in the selection.")
+    return responses, ignored
+
+
+@app.post("/api/reconstruction/ai/work-package/bulk-import")
+def api_bulk_import_ai_work_packets():
+    try:
+        responses, ignored = _uploaded_ai_responses()
+        result = curator.import_ai_work_packet_responses(responses)
+        result["ignored_files"] = ignored[:100]
+        result["ignored_file_count"] = len(ignored)
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
     return jsonify({"ok": True, "result": result})

@@ -907,6 +907,43 @@ class CuratorTests(unittest.TestCase):
             with self.assertRaisesRegex(RuntimeError, "stale"):
                 curator.import_ai_work_packet_response(json.dumps(response))
 
+    def test_ai_work_packet_bulk_import_reports_each_response_and_continues_after_errors(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            (source / "Camera Roll").mkdir()
+            (source / "Camera Roll" / "IMG_20200101_120000.jpg").write_bytes(b"evidence")
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+            curator.scan()
+            curator.build_reconstruction_foundation()
+            package = curator.generate_ai_work_package()
+            response = json.dumps({
+                "schema_version": 1, "dossier_id": package["dossier_id"],
+                "packet_id": "packet-001", "coverage_complete": True, "decisions": [],
+            })
+
+            result = curator.import_ai_work_packet_responses([
+                ("response-001.json", response),
+                ("duplicate-001.json", response),
+                ("broken.json", "not json"),
+            ])
+
+            self.assertEqual(result["total"], 3)
+            self.assertEqual(result["imported"], 1)
+            self.assertEqual(result["failed"], 2)
+            self.assertEqual([item["status"] for item in result["results"]], [
+                "imported", "error", "error",
+            ])
+            self.assertIn("supplied more than once", result["results"][1]["error"])
+            self.assertIn("usable JSON", result["results"][2]["error"])
+            self.assertTrue(result["package"]["complete"])
+            with connect(config / "catalog.sqlite3") as db:
+                self.assertEqual(db.execute("SELECT COUNT(*) FROM ai_packet_imports").fetchone()[0], 1)
+
     def test_reconstruction_review_dry_run_and_export_are_safety_gated(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
