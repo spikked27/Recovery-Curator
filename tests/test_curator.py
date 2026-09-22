@@ -454,7 +454,8 @@ class CuratorTests(unittest.TestCase):
             self.assertIn("idx_files_media_kind", indexes)
             self.assertIn("idx_files_media_origin", indexes)
             self.assertTrue({
-                "curation_label", "sanitized_path", "sanitized_method", "sanitization_detail",
+                "curation_label", "media_origin_source", "sensitivity_source",
+                "sanitized_path", "sanitized_method", "sanitization_detail",
             } <= columns)
             self.assertEqual(tuple(migrated), ("video", "unknown", "Videos"))
 
@@ -489,6 +490,14 @@ class CuratorTests(unittest.TestCase):
                          updated_at TEXT NOT NULL
                        )"""
                 )
+                db.execute(
+                    """CREATE TABLE curation_chat_proposals(
+                         id INTEGER PRIMARY KEY,message_id INTEGER NOT NULL,match_text TEXT NOT NULL,
+                         facet_type TEXT NOT NULL,value TEXT NOT NULL,confidence INTEGER NOT NULL DEFAULT 0,
+                         reason TEXT,affected_files INTEGER NOT NULL DEFAULT 0,
+                         status TEXT NOT NULL DEFAULT 'pending',created_at TEXT NOT NULL,updated_at TEXT NOT NULL
+                       )"""
+                )
                 db.commit()
 
             Curator(source, output, quarantine, db_path)
@@ -498,14 +507,24 @@ class CuratorTests(unittest.TestCase):
                 suggestion_columns = {
                     row[1] for row in db.execute("PRAGMA table_info(ai_structure_suggestions)")
                 }
+                curation_columns = {
+                    row[1] for row in db.execute("PRAGMA table_info(curation_chat_proposals)")
+                }
                 indexes = {row[1] for row in db.execute("PRAGMA index_list(reconstruction_proposals)")}
                 packet_table = db.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name='ai_packet_imports'"
                 ).fetchone()
+                effects_table = db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name='curation_rule_effects'"
+                ).fetchone()
             self.assertTrue({"review_state", "user_path", "review_note", "reviewed_at"} <= proposal_columns)
             self.assertTrue({"match_text", "destination"} <= context_columns)
             self.assertTrue({"validation_state", "dossier_id", "packet_id"} <= suggestion_columns)
+            self.assertTrue({
+                "title", "selector_json", "actions_json", "examples_json", "validation_note",
+            } <= curation_columns)
             self.assertIsNotNone(packet_table)
+            self.assertIsNotNone(effects_table)
             self.assertIn("idx_reconstruction_review", indexes)
 
     def test_video_metadata_and_discovered_folder_reconstruction(self):
@@ -1072,6 +1091,131 @@ class CuratorTests(unittest.TestCase):
                     "SELECT curation_label FROM files WHERE curation_label IS NOT NULL"
                 )}
             self.assertEqual(labels, {"Snapchat Exports"})
+
+    def test_curation_agent_searches_full_catalog_applies_multiple_labels_and_undoes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            for index in range(85):
+                (source / f"ordinary-{index:03d}.bin").write_bytes(f"ordinary {index}".encode())
+            (source / "~valegenta_saved.jpg").write_bytes(b"instagram one")
+            (source / "~taylorgallo__saved.mp4").write_bytes(b"instagram two")
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+            curator.scan()
+            curator.save_ai_provider_settings({
+                "provider_id": "ollama", "provider_name": "Local Assistant",
+                "endpoint": "http://ai.local:11434/v1", "model": "test-model", "enabled": True,
+            })
+            selector = {"field": "name", "operator": "starts_with", "value": "~"}
+            responses = [
+                {
+                    "reply": "I will check every tilde-prefixed filename.",
+                    "searches": [{"label": "Tilde handles", "selector": selector}],
+                    "proposals": [],
+                },
+                {
+                    "reply": "The complete catalog search supports one reusable rule.",
+                    "searches": [],
+                    "proposals": [{
+                        "title": "Instagram saved media", "selector": selector,
+                        "actions": {"collection": "Instagram Saved", "sensitivity": "adult"},
+                        "confidence": 98, "reason": "The owner identified the tilde naming convention.",
+                    }],
+                },
+            ]
+            with patch(
+                "app.ai.AIProviderClient.curation_conversation", side_effect=responses,
+            ) as converse:
+                conversation = curator.send_curation_message(
+                    "All tilde-pattern handles are adult Instagram saves."
+                )
+            self.assertEqual(converse.call_count, 2)
+            second_search_results = converse.call_args_list[1].args[2]
+            self.assertEqual(second_search_results[0]["matches"], 2)
+            self.assertEqual(conversation["turn"], {
+                "searches_run": 1, "staged": 1, "invalid": 0, "reply_kind": "suggestions",
+            })
+            proposal = next(item for item in conversation["proposals"] if item["status"] == "pending")
+            self.assertEqual(proposal["affected_files"], 2)
+            self.assertEqual(proposal["actions"], {
+                "collection": "Instagram Saved", "sensitivity": "adult",
+            })
+            applied = curator.review_curation_proposal(proposal["id"], "accepted")
+            self.assertEqual(applied["affected"], 2)
+            with connect(config / "catalog.sqlite3") as db:
+                labeled = db.execute(
+                    """SELECT COUNT(*) FROM files WHERE name LIKE '~%'
+                       AND curation_label='Instagram Saved' AND sensitivity='adult'"""
+                ).fetchone()[0]
+            self.assertEqual(labeled, 2)
+            later_response = {
+                "reply": "A more restrictive sensitivity suggestion is ready.", "searches": [],
+                "proposals": [{
+                    "title": "Tilde media privacy", "selector": selector,
+                    "actions": {"sensitivity": "intimate"}, "confidence": 90,
+                    "reason": "A later privacy rule for the same files.",
+                }],
+            }
+            with patch(
+                "app.ai.AIProviderClient.curation_conversation", return_value=later_response,
+            ):
+                later_conversation = curator.send_curation_message("Treat those as intimate instead.")
+            later = next(
+                item for item in later_conversation["proposals"] if item["status"] == "pending"
+            )
+            curator.review_curation_proposal(later["id"], "accepted")
+            with self.assertRaisesRegex(ValueError, "newer applied AI rule"):
+                curator.review_curation_proposal(proposal["id"], "undone")
+            curator.review_curation_proposal(later["id"], "undone")
+            undone = curator.review_curation_proposal(proposal["id"], "undone")
+            self.assertEqual(undone["affected"], 2)
+            with connect(config / "catalog.sqlite3") as db:
+                restored = db.execute(
+                    """SELECT COUNT(*) FROM files WHERE name LIKE '~%'
+                       AND curation_label IS NULL AND sensitivity='unknown'"""
+                ).fetchone()[0]
+            self.assertEqual(restored, 2)
+
+    def test_curation_agent_exposes_question_only_and_invalid_suggestion_states(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            (source / "camera-photo.jpg").write_bytes(b"photo")
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+            curator.scan()
+            curator.save_ai_provider_settings({
+                "provider_id": "ollama", "provider_name": "Local Assistant",
+                "endpoint": "http://ai.local:11434/v1", "model": "test-model", "enabled": True,
+            })
+            question = {"reply": "Were these taken by you?", "searches": [], "proposals": []}
+            with patch("app.ai.AIProviderClient.curation_conversation", return_value=question):
+                conversation = curator.send_curation_message("Help identify these files.")
+            self.assertEqual(conversation["turn"]["reply_kind"], "conversation")
+            self.assertEqual(conversation["turn"]["staged"], 0)
+
+            invalid = {
+                "reply": "I could not verify that proposed pattern.", "searches": [],
+                "proposals": [{
+                    "title": "Missing Snapchat export", "selector": {
+                        "field": "name", "operator": "contains", "value": "SnapSave",
+                    },
+                    "actions": {"collection": "Snapchat Saved"},
+                    "confidence": 80, "reason": "Unverified naming clue.",
+                }],
+            }
+            with patch("app.ai.AIProviderClient.curation_conversation", return_value=invalid):
+                conversation = curator.send_curation_message("What about SnapSave?")
+            self.assertEqual(conversation["turn"]["invalid"], 1)
+            rejected = next(item for item in conversation["proposals"] if item["status"] == "invalid")
+            self.assertIn("zero eligible", rejected["validation_note"])
 
     def test_reconstruction_review_dry_run_and_export_are_safety_gated(self):
         with tempfile.TemporaryDirectory() as temp:

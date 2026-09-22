@@ -153,7 +153,9 @@ def initialize(db_path: Path) -> None:
               ai_updated_at TEXT,
               media_kind TEXT DEFAULT 'other',
               media_origin TEXT DEFAULT 'unknown',
+              media_origin_source TEXT,
               sensitivity TEXT DEFAULT 'unknown',
+              sensitivity_source TEXT,
               video_duration REAL,
               video_width INTEGER,
               video_height INTEGER,
@@ -381,12 +383,30 @@ def initialize(db_path: Path) -> None:
               confidence INTEGER NOT NULL DEFAULT 0,
               reason TEXT,
               affected_files INTEGER NOT NULL DEFAULT 0,
+              title TEXT,
+              selector_json TEXT,
+              actions_json TEXT,
+              examples_json TEXT,
+              validation_note TEXT,
               status TEXT NOT NULL DEFAULT 'pending',
               created_at TEXT NOT NULL,
               updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_curation_chat_proposals_status
               ON curation_chat_proposals(status,id);
+            CREATE TABLE IF NOT EXISTS curation_rule_effects (
+              proposal_id INTEGER NOT NULL,
+              file_id INTEGER NOT NULL,
+              prior_media_origin TEXT,
+              prior_media_origin_source TEXT,
+              prior_sensitivity TEXT,
+              prior_sensitivity_source TEXT,
+              prior_curation_label TEXT,
+              prior_curation_label_source TEXT,
+              PRIMARY KEY(proposal_id,file_id)
+            );
+            CREATE INDEX IF NOT EXISTS idx_curation_rule_effects_file
+              ON curation_rule_effects(file_id,proposal_id);
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS actions (
               id INTEGER PRIMARY KEY,
@@ -408,7 +428,8 @@ def initialize(db_path: Path) -> None:
             "known_good_library": "TEXT", "known_good_path": "TEXT",
             "ctime_ns": "INTEGER", "mode": "INTEGER", "uid": "INTEGER", "gid": "INTEGER",
             "media_kind": "TEXT DEFAULT 'other'", "media_origin": "TEXT DEFAULT 'unknown'",
-            "sensitivity": "TEXT DEFAULT 'unknown'", "video_duration": "REAL",
+            "media_origin_source": "TEXT", "sensitivity": "TEXT DEFAULT 'unknown'",
+            "sensitivity_source": "TEXT", "video_duration": "REAL",
             "video_width": "INTEGER", "video_height": "INTEGER", "video_fps": "REAL",
             "video_codec": "TEXT", "audio_codec": "TEXT", "video_creation_date": "TEXT",
             "video_analysis_version": "INTEGER DEFAULT 0",
@@ -447,6 +468,16 @@ def initialize(db_path: Path) -> None:
         for column, definition in suggestion_migrations.items():
             if column not in suggestion_columns:
                 db.execute(f"ALTER TABLE ai_structure_suggestions ADD COLUMN {column} {definition}")
+        curation_proposal_columns = {
+            row[1] for row in db.execute("PRAGMA table_info(curation_chat_proposals)")
+        }
+        curation_proposal_migrations = {
+            "title": "TEXT", "selector_json": "TEXT", "actions_json": "TEXT",
+            "examples_json": "TEXT", "validation_note": "TEXT",
+        }
+        for column, definition in curation_proposal_migrations.items():
+            if column not in curation_proposal_columns:
+                db.execute(f"ALTER TABLE curation_chat_proposals ADD COLUMN {column} {definition}")
         db.execute("CREATE INDEX IF NOT EXISTS idx_files_known_good ON files(known_good_match)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_files_media_kind ON files(media_kind)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_files_media_origin ON files(media_origin)")
@@ -1048,6 +1079,7 @@ class Curator:
             db.execute("DELETE FROM ai_runs")
             db.execute("DELETE FROM ai_structure_suggestions")
             db.execute("DELETE FROM ai_packet_imports")
+            db.execute("DELETE FROM curation_rule_effects")
             db.execute("DELETE FROM curation_chat_proposals")
             db.execute("DELETE FROM curation_chat_messages")
             db.execute("DELETE FROM review_questions")
@@ -1338,7 +1370,8 @@ class Curator:
                            similar_group=NULL,known_good_match=0,known_good_count=0,known_good_library=NULL,
                            known_good_path=NULL,decision='undecided',exported_path=NULL,ai_caption=NULL,ai_people=NULL,
                            ai_objects=NULL,ai_ocr_text=NULL,ai_tags=NULL,ai_model=NULL,ai_updated_at=NULL,
-                           media_kind='other',media_origin='unknown',sensitivity='unknown',video_duration=NULL,
+                           media_kind='other',media_origin='unknown',media_origin_source=NULL,
+                           sensitivity='unknown',sensitivity_source=NULL,video_duration=NULL,
                            video_width=NULL,video_height=NULL,video_fps=NULL,video_codec=NULL,audio_codec=NULL,
                            video_creation_date=NULL,video_analysis_version=0,sanitized_path=NULL,
                            sanitized_method=NULL,sanitized_at=NULL,sanitization_detail=NULL WHERE path=?""",
@@ -1436,7 +1469,9 @@ class Curator:
                         """UPDATE files SET mime=?,detected_extension=?,validation=?,validation_detail=?,is_image=?,
                            width=?,height=?,megapixels=?,phash=?,exif_date=?,exif_make=?,exif_model=?,filename_date=?,
                            date_confidence=?,date_reason=?,category=?,category_confidence=?,category_reason=?,quality_score=?,
-                           media_kind=?,media_origin=?,sensitivity=?,video_duration=?,video_width=?,video_height=?,video_fps=?,
+                           media_kind=?,media_origin=CASE WHEN media_origin_source IS NULL THEN ? ELSE media_origin END,
+                           sensitivity=CASE WHEN sensitivity_source IS NULL THEN ? ELSE sensitivity END,
+                           video_duration=?,video_width=?,video_height=?,video_fps=?,
                            video_codec=?,audio_codec=?,video_creation_date=?,video_analysis_version=?,updated_at=?
                            WHERE id=?""",
                         (result["mime"], result["detected_extension"], result.get("validation"), result.get("validation_detail"),
@@ -4086,12 +4121,12 @@ class Curator:
             message_count = int(db.execute(
                 "SELECT COUNT(*) FROM curation_chat_messages WHERE role='user'"
             ).fetchone()[0])
-            sample_offset = ((max(message_count - 1, 0) * 80) % sample_count) if sample_count else 0
+            sample_offset = ((max(message_count - 1, 0) * 40) % sample_count) if sample_count else 0
             samples = [dict(row) for row in db.execute(
                 """SELECT relative_path,name,media_kind,media_origin,category,validation,
                           exif_date,video_creation_date,filename_date,curation_label
                    FROM files WHERE size>0 AND known_good_match=0
-                   ORDER BY (media_origin='unknown') DESC,category_confidence,id LIMIT 80 OFFSET ?""",
+                   ORDER BY (media_origin='unknown') DESC,category_confidence,id LIMIT 40 OFFSET ?""",
                 (sample_offset,),
             )]
             top_branches = [dict(row) for row in db.execute(
@@ -4103,17 +4138,254 @@ class Curator:
             )]
             owner_context = [dict(row) for row in db.execute(
                 """SELECT context_type,label,details,match_text,destination
-                   FROM recovery_context ORDER BY updated_at DESC,id DESC LIMIT 100"""
+                   FROM recovery_context ORDER BY updated_at DESC,id DESC LIMIT 50"""
             )]
+            current_rules = [dict(row) for row in db.execute(
+                """SELECT title,selector_json,actions_json,affected_files,status
+                   FROM curation_chat_proposals WHERE status IN ('pending','accepted')
+                   ORDER BY id DESC LIMIT 30"""
+            )]
+            for rule in current_rules:
+                for field in ("selector_json", "actions_json"):
+                    try:
+                        rule[field.removesuffix("_json")] = json.loads(rule.pop(field) or "null")
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        rule[field.removesuffix("_json")] = None
         summary["bytes_human"] = human_bytes(summary["bytes"])
         return {
             "goal": "label a sanitized browsing library; never reconstruct original folders",
             "summary": summary, "distributions": distributions,
             "owner_supplied_context": owner_context,
+            "current_pending_and_applied_rules": current_rules,
             "top_branches": top_branches,
             "sample_window": {"offset": sample_offset, "count": len(samples), "eligible": sample_count},
             "representative_samples": samples,
         }
+
+    @staticmethod
+    def _normalize_curation_selector(selector: object) -> dict:
+        fields = {"name", "relative_path", "extension", "media_kind"}
+        operators = {"contains", "starts_with", "ends_with", "equals", "in"}
+
+        def condition(value: object) -> dict:
+            if not isinstance(value, dict):
+                raise ValueError("Each selector condition must be an object.")
+            field = str(value.get("field") or "").strip().casefold()
+            field = {
+                "filename": "name", "basename": "name", "path": "relative_path",
+                "relative path": "relative_path", "type": "media_kind",
+            }.get(field, field)
+            operator = str(value.get("operator") or "").strip().casefold().replace("-", "_").replace(" ", "_")
+            operator = {
+                "startswith": "starts_with", "prefix": "starts_with",
+                "endswith": "ends_with", "suffix": "ends_with",
+                "exact": "equals", "one_of": "in",
+            }.get(operator, operator)
+            raw_value = value.get("value")
+            if field not in fields:
+                raise ValueError(f"Unsupported selector field: {field or '(missing)' }.")
+            if operator not in operators:
+                raise ValueError(f"Unsupported selector operator: {operator or '(missing)' }.")
+            if operator == "in":
+                if not isinstance(raw_value, list) or not raw_value or len(raw_value) > 25:
+                    raise ValueError("The 'in' selector requires 1–25 values.")
+                cleaned = [str(item).strip()[:300] for item in raw_value if str(item).strip()]
+                if not cleaned:
+                    raise ValueError("The selector values cannot be empty.")
+                return {"field": field, "operator": operator, "value": cleaned}
+            cleaned = str(raw_value or "").strip()[:300]
+            if not cleaned:
+                raise ValueError("The selector value cannot be empty.")
+            return {"field": field, "operator": operator, "value": cleaned}
+
+        if not isinstance(selector, dict):
+            raise ValueError("The proposal is missing a selector object.")
+        combinators = [key for key in ("all", "any") if key in selector]
+        if combinators:
+            if len(combinators) != 1:
+                raise ValueError("A selector may use either 'all' or 'any', not both.")
+            key = combinators[0]
+            values = selector.get(key)
+            if not isinstance(values, list) or not values or len(values) > 5:
+                raise ValueError(f"A compound selector requires 1–5 {key} conditions.")
+            return {key: [condition(item) for item in values]}
+        return condition(selector)
+
+    @classmethod
+    def _curation_selector_sql(cls, selector: object) -> tuple[dict, str, list[object]]:
+        normalized = cls._normalize_curation_selector(selector)
+        columns = {
+            "name": "name", "relative_path": "relative_path",
+            "extension": "extension", "media_kind": "media_kind",
+        }
+
+        def compile_condition(item: dict) -> tuple[str, list[object]]:
+            column = f"lower(COALESCE({columns[item['field']]},''))"
+            operator, value = item["operator"], item["value"]
+            if operator == "contains":
+                return f"instr({column},lower(?))>0", [value]
+            if operator == "starts_with":
+                return f"substr({column},1,length(?))=lower(?)", [value, value]
+            if operator == "ends_with":
+                return f"substr({column},-length(?))=lower(?)", [value, value]
+            if operator == "equals":
+                return f"{column}=lower(?)", [value]
+            markers = ",".join("lower(?)" for _ in value)
+            return f"{column} IN ({markers})", list(value)
+
+        for combinator, joiner in (("all", " AND "), ("any", " OR ")):
+            if combinator in normalized:
+                clauses, params = [], []
+                for item in normalized[combinator]:
+                    clause, values = compile_condition(item)
+                    clauses.append(f"({clause})")
+                    params.extend(values)
+                return normalized, joiner.join(clauses), params
+        clause, params = compile_condition(normalized)
+        return normalized, clause, params
+
+    @staticmethod
+    def _curation_selector_text(selector: dict) -> str:
+        if "all" in selector or "any" in selector:
+            key = "all" if "all" in selector else "any"
+            return f" {key.upper()} ".join(
+                Curator._curation_selector_text(item) for item in selector[key]
+            )
+        value = selector["value"]
+        if isinstance(value, list):
+            value_text = ", ".join(value)
+        else:
+            value_text = repr(value)
+        return f"{selector['field']} {selector['operator'].replace('_', ' ')} {value_text}"
+
+    def _catalog_search_for_curation(self, selector: object, label: str = "") -> dict:
+        normalized, clause, params = self._curation_selector_sql(selector)
+        base = f"size>0 AND known_good_match=0 AND ({clause})"
+        with connect(self.db_path) as db:
+            count = int(db.execute(f"SELECT COUNT(*) FROM files WHERE {base}", params).fetchone()[0])
+            examples = [dict(row) for row in db.execute(
+                f"""SELECT relative_path,name,media_kind,media_origin,sensitivity,curation_label
+                    FROM files WHERE {base} ORDER BY quality_score DESC,id LIMIT 10""",
+                params,
+            )]
+            media_types = [dict(row) for row in db.execute(
+                f"""SELECT COALESCE(media_kind,'other') value,COUNT(*) count
+                    FROM files WHERE {base} GROUP BY value ORDER BY count DESC LIMIT 10""",
+                params,
+            )]
+            origins = [dict(row) for row in db.execute(
+                f"""SELECT COALESCE(media_origin,'unknown') value,COUNT(*) count
+                    FROM files WHERE {base} GROUP BY value ORDER BY count DESC LIMIT 10""",
+                params,
+            )]
+        return {
+            "label": str(label or "Catalog search")[:200], "selector": normalized,
+            "selector_text": self._curation_selector_text(normalized), "matches": count,
+            "examples": examples, "media_types": media_types, "origins": origins,
+        }
+
+    @staticmethod
+    def _normalize_curation_actions(raw: object) -> dict:
+        if not isinstance(raw, dict):
+            raise ValueError("The proposal is missing an actions object.")
+        actions = {}
+        collection = str(raw.get("collection") or raw.get("collection_label") or "").strip()
+        if collection:
+            collection = sanitize_component(collection)[:150]
+            if not collection:
+                raise ValueError("The collection label is empty after sanitization.")
+            actions["collection"] = collection
+        origin = str(raw.get("origin") or "").strip().casefold().replace("-", "_").replace(" ", "_")
+        origin = {"personal_media": "personal", "social": "social_media"}.get(origin, origin)
+        allowed_origins = {
+            "personal", "camera", "snapchat", "screenshot", "screen_recording",
+            "downloaded", "messaging", "social_media", "scanned", "generated",
+        }
+        if origin:
+            if origin not in allowed_origins:
+                raise ValueError(f"Unsupported origin label: {origin}.")
+            actions["origin"] = origin
+        sensitivity = str(raw.get("sensitivity") or "").strip().casefold().replace("-", "_").replace(" ", "_")
+        sensitivity = {"sensitive": "possibly_sensitive", "adult_content": "adult"}.get(
+            sensitivity, sensitivity,
+        )
+        if sensitivity:
+            if sensitivity not in {"normal", "adult", "possibly_sensitive", "intimate"}:
+                raise ValueError(f"Unsupported sensitivity label: {sensitivity}.")
+            actions["sensitivity"] = sensitivity
+        if not actions:
+            raise ValueError("The proposal does not contain a supported label action.")
+        return actions
+
+    @staticmethod
+    def _legacy_curation_proposal(raw: dict) -> tuple[object, object]:
+        selector = raw.get("selector")
+        actions = raw.get("actions")
+        if selector is None and raw.get("match_text"):
+            selector = {
+                "field": "relative_path", "operator": "contains",
+                "value": raw.get("match_text"),
+            }
+        if actions is None and raw.get("facet_type"):
+            facet_type = str(raw.get("facet_type") or "").casefold()
+            if facet_type in {"collection", "origin", "sensitivity"}:
+                actions = {facet_type: raw.get("value")}
+        return selector, actions
+
+    def _stage_curation_proposal(self, db: sqlite3.Connection, message_id: int, raw: object) -> str:
+        now = utcnow()
+        proposal = raw if isinstance(raw, dict) else {}
+        title = str(proposal.get("title") or "AI catalog suggestion").strip()[:200]
+        reason = str(proposal.get("reason") or "").strip()[:1000]
+        try:
+            confidence = max(0, min(int(proposal.get("confidence") or 0), 100))
+        except (TypeError, ValueError):
+            confidence = 0
+        selector_raw, actions_raw = self._legacy_curation_proposal(proposal)
+        normalized_selector, actions, search = None, None, None
+        validation_note = None
+        try:
+            normalized_selector = self._normalize_curation_selector(selector_raw)
+            actions = self._normalize_curation_actions(actions_raw)
+            search = self._catalog_search_for_curation(normalized_selector, title)
+            if not search["matches"]:
+                raise ValueError("This selector currently matches zero eligible catalog files.")
+            selector_key = json.dumps(normalized_selector, ensure_ascii=False, separators=(",", ":"))
+            actions_key = json.dumps(actions, ensure_ascii=False, separators=(",", ":"))
+            existing = db.execute(
+                """SELECT status FROM curation_chat_proposals
+                   WHERE selector_json=? AND actions_json=? AND status IN ('pending','accepted')
+                   ORDER BY id DESC LIMIT 1""",
+                (selector_key, actions_key),
+            ).fetchone()
+            if existing:
+                raise ValueError(f"An identical suggestion is already {existing['status']}.")
+            status = "pending"
+        except (TypeError, ValueError) as exc:
+            validation_note = str(exc)
+            status = "invalid"
+        selector_for_storage = normalized_selector if normalized_selector is not None else selector_raw
+        actions_for_storage = actions if actions is not None else actions_raw
+        selector_text = (
+            self._curation_selector_text(normalized_selector) if normalized_selector is not None
+            else str(proposal.get("match_text") or "Invalid selector")[:300]
+        )
+        first_action = next(iter(actions.items()), ("", "")) if actions else ("", "")
+        db.execute(
+            """INSERT INTO curation_chat_proposals(
+                 message_id,match_text,facet_type,value,confidence,reason,affected_files,
+                 title,selector_json,actions_json,examples_json,validation_note,status,created_at,updated_at
+               ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (
+                message_id, selector_text[:300], first_action[0], first_action[1], confidence,
+                reason, int(search["matches"] if search else 0), title,
+                json.dumps(selector_for_storage, ensure_ascii=False, separators=(",", ":")),
+                json.dumps(actions_for_storage, ensure_ascii=False, separators=(",", ":")),
+                json.dumps(search["examples"] if search else [], ensure_ascii=False, separators=(",", ":")),
+                validation_note, status, now, now,
+            ),
+        )
+        return status
 
     def curation_conversation(self) -> dict:
         with connect(self.db_path) as db:
@@ -4122,9 +4394,34 @@ class Curator:
             )]
             messages.reverse()
             proposals = [dict(row) for row in db.execute(
-                """SELECT p.* FROM curation_chat_proposals p
-                   ORDER BY p.id DESC LIMIT 100"""
+                """SELECT p.*,EXISTS(
+                         SELECT 1 FROM curation_rule_effects e WHERE e.proposal_id=p.id
+                       ) undoable
+                   FROM curation_chat_proposals p
+                   ORDER BY p.id DESC LIMIT 250"""
             )]
+        for proposal in proposals:
+            for source, target, fallback in (
+                ("selector_json", "selector", None), ("actions_json", "actions", None),
+                ("examples_json", "examples", []),
+            ):
+                try:
+                    proposal[target] = json.loads(proposal.get(source) or "null")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    proposal[target] = fallback
+            if not proposal.get("selector") and proposal.get("match_text"):
+                proposal["selector"] = {
+                    "field": "relative_path", "operator": "contains",
+                    "value": proposal["match_text"],
+                }
+            if not proposal.get("actions") and proposal.get("facet_type"):
+                proposal["actions"] = {proposal["facet_type"]: proposal.get("value")}
+            try:
+                proposal["selector_text"] = self._curation_selector_text(
+                    self._normalize_curation_selector(proposal["selector"])
+                )
+            except (TypeError, ValueError):
+                proposal["selector_text"] = proposal.get("match_text") or "Invalid selector"
         return {"messages": messages, "proposals": proposals}
 
     def send_curation_message(self, content: str) -> dict:
@@ -4147,9 +4444,35 @@ class Curator:
             )]
             recent.reverse()
             db.commit()
-        result = AIProviderClient(config).curation_conversation(
-            recent, self._curation_conversation_context(),
-        )
+        client = AIProviderClient(config)
+        context = self._curation_conversation_context()
+        search_results, prior_plan = [], None
+        search_count = 0
+        result = {}
+        for round_number in range(3):
+            result = client.curation_conversation(recent, context, search_results, prior_plan)
+            requested = result.get("searches") if isinstance(result.get("searches"), list) else []
+            if not requested or round_number == 2:
+                break
+            for request_item in requested[: max(0, 6 - search_count)]:
+                if not isinstance(request_item, dict):
+                    continue
+                try:
+                    search_result = self._catalog_search_for_curation(
+                        request_item.get("selector"), str(request_item.get("label") or ""),
+                    )
+                except (TypeError, ValueError) as exc:
+                    search_result = {
+                        "label": str(request_item.get("label") or "Invalid catalog search")[:200],
+                        "selector": request_item.get("selector"), "matches": 0,
+                        "examples": [], "error": str(exc),
+                    }
+                search_results.append(search_result)
+                search_count += 1
+            prior_plan = {
+                "reply": str(result.get("reply") or "")[:4000],
+                "searches": requested[:6],
+            }
         reply = str(result.get("reply") or "").strip()
         if not reply:
             raise ValueError("The AI assistant returned an empty reply.")
@@ -4163,94 +4486,161 @@ class Curator:
                 (reply[:8000], config.provider_name[:100], config.model[:200], now),
             )
             message_id = int(cursor.lastrowid)
-            for proposal in raw_proposals[:3]:
-                if not isinstance(proposal, dict):
-                    continue
-                match_text = str(proposal.get("match_text") or "").strip()[:300]
-                facet_type = str(proposal.get("facet_type") or "").strip().casefold()
-                value = sanitize_component(str(proposal.get("value") or "").strip())[:150]
-                reason = str(proposal.get("reason") or "").strip()[:800]
-                try:
-                    confidence = max(0, min(int(proposal.get("confidence") or 0), 100))
-                except (TypeError, ValueError):
-                    confidence = 0
-                if len(match_text) < 4 or facet_type not in {"origin", "sensitivity", "collection"}:
-                    continue
-                if confidence < 60 or not value:
-                    continue
-                if facet_type == "origin" and value.casefold().replace(" ", "_") not in {
-                    "camera", "snapchat", "screenshot", "screen_recording", "downloaded",
-                    "messaging", "generated",
-                }:
-                    continue
-                if facet_type == "sensitivity" and value.casefold().replace(" ", "_") not in {
-                    "normal", "adult", "possibly_sensitive", "intimate",
-                }:
-                    continue
-                affected = int(db.execute(
-                    """SELECT COUNT(*) FROM files WHERE size>0 AND known_good_match=0
-                       AND instr(lower(relative_path),lower(?))>0""",
-                    (match_text,),
-                ).fetchone()[0])
-                if not affected:
-                    continue
-                db.execute(
-                    """INSERT INTO curation_chat_proposals(
-                         message_id,match_text,facet_type,value,confidence,reason,
-                         affected_files,status,created_at,updated_at
-                       ) VALUES(?,?,?,?,?,?,?,'pending',?,?)""",
-                    (message_id, match_text, facet_type, value, confidence, reason, affected, now, now),
-                )
+            staged = invalid = 0
+            for proposal in raw_proposals[:8]:
+                state = self._stage_curation_proposal(db, message_id, proposal)
+                staged += state == "pending"
+                invalid += state == "invalid"
             db.commit()
-        return self.curation_conversation()
+        conversation = self.curation_conversation()
+        conversation["turn"] = {
+            "searches_run": search_count, "staged": staged, "invalid": invalid,
+            "reply_kind": "suggestions" if staged else ("validation_problem" if invalid else "conversation"),
+        }
+        return conversation
 
     def review_curation_proposal(self, proposal_id: int, decision: str) -> dict:
-        if decision not in {"accepted", "rejected"}:
-            raise ValueError("Choose accepted or rejected.")
+        if decision not in {"accepted", "rejected", "undone"}:
+            raise ValueError("Choose accepted, rejected, or undone.")
         with connect(self.db_path) as db:
             proposal = db.execute(
-                "SELECT * FROM curation_chat_proposals WHERE id=? AND status='pending'",
-                (proposal_id,),
+                "SELECT * FROM curation_chat_proposals WHERE id=?", (proposal_id,),
             ).fetchone()
             if not proposal:
-                raise FileNotFoundError("Pending assistant proposal not found.")
+                raise FileNotFoundError("Assistant proposal not found.")
             affected = 0
             if decision == "accepted":
-                value = proposal["value"]
+                if proposal["status"] != "pending":
+                    raise ValueError("Only a pending suggestion can be applied.")
+                try:
+                    selector_raw = json.loads(proposal["selector_json"] or "null")
+                    actions_raw = json.loads(proposal["actions_json"] or "null")
+                    if selector_raw is None or actions_raw is None:
+                        selector_raw, actions_raw = self._legacy_curation_proposal(dict(proposal))
+                    selector = self._normalize_curation_selector(selector_raw)
+                    actions = self._normalize_curation_actions(actions_raw)
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError(f"This suggestion is no longer valid: {exc}") from exc
+                _, clause, params = self._curation_selector_sql(selector)
+                predicate = f"size>0 AND known_good_match=0 AND ({clause})"
                 source = f"ai-conversation:{proposal_id}"
-                predicate = "size>0 AND known_good_match=0 AND instr(lower(relative_path),lower(?))>0"
-                if proposal["facet_type"] == "origin":
-                    normalized = value.casefold().replace(" ", "_")
-                    cursor = db.execute(
-                        f"UPDATE files SET media_origin=?,updated_at=? WHERE {predicate}",
-                        (normalized, utcnow(), proposal["match_text"]),
-                    )
-                    facet_type, facet_value = "origin", normalized
-                elif proposal["facet_type"] == "sensitivity":
-                    normalized = value.casefold().replace(" ", "_")
-                    cursor = db.execute(
-                        f"UPDATE files SET sensitivity=?,updated_at=? WHERE {predicate}",
-                        (normalized, utcnow(), proposal["match_text"]),
-                    )
-                    facet_type, facet_value = "sensitivity", normalized
-                else:
-                    cursor = db.execute(
-                        f"""UPDATE files SET curation_label=?,curation_label_source=?,updated_at=?
-                            WHERE {predicate}""",
-                        (value, source, utcnow(), proposal["match_text"]),
-                    )
-                    facet_type, facet_value = "topic", value
-                affected = int(cursor.rowcount)
+                affected = int(db.execute(
+                    f"SELECT COUNT(*) FROM files WHERE {predicate}", params,
+                ).fetchone()[0])
+                if not affected:
+                    raise ValueError("This selector no longer matches any eligible files.")
                 db.execute(
-                    f"""INSERT OR REPLACE INTO file_facets(
-                         file_id,facet_type,value,confidence,source,reason,updated_at
-                       ) SELECT id,?,?,?, ?,?,? FROM files WHERE {predicate}""",
-                    (facet_type, facet_value, proposal["confidence"], source,
-                     proposal["reason"], utcnow(), proposal["match_text"]),
+                    f"""INSERT OR REPLACE INTO curation_rule_effects(
+                         proposal_id,file_id,prior_media_origin,prior_media_origin_source,
+                         prior_sensitivity,prior_sensitivity_source,prior_curation_label,
+                         prior_curation_label_source
+                       ) SELECT ?,id,media_origin,media_origin_source,sensitivity,sensitivity_source,
+                                curation_label,curation_label_source
+                         FROM files WHERE {predicate}""",
+                    [proposal_id, *params],
+                )
+                now = utcnow()
+                assignments, update_values = [], []
+                if "origin" in actions:
+                    assignments.extend(("media_origin=?", "media_origin_source=?"))
+                    update_values.extend((actions["origin"], source))
+                if "sensitivity" in actions:
+                    assignments.extend(("sensitivity=?", "sensitivity_source=?"))
+                    update_values.extend((actions["sensitivity"], source))
+                if "collection" in actions:
+                    assignments.extend(("curation_label=?", "curation_label_source=?"))
+                    update_values.extend((actions["collection"], source))
+                assignments.append("updated_at=?")
+                update_values.append(now)
+                db.execute(
+                    f"UPDATE files SET {','.join(assignments)} WHERE {predicate}",
+                    [*update_values, *params],
+                )
+                for action, value in actions.items():
+                    facet_type = "topic" if action == "collection" else action
+                    db.execute(
+                        f"""INSERT OR REPLACE INTO file_facets(
+                             file_id,facet_type,value,confidence,source,reason,updated_at
+                           ) SELECT id,?,?,?,?,?,? FROM files WHERE {predicate}""",
+                        [facet_type, value, proposal["confidence"], source,
+                         proposal["reason"], now, *params],
+                    )
+                db.execute(
+                    "UPDATE curation_chat_proposals SET affected_files=? WHERE id=?",
+                    (affected, proposal_id),
                 )
                 db.execute(
                     "DELETE FROM settings WHERE key IN ('sanitization_export_token','sanitization_preview_json')"
                 )
+            elif decision == "undone":
+                if proposal["status"] != "accepted":
+                    raise ValueError("Only an applied suggestion can be undone.")
+                try:
+                    actions = self._normalize_curation_actions(
+                        json.loads(proposal["actions_json"] or "null")
+                    )
+                except (TypeError, ValueError, json.JSONDecodeError) as exc:
+                    raise ValueError(f"This applied suggestion cannot be undone safely: {exc}") from exc
+                source = f"ai-conversation:{proposal_id}"
+                affected = int(db.execute(
+                    "SELECT COUNT(*) FROM curation_rule_effects WHERE proposal_id=?", (proposal_id,),
+                ).fetchone()[0])
+                source_columns = {
+                    "origin": "media_origin_source", "sensitivity": "sensitivity_source",
+                    "collection": "curation_label_source",
+                }
+                for action in actions:
+                    source_column = source_columns[action]
+                    newer = int(db.execute(
+                        f"""SELECT COUNT(*) FROM curation_rule_effects e JOIN files f ON f.id=e.file_id
+                            WHERE e.proposal_id=? AND f.{source_column} LIKE 'ai-conversation:%'
+                              AND f.{source_column}!=?""",
+                        (proposal_id, source),
+                    ).fetchone()[0])
+                    if newer:
+                        raise ValueError(
+                            "A newer applied AI rule overlaps this suggestion. Undo the newer rule first."
+                        )
+                if "origin" in actions:
+                    db.execute(
+                        """UPDATE files SET
+                             media_origin=(SELECT prior_media_origin FROM curation_rule_effects e
+                                           WHERE e.proposal_id=? AND e.file_id=files.id),
+                             media_origin_source=(SELECT prior_media_origin_source FROM curation_rule_effects e
+                                                  WHERE e.proposal_id=? AND e.file_id=files.id),updated_at=?
+                           WHERE media_origin_source=? AND id IN
+                             (SELECT file_id FROM curation_rule_effects WHERE proposal_id=?)""",
+                        (proposal_id, proposal_id, utcnow(), source, proposal_id),
+                    )
+                if "sensitivity" in actions:
+                    db.execute(
+                        """UPDATE files SET
+                             sensitivity=(SELECT prior_sensitivity FROM curation_rule_effects e
+                                          WHERE e.proposal_id=? AND e.file_id=files.id),
+                             sensitivity_source=(SELECT prior_sensitivity_source FROM curation_rule_effects e
+                                                 WHERE e.proposal_id=? AND e.file_id=files.id),updated_at=?
+                           WHERE sensitivity_source=? AND id IN
+                             (SELECT file_id FROM curation_rule_effects WHERE proposal_id=?)""",
+                        (proposal_id, proposal_id, utcnow(), source, proposal_id),
+                    )
+                if "collection" in actions:
+                    db.execute(
+                        """UPDATE files SET
+                             curation_label=(SELECT prior_curation_label FROM curation_rule_effects e
+                                             WHERE e.proposal_id=? AND e.file_id=files.id),
+                             curation_label_source=(SELECT prior_curation_label_source FROM curation_rule_effects e
+                                                    WHERE e.proposal_id=? AND e.file_id=files.id),updated_at=?
+                           WHERE curation_label_source=? AND id IN
+                             (SELECT file_id FROM curation_rule_effects WHERE proposal_id=?)""",
+                        (proposal_id, proposal_id, utcnow(), source, proposal_id),
+                    )
+                db.execute("DELETE FROM file_facets WHERE source=?", (source,))
+                db.execute(
+                    "DELETE FROM settings WHERE key IN ('sanitization_export_token','sanitization_preview_json')"
+                )
+            else:
+                if proposal["status"] != "pending":
+                    raise ValueError("Only a pending suggestion can be dismissed.")
             db.execute(
                 "UPDATE curation_chat_proposals SET status=?,updated_at=? WHERE id=?",
                 (decision, utcnow(), proposal_id),
@@ -5368,8 +5758,9 @@ class Curator:
         fields = [
             "id", "relative_path", "sanitized_path", "sanitized_method", "sanitized_at",
             "sanitization_detail",
-            "content_hash", "validation", "media_kind", "media_origin", "sensitivity",
-            "curation_label", "known_good_match", "exact_group", "similar_group",
+            "content_hash", "validation", "media_kind", "media_origin", "media_origin_source",
+            "sensitivity", "sensitivity_source", "curation_label", "curation_label_source",
+            "known_good_match", "exact_group", "similar_group",
             "exif_date", "video_creation_date", "filename_date", "date_confidence", "date_reason",
         ]
         with connect(self.db_path) as db, csv_path.open("w", newline="", encoding="utf-8") as csv_file, jsonl_path.open("w", encoding="utf-8") as json_file:
@@ -5456,7 +5847,8 @@ class Curator:
             "quality_score", "exact_group", "similar_group", "known_good_match", "known_good_count",
             "known_good_library", "known_good_path", "decision", "exported_path",
             "ai_caption", "ai_people", "ai_objects", "ai_ocr_text", "ai_tags", "ai_model", "ai_updated_at",
-            "media_kind", "media_origin", "sensitivity", "video_duration", "video_width", "video_height",
+            "media_kind", "media_origin", "media_origin_source", "sensitivity", "sensitivity_source",
+            "video_duration", "video_width", "video_height",
             "video_fps", "video_codec", "audio_codec", "video_creation_date", "video_analysis_version",
             "curation_label", "curation_label_source", "sanitized_path", "sanitized_method",
             "sanitized_at", "sanitization_detail",
