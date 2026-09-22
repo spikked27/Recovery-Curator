@@ -52,7 +52,7 @@
 <header class="topbar"><a class="brand" href="/"><span class="brand-mark">RC</span><span>Recovery Curator</span></a><nav aria-label="Primary">
   <a class="{% if request.path=='/' %}active{% endif %}" href="/">Dashboard</a>
   <a class="{% if request.path.startswith('/scans') %}active{% endif %}" href="/scans">Scans</a>
-  <a class="{% if request.path.startswith('/reconstruction') %}active{% endif %}" href="/reconstruction">Reconstruct</a>
+  <a class="{% if request.path.startswith('/curate') %}active{% endif %}" href="/curate">Curate</a>
   <a class="{% if request.path=='/groups/exact' %}active{% endif %}" href="/groups/exact">Duplicates</a>
   <a class="{% if request.path=='/groups/similar' %}active{% endif %}" href="/groups/similar">Similar</a>
   <a class="{% if request.args.get('known_good')=='1' %}active{% endif %}" href="/files?known_good=1">Matches</a>

@@ -162,6 +162,12 @@ def initialize(db_path: Path) -> None:
               audio_codec TEXT,
               video_creation_date TEXT,
               video_analysis_version INTEGER DEFAULT 0,
+              curation_label TEXT,
+              curation_label_source TEXT,
+              sanitized_path TEXT,
+              sanitized_method TEXT,
+              sanitized_at TEXT,
+              sanitization_detail TEXT,
               updated_at TEXT
             );
             CREATE INDEX IF NOT EXISTS idx_files_size ON files(size);
@@ -358,6 +364,29 @@ def initialize(db_path: Path) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_ai_packet_imports_dossier
               ON ai_packet_imports(dossier_id,packet_id);
+            CREATE TABLE IF NOT EXISTS curation_chat_messages (
+              id INTEGER PRIMARY KEY,
+              role TEXT NOT NULL,
+              content TEXT NOT NULL,
+              provider_name TEXT,
+              model TEXT,
+              created_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS curation_chat_proposals (
+              id INTEGER PRIMARY KEY,
+              message_id INTEGER NOT NULL,
+              match_text TEXT NOT NULL,
+              facet_type TEXT NOT NULL,
+              value TEXT NOT NULL,
+              confidence INTEGER NOT NULL DEFAULT 0,
+              reason TEXT,
+              affected_files INTEGER NOT NULL DEFAULT 0,
+              status TEXT NOT NULL DEFAULT 'pending',
+              created_at TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_curation_chat_proposals_status
+              ON curation_chat_proposals(status,id);
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS actions (
               id INTEGER PRIMARY KEY,
@@ -383,6 +412,9 @@ def initialize(db_path: Path) -> None:
             "video_width": "INTEGER", "video_height": "INTEGER", "video_fps": "REAL",
             "video_codec": "TEXT", "audio_codec": "TEXT", "video_creation_date": "TEXT",
             "video_analysis_version": "INTEGER DEFAULT 0",
+            "curation_label": "TEXT", "curation_label_source": "TEXT",
+            "sanitized_path": "TEXT", "sanitized_method": "TEXT", "sanitized_at": "TEXT",
+            "sanitization_detail": "TEXT",
         }
         for column, definition in migrations.items():
             if column not in existing_columns:
@@ -418,6 +450,7 @@ def initialize(db_path: Path) -> None:
         db.execute("CREATE INDEX IF NOT EXISTS idx_files_known_good ON files(known_good_match)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_files_media_kind ON files(media_kind)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_files_media_origin ON files(media_origin)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_files_sanitized_path ON files(sanitized_path)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_reconstruction_review ON reconstruction_proposals(review_state)")
         migrated_file_columns = {row[1] for row in db.execute("PRAGMA table_info(files)")}
         performance_indexes = (
@@ -1015,6 +1048,8 @@ class Curator:
             db.execute("DELETE FROM ai_runs")
             db.execute("DELETE FROM ai_structure_suggestions")
             db.execute("DELETE FROM ai_packet_imports")
+            db.execute("DELETE FROM curation_chat_proposals")
+            db.execute("DELETE FROM curation_chat_messages")
             db.execute("DELETE FROM review_questions")
             db.execute("DELETE FROM ai_provider_settings")
             db.execute("DELETE FROM reconstruction_proposals")
@@ -1047,6 +1082,7 @@ class Curator:
             "review_questions.csv", "review_questions.jsonl",
             "ai_structure_suggestions.csv", "ai_structure_suggestions.jsonl",
             "ai_packet_imports.csv", "ai_packet_imports.jsonl",
+            "sanitization_manifest.csv", "sanitization_manifest.jsonl",
             "reconstruction_ai_dossier.txt",
         ):
             report = self.db_path.parent / name
@@ -1226,10 +1262,18 @@ class Curator:
                 f"Recovered Source cannot be read at {self.source}: {source_diagnostic['error']}. "
                 "Check the container path permissions."
             )
+        if self._paths_overlap(self.source, self.output):
+            raise ValueError(
+                "Curated Output must be a separate folder outside Recovered Source. "
+                "Use two sibling folders on the same disk when you want hardlinks."
+            )
         self._validate_reference_roots()
         scan_token = utcnow() + "-" + os.urandom(4).hex()
         self._begin_phase("inventory", 0, "Inventorying files with bounded memory")
         with connect(self.db_path) as db:
+            db.execute(
+                "DELETE FROM settings WHERE key IN ('sanitization_export_token','sanitization_preview_json')"
+            )
             inventory_count = 0
             traversal = TraversalDiagnostics()
 
@@ -1296,7 +1340,9 @@ class Curator:
                            ai_objects=NULL,ai_ocr_text=NULL,ai_tags=NULL,ai_model=NULL,ai_updated_at=NULL,
                            media_kind='other',media_origin='unknown',sensitivity='unknown',video_duration=NULL,
                            video_width=NULL,video_height=NULL,video_fps=NULL,video_codec=NULL,audio_codec=NULL,
-                           video_creation_date=NULL,video_analysis_version=0 WHERE path=?""", (str(path),)
+                           video_creation_date=NULL,video_analysis_version=0,sanitized_path=NULL,
+                           sanitized_method=NULL,sanitized_at=NULL,sanitization_detail=NULL WHERE path=?""",
+                        (str(path),)
                     )
                 if index % self.batch_size == 0:
                     db.commit()
@@ -1602,6 +1648,53 @@ class Curator:
             return False
         threading.Thread(target=self._reconstruction_wrapper, daemon=True).start()
         return True
+
+    def start_sanitization_analysis(self) -> bool:
+        if not self._start_job(
+            "sanitization_analysis", "Starting safe media and recovery-evidence analysis",
+        ):
+            return False
+        threading.Thread(target=self._sanitization_analysis_wrapper, daemon=True).start()
+        return True
+
+    def _sanitization_analysis_wrapper(self) -> None:
+        try:
+            result = self.build_sanitization_foundation()
+            self._set_state(
+                running=False, phase="complete",
+                message=(
+                    f"Sanitization analysis ready — {result['included']:,} unique files selected; "
+                    f"{result['known_good_excluded']:,} known-good copies omitted"
+                ),
+                error=None,
+            )
+        except ScanCancelled as exc:
+            self._set_state(running=False, phase="stopped", message=str(exc), error=None)
+        except Exception as exc:
+            self._set_state(
+                running=False, phase="failed", message="Sanitization analysis failed", error=str(exc),
+            )
+
+    def build_sanitization_foundation(self) -> dict:
+        """Refresh only factual evidence needed by the automatic review-library workflow."""
+        with connect(self.db_path) as db:
+            if db.execute("SELECT COUNT(*) FROM files").fetchone()[0] == 0:
+                raise RuntimeError("Run a recovery scan before analyzing the review library.")
+            self._analyze_pending(db)
+            self._check_cancel()
+            self._begin_phase("facets", 1, "Deriving safe media types, origins, and labels")
+            self._backfill_facets(db)
+            self._progress(1, 1)
+            self._check_cancel()
+            self._refresh_known_good_relationships(db)
+            self._build_placeholder_relationships(db)
+            db.execute(
+                "DELETE FROM settings WHERE key IN ('sanitization_export_token','sanitization_preview_json')"
+            )
+            db.commit()
+        self.export_catalog()
+        self._invalidate_summaries()
+        return self.sanitization_preview()
 
     def _reconstruction_wrapper(self) -> None:
         try:
@@ -3966,6 +4059,206 @@ class Curator:
         self._invalidate_summaries()
         return {"reviewed": reviewed, "accepted": accepted}
 
+    def _curation_conversation_context(self) -> dict:
+        with connect(self.db_path) as db:
+            summary = dict(db.execute(
+                """SELECT COUNT(*) files,COALESCE(SUM(size),0) bytes,
+                          COALESCE(SUM(known_good_match=1),0) known_good_matches,
+                          COALESCE(SUM(size=0),0) zero_byte_placeholders,
+                          COALESCE(SUM(validation='corrupt'),0) corrupt_files
+                   FROM files"""
+            ).fetchone())
+            distributions = {}
+            for name, expression in {
+                "media_types": "COALESCE(media_kind,'other')",
+                "origins": "COALESCE(media_origin,'unknown')",
+                "sensitivity": "COALESCE(sensitivity,'unknown')",
+                "current_collections": "COALESCE(curation_label,'Unlabeled')",
+            }.items():
+                distributions[name] = [dict(row) for row in db.execute(
+                    f"""SELECT {expression} value,COUNT(*) count FROM files
+                         WHERE size>0 AND known_good_match=0
+                         GROUP BY value ORDER BY count DESC,value LIMIT 25"""
+                )]
+            sample_count = int(db.execute(
+                "SELECT COUNT(*) FROM files WHERE size>0 AND known_good_match=0"
+            ).fetchone()[0])
+            message_count = int(db.execute(
+                "SELECT COUNT(*) FROM curation_chat_messages WHERE role='user'"
+            ).fetchone()[0])
+            sample_offset = ((max(message_count - 1, 0) * 80) % sample_count) if sample_count else 0
+            samples = [dict(row) for row in db.execute(
+                """SELECT relative_path,name,media_kind,media_origin,category,validation,
+                          exif_date,video_creation_date,filename_date,curation_label
+                   FROM files WHERE size>0 AND known_good_match=0
+                   ORDER BY (media_origin='unknown') DESC,category_confidence,id LIMIT 80 OFFSET ?""",
+                (sample_offset,),
+            )]
+            top_branches = [dict(row) for row in db.execute(
+                """SELECT CASE WHEN instr(relative_path,'/')=0 THEN '.'
+                                ELSE substr(relative_path,1,instr(relative_path,'/')-1) END branch,
+                          COUNT(*) files
+                   FROM files WHERE size>0 AND known_good_match=0
+                   GROUP BY branch ORDER BY files DESC,branch LIMIT 30"""
+            )]
+            owner_context = [dict(row) for row in db.execute(
+                """SELECT context_type,label,details,match_text,destination
+                   FROM recovery_context ORDER BY updated_at DESC,id DESC LIMIT 100"""
+            )]
+        summary["bytes_human"] = human_bytes(summary["bytes"])
+        return {
+            "goal": "label a sanitized browsing library; never reconstruct original folders",
+            "summary": summary, "distributions": distributions,
+            "owner_supplied_context": owner_context,
+            "top_branches": top_branches,
+            "sample_window": {"offset": sample_offset, "count": len(samples), "eligible": sample_count},
+            "representative_samples": samples,
+        }
+
+    def curation_conversation(self) -> dict:
+        with connect(self.db_path) as db:
+            messages = [dict(row) for row in db.execute(
+                "SELECT * FROM curation_chat_messages ORDER BY id DESC LIMIT 100"
+            )]
+            messages.reverse()
+            proposals = [dict(row) for row in db.execute(
+                """SELECT p.* FROM curation_chat_proposals p
+                   ORDER BY p.id DESC LIMIT 100"""
+            )]
+        return {"messages": messages, "proposals": proposals}
+
+    def send_curation_message(self, content: str) -> dict:
+        from .ai import AIProviderClient, ProviderConfig
+
+        content = content.strip()
+        if not content:
+            raise ValueError("Enter a message for the recovery assistant.")
+        if len(content) > 4000:
+            raise ValueError("Keep each message under 4,000 characters.")
+        settings = self._ai_provider_config_values()
+        config = ProviderConfig.from_mapping(settings)
+        with connect(self.db_path) as db:
+            db.execute(
+                "INSERT INTO curation_chat_messages(role,content,created_at) VALUES('user',?,?)",
+                (content, utcnow()),
+            )
+            recent = [dict(row) for row in db.execute(
+                "SELECT role,content FROM curation_chat_messages ORDER BY id DESC LIMIT 20"
+            )]
+            recent.reverse()
+            db.commit()
+        result = AIProviderClient(config).curation_conversation(
+            recent, self._curation_conversation_context(),
+        )
+        reply = str(result.get("reply") or "").strip()
+        if not reply:
+            raise ValueError("The AI assistant returned an empty reply.")
+        raw_proposals = result.get("proposals") if isinstance(result.get("proposals"), list) else []
+        now = utcnow()
+        with connect(self.db_path) as db:
+            cursor = db.execute(
+                """INSERT INTO curation_chat_messages(
+                     role,content,provider_name,model,created_at
+                   ) VALUES('assistant',?,?,?,?)""",
+                (reply[:8000], config.provider_name[:100], config.model[:200], now),
+            )
+            message_id = int(cursor.lastrowid)
+            for proposal in raw_proposals[:3]:
+                if not isinstance(proposal, dict):
+                    continue
+                match_text = str(proposal.get("match_text") or "").strip()[:300]
+                facet_type = str(proposal.get("facet_type") or "").strip().casefold()
+                value = sanitize_component(str(proposal.get("value") or "").strip())[:150]
+                reason = str(proposal.get("reason") or "").strip()[:800]
+                try:
+                    confidence = max(0, min(int(proposal.get("confidence") or 0), 100))
+                except (TypeError, ValueError):
+                    confidence = 0
+                if len(match_text) < 4 or facet_type not in {"origin", "sensitivity", "collection"}:
+                    continue
+                if confidence < 60 or not value:
+                    continue
+                if facet_type == "origin" and value.casefold().replace(" ", "_") not in {
+                    "camera", "snapchat", "screenshot", "screen_recording", "downloaded",
+                    "messaging", "generated",
+                }:
+                    continue
+                if facet_type == "sensitivity" and value.casefold().replace(" ", "_") not in {
+                    "normal", "adult", "possibly_sensitive", "intimate",
+                }:
+                    continue
+                affected = int(db.execute(
+                    """SELECT COUNT(*) FROM files WHERE size>0 AND known_good_match=0
+                       AND instr(lower(relative_path),lower(?))>0""",
+                    (match_text,),
+                ).fetchone()[0])
+                if not affected:
+                    continue
+                db.execute(
+                    """INSERT INTO curation_chat_proposals(
+                         message_id,match_text,facet_type,value,confidence,reason,
+                         affected_files,status,created_at,updated_at
+                       ) VALUES(?,?,?,?,?,?,?,'pending',?,?)""",
+                    (message_id, match_text, facet_type, value, confidence, reason, affected, now, now),
+                )
+            db.commit()
+        return self.curation_conversation()
+
+    def review_curation_proposal(self, proposal_id: int, decision: str) -> dict:
+        if decision not in {"accepted", "rejected"}:
+            raise ValueError("Choose accepted or rejected.")
+        with connect(self.db_path) as db:
+            proposal = db.execute(
+                "SELECT * FROM curation_chat_proposals WHERE id=? AND status='pending'",
+                (proposal_id,),
+            ).fetchone()
+            if not proposal:
+                raise FileNotFoundError("Pending assistant proposal not found.")
+            affected = 0
+            if decision == "accepted":
+                value = proposal["value"]
+                source = f"ai-conversation:{proposal_id}"
+                predicate = "size>0 AND known_good_match=0 AND instr(lower(relative_path),lower(?))>0"
+                if proposal["facet_type"] == "origin":
+                    normalized = value.casefold().replace(" ", "_")
+                    cursor = db.execute(
+                        f"UPDATE files SET media_origin=?,updated_at=? WHERE {predicate}",
+                        (normalized, utcnow(), proposal["match_text"]),
+                    )
+                    facet_type, facet_value = "origin", normalized
+                elif proposal["facet_type"] == "sensitivity":
+                    normalized = value.casefold().replace(" ", "_")
+                    cursor = db.execute(
+                        f"UPDATE files SET sensitivity=?,updated_at=? WHERE {predicate}",
+                        (normalized, utcnow(), proposal["match_text"]),
+                    )
+                    facet_type, facet_value = "sensitivity", normalized
+                else:
+                    cursor = db.execute(
+                        f"""UPDATE files SET curation_label=?,curation_label_source=?,updated_at=?
+                            WHERE {predicate}""",
+                        (value, source, utcnow(), proposal["match_text"]),
+                    )
+                    facet_type, facet_value = "topic", value
+                affected = int(cursor.rowcount)
+                db.execute(
+                    f"""INSERT OR REPLACE INTO file_facets(
+                         file_id,facet_type,value,confidence,source,reason,updated_at
+                       ) SELECT id,?,?,?, ?,?,? FROM files WHERE {predicate}""",
+                    (facet_type, facet_value, proposal["confidence"], source,
+                     proposal["reason"], utcnow(), proposal["match_text"]),
+                )
+                db.execute(
+                    "DELETE FROM settings WHERE key IN ('sanitization_export_token','sanitization_preview_json')"
+                )
+            db.execute(
+                "UPDATE curation_chat_proposals SET status=?,updated_at=? WHERE id=?",
+                (decision, utcnow(), proposal_id),
+            )
+            db.commit()
+        self._invalidate_summaries()
+        return {"decision": decision, "affected": affected, "conversation": self.curation_conversation()}
+
     def analyze_file_with_ai(self, file_id: int) -> dict:
         from .ai import AIProviderClient, ProviderConfig
 
@@ -4619,6 +4912,477 @@ class Curator:
             db.commit()
         return str(destination)
 
+    @staticmethod
+    def _sanitization_query() -> str:
+        return """
+            WITH zero_date_evidence AS (
+              SELECT r.related_file_id,
+                     CASE WHEN COUNT(DISTINCT CASE WHEN z.date_confidence>=85
+                                                    THEN z.filename_date END)=1
+                          THEN MAX(CASE WHEN z.date_confidence>=85 THEN z.filename_date END) END zero_date,
+                     MIN(r.confidence) zero_date_confidence,
+                     CASE WHEN COUNT(DISTINCT z.mtime_ns)=1 THEN MAX(z.mtime_ns) END zero_mtime_ns
+              FROM file_relationships r
+              JOIN files z ON z.id=r.file_id
+              WHERE r.relationship='zero_same_name' AND r.confidence>=85
+              GROUP BY r.related_file_id
+            ), eligible AS (
+              SELECT f.*,z.zero_date,z.zero_date_confidence,z.zero_mtime_ns
+              FROM files f LEFT JOIN zero_date_evidence z ON z.related_file_id=f.id
+              WHERE f.size>0 AND f.known_good_match=0 AND f.decision!='reject'
+                AND COALESCE(f.validation,'unchecked')!='unreadable'
+            ), ranked AS (
+              SELECT eligible.*,
+                     ROW_NUMBER() OVER (
+                       PARTITION BY CASE WHEN exact_group IS NULL THEN 'file:'||id
+                                         ELSE 'exact:'||exact_group END
+                       ORDER BY (decision='keep') DESC,quality_score DESC,LENGTH(path),path,id
+                     ) duplicate_rank
+              FROM eligible
+            )
+            SELECT * FROM ranked WHERE duplicate_rank=1
+        """
+
+    @staticmethod
+    def _date_folder(value: str | None) -> tuple[str, str] | None:
+        if not value:
+            return None
+        try:
+            parsed = dt.datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+        except (TypeError, ValueError):
+            return None
+        if parsed.year < 1990 or parsed.year > dt.datetime.now().year + 1:
+            return None
+        return str(parsed.year), f"{parsed.month:02d}"
+
+    def _sanitization_destination(self, row: sqlite3.Row | dict) -> dict:
+        item = dict(row)
+        media = str(item.get("media_kind") or "other")
+        extension = str(item.get("extension") or "").casefold()
+        type_name = {
+            "photo": "Photos", "video": "Videos", "audio": "Audio",
+            "document": "Documents", "email": "Email", "other": "Other Files",
+        }.get(media, "Other Files")
+        if media == "other" and extension in {".zip", ".7z", ".rar", ".tar", ".gz", ".bz2"}:
+            type_name = "Archives"
+
+        validation = str(item.get("validation") or "unchecked")
+        sensitivity = str(item.get("sensitivity") or "unknown")
+        origin = str(item.get("media_origin") or "unknown")
+        if validation == "corrupt":
+            root = ["Needs Attention", "Corrupt or Partially Readable", type_name]
+        elif sensitivity in {"adult", "intimate", "possibly_sensitive"}:
+            root = ["Private Review", type_name]
+        else:
+            root = [type_name]
+
+        label = str(item.get("curation_label") or "").strip()
+        path_text = str(item.get("relative_path") or "").casefold()
+        if label:
+            grouping = sanitize_component(label)
+        elif "nasa" in path_text or "jwst" in path_text:
+            grouping = "NASA and Space"
+        elif "wallpaper" in path_text or "background" in path_text:
+            grouping = "Wallpapers"
+        elif origin and origin != "unknown":
+            grouping = sanitize_component(origin.replace("_", " ").title())
+        else:
+            grouping = "Unsorted"
+        root.append(grouping)
+
+        date_value = None
+        date_source = "unknown"
+        date_confidence = 0
+        repair_date = None
+        repair_mtime_ns = None
+        if self._date_folder(item.get("exif_date")):
+            date_value, date_source, date_confidence = item["exif_date"], "embedded_capture_date", 100
+        elif self._date_folder(item.get("video_creation_date")):
+            date_value, date_source, date_confidence = item["video_creation_date"], "embedded_video_date", 100
+        elif int(item.get("date_confidence") or 0) >= 85 and self._date_folder(item.get("filename_date")):
+            date_value = item["filename_date"]
+            date_source, date_confidence, repair_date = "filename_date", int(item["date_confidence"]), date_value
+        elif int(item.get("zero_date_confidence") or 0) >= 85 and self._date_folder(item.get("zero_date")):
+            date_value = item["zero_date"]
+            date_source, date_confidence, repair_date = "zero_byte_filename_date", int(item["zero_date_confidence"]), date_value
+        elif int(item.get("zero_date_confidence") or 0) >= 85:
+            try:
+                zero_modified = dt.datetime.fromtimestamp(
+                    int(item.get("zero_mtime_ns") or 0) / 1_000_000_000, dt.timezone.utc,
+                )
+                live_modified = dt.datetime.fromtimestamp(
+                    int(item.get("mtime_ns") or 0) / 1_000_000_000, dt.timezone.utc,
+                )
+                if (
+                    1990 <= zero_modified.year <= dt.datetime.now().year + 1
+                    and zero_modified < live_modified - dt.timedelta(days=1)
+                ):
+                    date_value = zero_modified.isoformat()
+                    date_source, date_confidence = "zero_byte_modified_date", 80
+                    repair_mtime_ns = int(item["zero_mtime_ns"])
+            except (OSError, OverflowError, TypeError, ValueError):
+                pass
+        if not date_value:
+            try:
+                modified = dt.datetime.fromtimestamp(int(item.get("mtime_ns") or 0) / 1_000_000_000, dt.timezone.utc)
+                if 1990 <= modified.year <= dt.datetime.now().year + 1:
+                    date_value = modified.isoformat()
+                    date_source, date_confidence = "filesystem_modified_date", 60
+            except (OSError, OverflowError, TypeError, ValueError):
+                pass
+        folder = self._date_folder(date_value)
+        date_group = {
+            "embedded_capture_date": "Embedded Date",
+            "embedded_video_date": "Embedded Date",
+            "filename_date": "Inferred Date",
+            "zero_byte_filename_date": "Inferred Date",
+            "zero_byte_modified_date": "Recovered Modified Date",
+            "filesystem_modified_date": "Modified Date",
+        }.get(date_source, "Unknown Date")
+        root.append(date_group)
+        if folder:
+            root.extend(folder)
+        filename = sanitize_component(str(item.get("name") or f"file-{item.get('id')}"))
+        root.append(filename)
+        return {
+            "relative_path": self._clean_relative_path(str(Path(*root))),
+            "date_value": date_value, "date_source": date_source,
+            "date_confidence": date_confidence,
+            "repair_date": repair_date if media == "photo" and not item.get("exif_date") else None,
+            "repair_mtime_ns": repair_mtime_ns,
+            "collection": grouping, "type_name": type_name,
+        }
+
+    @staticmethod
+    def _existing_parent(path: Path) -> Path | None:
+        current = path
+        while not current.exists() and current != current.parent:
+            current = current.parent
+        return current if current.exists() else None
+
+    def _current_sanitization_preview(self) -> dict:
+        with connect(self.db_path) as db:
+            counts = dict(db.execute(
+                """SELECT COUNT(*) catalog_files,
+                          COALESCE(SUM(size=0),0) zero_evidence,
+                          COALESCE(SUM(size>0 AND known_good_match=1),0) known_good_excluded,
+                          COALESCE(SUM(size>0 AND known_good_match=0 AND decision='reject'),0) rejected_excluded,
+                          COALESCE(SUM(size>0 AND known_good_match=0 AND validation='unreadable'),0) unreadable_excluded,
+                          COALESCE(SUM(size>0 AND known_good_match=0 AND decision!='reject'
+                                       AND COALESCE(validation,'unchecked')!='unreadable'),0) duplicate_pool
+                   FROM files"""
+            ).fetchone())
+            rows = db.execute(self._sanitization_query())
+            signature = blake3()
+            included = repair_candidates = already_built = unavailable = corrupt = 0
+            hardlink_candidates = independent_candidates = independent_bytes = total_bytes = 0
+            zero_date_repairs = 0
+            destinations: set[str] = set()
+            collisions = 0
+            collections: dict[str, list[int]] = defaultdict(lambda: [0, 0])
+            output_parent = self._existing_parent(self.output)
+            output_device = output_parent.stat().st_dev if output_parent else None
+            try:
+                source_root_device = self.source.stat().st_dev
+            except OSError:
+                source_root_device = None
+            for row in rows:
+                plan = self._sanitization_destination(row)
+                included += 1
+                size = int(row["size"] or 0)
+                total_bytes += size
+                signature.update(json.dumps(
+                    [row["id"], row["updated_at"], plan["relative_path"], plan["date_source"],
+                     plan["repair_date"], plan["repair_mtime_ns"], row["sanitized_path"]],
+                    ensure_ascii=False, separators=(",", ":"),
+                ).encode("utf-8"))
+                key = plan["relative_path"].casefold()
+                if key in destinations or (self.output / plan["relative_path"]).exists():
+                    collisions += 1
+                destinations.add(key)
+                collections[plan["type_name"]][0] += 1
+                collections[plan["type_name"]][1] += size
+                if row["validation"] == "corrupt":
+                    corrupt += 1
+                if plan["repair_date"] or plan["repair_mtime_ns"]:
+                    repair_candidates += 1
+                    zero_date_repairs += plan["date_source"].startswith("zero_byte_")
+                if row["sanitized_path"] and Path(row["sanitized_path"]).exists():
+                    already_built += 1
+                    continue
+                source = Path(row["path"])
+                try:
+                    source_device = source.stat().st_dev
+                except OSError:
+                    unavailable += 1
+                    continue
+                if not plan["repair_date"] and not plan["repair_mtime_ns"] and output_device is not None and source_device == output_device:
+                    hardlink_candidates += 1
+                else:
+                    independent_candidates += 1
+                    independent_bytes += size
+            counts["duplicate_excluded"] = max(int(counts["duplicate_pool"] or 0) - included, 0)
+        same_filesystem = bool(
+            output_device is not None and source_root_device is not None
+            and output_device == source_root_device
+        )
+        return {
+            **counts, "included": included, "repair_candidates": repair_candidates,
+            "zero_date_repairs": zero_date_repairs, "already_built": already_built,
+            "unavailable": unavailable, "corrupt_included": corrupt,
+            "hardlink_candidates": hardlink_candidates,
+            "independent_candidates": independent_candidates,
+            "independent_bytes": independent_bytes,
+            "independent_bytes_human": human_bytes(independent_bytes),
+            "total_bytes": total_bytes, "total_bytes_human": human_bytes(total_bytes),
+            "collisions": collisions, "same_filesystem": same_filesystem,
+            "collections": [
+                {"name": name, "files": values[0], "bytes": values[1], "bytes_human": human_bytes(values[1])}
+                for name, values in sorted(collections.items())
+            ],
+            "token": signature.hexdigest(),
+        }
+
+    def sanitization_preview(self, authorize: bool = False) -> dict:
+        preview = self._current_sanitization_preview()
+        with connect(self.db_path) as db:
+            db.execute(
+                "INSERT OR REPLACE INTO settings(key,value) VALUES('sanitization_preview_json',?)",
+                (json.dumps(preview, ensure_ascii=False, separators=(",", ":")),),
+            )
+            if authorize:
+                db.execute(
+                    "INSERT OR REPLACE INTO settings(key,value) VALUES('sanitization_export_token',?)",
+                    (preview["token"],),
+                )
+            db.commit()
+            stored = db.execute(
+                "SELECT value FROM settings WHERE key='sanitization_export_token'"
+            ).fetchone()
+        preview["authorized"] = bool(stored and stored["value"] == preview["token"])
+        return preview
+
+    def sanitization_overview(self) -> dict:
+        """Return a page-load summary without walking and statting every source file."""
+        with connect(self.db_path) as db:
+            stored_preview = db.execute(
+                "SELECT value FROM settings WHERE key='sanitization_preview_json'"
+            ).fetchone()
+            stored_token = db.execute(
+                "SELECT value FROM settings WHERE key='sanitization_export_token'"
+            ).fetchone()
+            if stored_preview:
+                try:
+                    preview = json.loads(stored_preview["value"])
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    preview = None
+                if isinstance(preview, dict):
+                    preview["authorized"] = bool(
+                        stored_token and stored_token["value"] == preview.get("token")
+                    )
+                    return preview
+
+            counts = dict(db.execute(
+                """SELECT COUNT(*) catalog_files,
+                          COALESCE(SUM(size=0),0) zero_evidence,
+                          COALESCE(SUM(size>0 AND known_good_match=1),0) known_good_excluded,
+                          COALESCE(SUM(size>0 AND known_good_match=0 AND decision='reject'),0) rejected_excluded,
+                          COALESCE(SUM(size>0 AND known_good_match=0 AND validation='unreadable'),0) unreadable_excluded,
+                          COALESCE(SUM(size>0 AND known_good_match=0 AND decision!='reject'
+                                       AND COALESCE(validation,'unchecked')!='unreadable'),0) duplicate_pool
+                   FROM files"""
+            ).fetchone())
+            eligible = dict(db.execute(
+                f"""SELECT COUNT(*) included,COALESCE(SUM(size),0) total_bytes,
+                            COALESCE(SUM(validation='corrupt'),0) corrupt_included,
+                            COALESCE(SUM(media_kind='photo' AND exif_date IS NULL AND (
+                              (date_confidence>=85 AND filename_date IS NOT NULL) OR
+                              (zero_date_confidence>=85 AND zero_date IS NOT NULL)
+                            )),0) repair_candidates
+                     FROM ({self._sanitization_query()})"""
+            ).fetchone())
+            collections = [dict(row) for row in db.execute(
+                f"""SELECT CASE COALESCE(media_kind,'other')
+                               WHEN 'photo' THEN 'Photos' WHEN 'video' THEN 'Videos'
+                               WHEN 'audio' THEN 'Audio' WHEN 'document' THEN 'Documents'
+                               WHEN 'email' THEN 'Email' ELSE 'Other Files' END name,
+                            COUNT(*) files,COALESCE(SUM(size),0) bytes
+                     FROM ({self._sanitization_query()}) GROUP BY name ORDER BY name"""
+            )]
+        included = int(eligible["included"] or 0)
+        repairs = int(eligible["repair_candidates"] or 0)
+        output_parent = self._existing_parent(self.output)
+        try:
+            same_filesystem = bool(
+                output_parent and output_parent.stat().st_dev == self.source.stat().st_dev
+            )
+        except OSError:
+            same_filesystem = False
+        independent = repairs if same_filesystem else included
+        return {
+            **counts, **eligible,
+            "duplicate_excluded": max(int(counts["duplicate_pool"] or 0) - included, 0),
+            "zero_date_repairs": 0, "already_built": 0, "unavailable": 0,
+            "hardlink_candidates": max(included - independent, 0),
+            "independent_candidates": independent, "independent_bytes": 0,
+            "independent_bytes_human": "calculated in preview",
+            "total_bytes_human": human_bytes(int(eligible["total_bytes"] or 0)),
+            "collisions": 0, "same_filesystem": same_filesystem,
+            "collections": [
+                {**item, "bytes_human": human_bytes(int(item["bytes"] or 0))}
+                for item in collections
+            ],
+            "token": "", "authorized": False,
+        }
+
+    def _independent_clone(self, source: Path, destination: Path, allow_copy: bool) -> str:
+        result = subprocess.run(
+            ["cp", "--reflink=always", "--preserve=all", "--", str(source), str(destination)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=300,
+        )
+        if result.returncode == 0:
+            return "reflink"
+        try:
+            destination.unlink()
+        except FileNotFoundError:
+            pass
+        if not allow_copy:
+            detail = " ".join(result.stderr.split())[:300]
+            raise RuntimeError(
+                "This file needs an independent clone, but reflink is unavailable. "
+                f"Enable copy fallback to continue. {detail}".strip()
+            )
+        shutil.copy2(source, destination)
+        return "copy"
+
+    def export_sanitized_library(self, token: str, allow_copy_fallback: bool = False) -> dict:
+        if not self.allow_actions:
+            raise PermissionError("Actions are disabled. Set ALLOW_ACTIONS=true before building the review library.")
+        if self._paths_overlap(self.source, self.output):
+            raise ValueError(
+                "Curated Output must be a separate folder outside Recovered Source."
+            )
+        preview = self.sanitization_preview(authorize=False)
+        if not preview["authorized"] or not token or token != preview["token"]:
+            raise RuntimeError("The catalog changed or has not been previewed. Generate a fresh preview first.")
+        hardlinked = reflinked = copied = repaired = repair_failed = failed = skipped = 0
+        output_parent = self._existing_parent(self.output)
+        output_device = output_parent.stat().st_dev if output_parent else None
+        with connect(self.db_path) as db:
+            rows = db.execute(self._sanitization_query() + " ORDER BY id")
+            for row in rows:
+                if row["sanitized_path"] and Path(row["sanitized_path"]).exists():
+                    skipped += 1
+                    continue
+                source = Path(row["path"])
+                if not source.is_file():
+                    skipped += 1
+                    continue
+                plan = self._sanitization_destination(row)
+                destination = self._safe_destination(self.output, plan["relative_path"])
+                method = ""
+                repair_state = "not_needed"
+                try:
+                    same_device = output_device is not None and source.stat().st_dev == output_device
+                    if not plan["repair_date"] and not plan["repair_mtime_ns"] and same_device:
+                        try:
+                            os.link(source, destination)
+                            method = "hardlink"
+                        except OSError:
+                            method = self._independent_clone(source, destination, allow_copy_fallback)
+                    else:
+                        method = self._independent_clone(source, destination, allow_copy_fallback)
+                    if method != "hardlink":
+                        if plan["repair_date"]:
+                            if apply_date_metadata(destination, plan["repair_date"]):
+                                repaired += 1
+                                repair_state = "applied"
+                            else:
+                                repair_failed += 1
+                                repair_state = "failed"
+                        if plan["repair_mtime_ns"]:
+                            source_stat = destination.stat()
+                            os.utime(
+                                destination,
+                                ns=(source_stat.st_atime_ns, int(plan["repair_mtime_ns"])),
+                            )
+                            repaired += 1
+                            repair_state = "applied"
+                        self._normalize_output_file(destination)
+                    if method == "hardlink":
+                        hardlinked += 1
+                    elif method == "reflink":
+                        reflinked += 1
+                    else:
+                        copied += 1
+                    now = utcnow()
+                    detail = json.dumps(
+                        {"method": method, "date_source": plan["date_source"],
+                         "date_confidence": plan["date_confidence"], "repair": repair_state},
+                        separators=(",", ":"),
+                    )
+                    db.execute(
+                        """UPDATE files SET sanitized_path=?,sanitized_method=?,sanitized_at=?,
+                                  sanitization_detail=? WHERE id=?""",
+                        (str(destination), method, now, detail, row["id"]),
+                    )
+                    db.execute(
+                        """INSERT INTO actions(
+                             created_at,action,file_id,source_path,destination_path,status,detail
+                           ) VALUES(?,?,?,?,?,'complete',?)""",
+                        (now, "sanitization_export", row["id"], str(source), str(destination),
+                         detail),
+                    )
+                except Exception as exc:
+                    failed += 1
+                    try:
+                        if destination.exists():
+                            destination.unlink()
+                    except OSError:
+                        pass
+                    db.execute(
+                        """INSERT INTO actions(
+                             created_at,action,file_id,source_path,destination_path,status,detail
+                           ) VALUES(?,?,?,?,?,'failed',?)""",
+                        (utcnow(), "sanitization_export", row["id"], str(source), str(destination), str(exc)[:500]),
+                    )
+                if (hardlinked + reflinked + copied + failed) % 50 == 0:
+                    db.commit()
+            db.execute(
+                "DELETE FROM settings WHERE key IN ('sanitization_export_token','sanitization_preview_json')"
+            )
+            db.commit()
+        self.export_catalog(self.output)
+        manifest = self.export_sanitization_manifest()
+        self._invalidate_summaries()
+        return {
+            "hardlinked": hardlinked, "reflinked": reflinked, "copied": copied,
+            "repaired": repaired, "repair_failed": repair_failed,
+            "failed": failed, "skipped": skipped, "manifest": str(manifest),
+        }
+
+    def export_sanitization_manifest(self) -> Path:
+        self.output.mkdir(parents=True, exist_ok=True)
+        csv_path = self.output / "sanitization_manifest.csv"
+        jsonl_path = self.output / "sanitization_manifest.jsonl"
+        fields = [
+            "id", "relative_path", "sanitized_path", "sanitized_method", "sanitized_at",
+            "sanitization_detail",
+            "content_hash", "validation", "media_kind", "media_origin", "sensitivity",
+            "curation_label", "known_good_match", "exact_group", "similar_group",
+            "exif_date", "video_creation_date", "filename_date", "date_confidence", "date_reason",
+        ]
+        with connect(self.db_path) as db, csv_path.open("w", newline="", encoding="utf-8") as csv_file, jsonl_path.open("w", encoding="utf-8") as json_file:
+            writer = csv.DictWriter(csv_file, fieldnames=fields)
+            writer.writeheader()
+            for row in db.execute("SELECT * FROM files WHERE sanitized_path IS NOT NULL ORDER BY id"):
+                item = {field: row[field] for field in fields}
+                writer.writerow(item)
+                json_file.write(json.dumps(item, ensure_ascii=False) + "\n")
+        self._normalize_output_file(csv_path)
+        self._normalize_output_file(jsonl_path)
+        return csv_path
+
     def build_curated_library(self) -> dict:
         """Copies explicit keepers and ungrouped files. Never modifies the recovered source."""
         if not self.allow_actions:
@@ -4694,6 +5458,8 @@ class Curator:
             "ai_caption", "ai_people", "ai_objects", "ai_ocr_text", "ai_tags", "ai_model", "ai_updated_at",
             "media_kind", "media_origin", "sensitivity", "video_duration", "video_width", "video_height",
             "video_fps", "video_codec", "audio_codec", "video_creation_date", "video_analysis_version",
+            "curation_label", "curation_label_source", "sanitized_path", "sanitized_method",
+            "sanitized_at", "sanitization_detail",
         ]
         with connect(self.db_path) as db, csv_path.open("w", newline="", encoding="utf-8") as csv_file, jsonl_path.open("w", encoding="utf-8") as json_file:
             writer = csv.DictWriter(csv_file, fieldnames=fields)

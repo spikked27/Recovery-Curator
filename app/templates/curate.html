@@ -1,0 +1,96 @@
+{% extends "base.html" %}{% block title %}Curate review library — Recovery Curator{% endblock %}{% block content %}
+<div class="page-heading"><div><span class="eyebrow">Light-touch recovery</span><h2>Build a clean library for human review</h2><p>Organize what can be supported safely. Do not attempt to recreate the owner's original folders.</p></div><span class="safety-badge">Source remains unchanged</span></div>
+
+<section class="card workflow-card">
+  <div class="workflow-steps">
+    <a href="#analyze" class="active-stage"><strong>1</strong><span>Analyze</span><small>Facts and relationships</small></a>
+    <a href="#assistant"><strong>2</strong><span>Label</span><small>Optional AI conversation</small></a>
+    <a href="#preview"><strong>3</strong><span>Preview</span><small>Automatic safe plan</small></a>
+    <a href="#build-library"><strong>4</strong><span>Build</span><small>Links and safe clones</small></a>
+  </div>
+  <p>Recovery Curator omits known-good copies and zero-byte placeholders, keeps one representative of every byte-identical group, retains visually similar variants, and groups the result by media type, broad source, label, and clearly identified date evidence.</p>
+</section>
+
+<section class="card" id="analyze">
+  <div class="section-heading"><div><span class="step-label">Step 1</span><h3>Refresh factual evidence</h3></div><button id="start-sanitization" {% if status.running or not summary.files %}disabled{% endif %}>Analyze for sanitization</button></div>
+  <p class="muted">This validates pending media, completes video metadata, refreshes exact known-good matches, and links zero-byte filenames to surviving content. It does not copy or modify files.</p>
+  <div class="live-job {% if status.running %}is-running{% endif %}" id="sanitize-job">
+    <div class="job-heading"><div><span class="step-label">Current activity</span><h3 id="sanitize-message">{{ status.message }}</h3></div><span id="sanitize-state" class="pill {{ 'good' if status.running else '' }}">{{ 'Running' if status.running else status.phase|replace('_',' ')|title }}</span></div>
+    <progress id="sanitize-progress" max="{{ status.total or 1 }}" value="{{ status.processed or 0 }}"></progress>
+    <p class="muted" id="sanitize-detail">{{ status.processed }}/{{ status.total }} · {{ status.rate or 0 }} items/s</p>
+    <p class="bad" id="sanitize-error" {% if not status.error %}hidden{% endif %}>{{ status.error or '' }}</p>
+  </div>
+</section>
+
+<section class="card" id="assistant">
+  <div class="section-heading"><div><span class="step-label">Step 2 · Optional</span><h3>Talk with the recovery assistant</h3><p class="muted">Use conversation to identify broad collections and sources. AI cannot reconstruct folders or touch files.</p></div><span class="pill {{ 'good' if ai_settings.enabled else 'warn' }}">{{ (ai_settings.provider_name ~ ' · ' ~ ai_settings.model) if ai_settings.enabled else 'AI not configured' }}</span></div>
+  {% if not ai_settings.enabled %}<div class="notice">Configure a provider once, then return here for the conversational workflow. <a href="/reconstruction?step=ai#ai-provider">Open advanced AI connection settings</a>.</div>{% endif %}
+  <div class="subcard">
+    <div id="curation-chat" class="chat-thread"></div>
+    <form id="curation-chat-form" class="chat-compose">
+      <textarea id="curation-chat-input" maxlength="4000" placeholder="For example: Folders containing SnapSave are exports from Snapchat. Help me separate those from ordinary downloads." {% if not ai_settings.enabled %}disabled{% endif %}></textarea>
+      <button {% if not ai_settings.enabled %}disabled{% endif %}>Send</button>
+    </form>
+    <div id="curation-chat-status" class="connection-result" role="status" aria-live="polite">The assistant receives bounded catalog summaries and representative filenames, not the recovered files themselves.</div>
+  </div>
+  <div id="curation-proposals" class="suggestion-list"></div>
+  <details class="advanced-settings"><summary>Advanced AI tools</summary><p>Direct photo/video analysis remains available when filenames and metadata are not enough. Packet and dossier exchange are retained only for compatibility and are not part of this workflow.</p><a class="button ghost" href="/reconstruction?step=ai">Provider settings and direct media analysis</a></details>
+</section>
+
+<section class="card" id="preview">
+  <div class="section-heading"><div><span class="step-label">Step 3</span><h3>Automatic sanitization preview</h3><p class="muted">No per-file approvals are required.</p></div><form method="post" action="/curate/preview"><button>Generate current build preview</button></form></div>
+  <div class="metric-grid compact workspace-metrics">
+    <div><div class="metric good" id="preview-included">{{ preview.included }}</div><div class="muted">unique files included</div></div>
+    <div><div class="metric" id="preview-known-good">{{ preview.known_good_excluded }}</div><div class="muted">known-good copies omitted</div></div>
+    <div><div class="metric" id="preview-duplicates">{{ preview.duplicate_excluded }}</div><div class="muted">exact duplicates omitted</div></div>
+    <div><div class="metric" id="preview-zero">{{ preview.zero_evidence }}</div><div class="muted">zero-byte clues only</div></div>
+    <div><div class="metric warn" id="preview-repairs">{{ preview.repair_candidates }}</div><div class="muted">safe date repairs</div></div>
+    <div><div class="metric warn" id="preview-corrupt">{{ preview.corrupt_included }}</div><div class="muted">isolated for attention</div></div>
+  </div>
+  {% if preview.included and not preview.same_filesystem %}<div class="notice bad"><strong>The source and curated output are not on the same filesystem.</strong> Hardlinks will not be possible. Map Curated Output to the same direct Unraid disk/filesystem as the recovered source to avoid duplicating file data.</div>
+  {% elif preview.included %}<div class="notice good"><strong>Space-saving layout available.</strong> {{ preview.hardlink_candidates }} unchanged files can be hardlinked. {{ preview.independent_candidates }} files require an independent reflink or copy because they need repair or cross a filesystem boundary.</div>{% endif %}
+  <p><strong>{{ preview.total_bytes_human }}</strong> of unique content is represented. Independent files account for at most <strong>{{ preview.independent_bytes_human }}</strong>; reflinks consume space only as repaired blocks diverge.</p>
+  <details class="review-drawer" {% if preview.collections %}open{% endif %}><summary>Planned top-level collections</summary><div class="table-wrap"><table><thead><tr><th>Collection</th><th>Files</th><th>Logical size</th></tr></thead><tbody>
+    {% for item in preview.collections %}<tr><td>{{ item.name }}</td><td>{{ item.files }}</td><td>{{ item.bytes_human }}</td></tr>{% endfor %}
+  </tbody></table></div></details>
+</section>
+
+<section class="card" id="build-library">
+  <div class="section-heading"><div><span class="step-label">Step 4</span><h3>Build the review library</h3></div><span class="safety-badge">Explicit confirmation required</span></div>
+  <p>Unchanged files use hardlinks when possible. Files receiving a high-confidence date repair use independent reflink clones. Existing output files are never overwritten, and every result is recorded in CSV and JSONL manifests.</p>
+  {% if not allow_actions %}<div class="notice">Set <strong>Allow Write Actions</strong> to <code>true</code> and restart the container when you are ready. The recovered source can remain read-only.</div>{% endif %}
+  {% if preview.authorized %}
+  <form method="post" action="/curate/build" class="stacked-form" onsubmit="return confirm('Build the sanitized review library now? The recovered source will remain unchanged.');">
+    <input type="hidden" name="token" value="{{ preview.token }}">
+    <label class="checkbox-label"><input type="checkbox" name="allow_copy_fallback" value="1"> Allow full-copy fallback when neither a hardlink nor reflink is possible</label>
+    <label>Type <strong>CURATE</strong> to confirm <input name="confirmation" required autocomplete="off" pattern="CURATE"></label>
+    <button {% if not allow_actions or not preview.included %}disabled{% endif %}>Build sanitized review library</button>
+  </form>
+  {% else %}<p class="muted">Generate a current preview after the latest scan or AI labeling change to unlock the build.</p>{% endif %}
+</section>
+
+<style>
+.workflow-steps{grid-template-columns:repeat(4,1fr)}
+.chat-thread{display:flex;flex-direction:column;gap:9px;max-height:440px;overflow:auto;padding:4px}.chat-message{max-width:82%;padding:10px 12px;border-radius:11px;background:#172535;white-space:pre-wrap}.chat-message.user{align-self:flex-end;background:#1d4774}.chat-message.assistant{align-self:flex-start}.chat-compose{display:grid;grid-template-columns:1fr auto;gap:9px;margin-top:12px}.chat-compose textarea{min-height:78px}.chat-compose button{align-self:end}.proposal-buttons{display:flex;gap:7px}@media(max-width:700px){.chat-message{max-width:94%}.chat-compose{grid-template-columns:1fr}.chat-compose button{width:100%}}
+</style>
+<script>
+const initialConversation={{ conversation|tojson }};
+const chat=document.getElementById('curation-chat');const proposals=document.getElementById('curation-proposals');const chatForm=document.getElementById('curation-chat-form');const chatInput=document.getElementById('curation-chat-input');const chatStatus=document.getElementById('curation-chat-status');
+function appendText(parent,tag,text,className=''){const node=document.createElement(tag);node.textContent=text;if(className)node.className=className;parent.appendChild(node);return node}
+function renderConversation(value){
+  chat.replaceChildren();for(const item of value.messages||[]){appendText(chat,'div',item.content,`chat-message ${item.role}`)}chat.scrollTop=chat.scrollHeight;
+  proposals.replaceChildren();for(const item of (value.proposals||[]).filter(item=>item.status==='pending')){
+    const card=document.createElement('article');card.className='suggestion-card';const body=document.createElement('div');appendText(body,'span',`${item.confidence}% confidence`,'pill');appendText(body,'strong',`${item.match_text} → ${item.facet_type}: ${item.value}`);appendText(body,'span',`${Number(item.affected_files).toLocaleString()} file(s) affected · ${item.reason||'No reason supplied.'}`,'muted');card.appendChild(body);const actions=document.createElement('div');actions.className='proposal-buttons';const apply=appendText(actions,'button','Apply rule');const reject=appendText(actions,'button','Dismiss','secondary');apply.onclick=()=>reviewProposal(item.id,'accepted');reject.onclick=()=>reviewProposal(item.id,'rejected');card.appendChild(actions);proposals.appendChild(card)
+  }
+}
+async function api(url,body){const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});let data={};try{data=await response.json()}catch(error){throw new Error(`Server returned ${response.status}.`)}if(!response.ok||data.ok===false)throw new Error(data.error||`Request failed (${response.status}).`);return data}
+chatForm.addEventListener('submit',async event=>{event.preventDefault();const message=chatInput.value.trim();if(!message)return;const button=chatForm.querySelector('button');button.disabled=true;chatInput.disabled=true;chatStatus.textContent='The recovery assistant is reviewing the bounded catalog context…';chatStatus.className='connection-result';try{const data=await api('/api/curate/assistant/message',{message});chatInput.value='';renderConversation(data.conversation);chatStatus.textContent='Reply received. Broad labeling rules still require your confirmation below.';chatStatus.className='connection-result success'}catch(error){chatStatus.textContent=error.message;chatStatus.className='connection-result error'}finally{button.disabled=false;chatInput.disabled=false;chatInput.focus()}});
+async function reviewProposal(id,decision){chatStatus.textContent=decision==='accepted'?'Applying the confirmed label rule…':'Dismissing the suggestion…';try{const data=await api(`/api/curate/assistant/proposal/${id}`,{decision});renderConversation(data.result.conversation);chatStatus.textContent=decision==='accepted'?`Rule applied to ${data.result.affected.toLocaleString()} file(s). Generate a fresh preview when the conversation is done.`:'Suggestion dismissed.';chatStatus.className='connection-result success'}catch(error){chatStatus.textContent=error.message;chatStatus.className='connection-result error'}}
+renderConversation(initialConversation);
+
+const analyze=document.getElementById('start-sanitization');const message=document.getElementById('sanitize-message');const state=document.getElementById('sanitize-state');const progress=document.getElementById('sanitize-progress');const detail=document.getElementById('sanitize-detail');const errorNode=document.getElementById('sanitize-error');let running={{ 'true' if status.running else 'false' }};
+function renderStatus(s){running=Boolean(s.running);message.textContent=s.message||'Ready';state.textContent=s.running?'Running':String(s.phase||'ready').replaceAll('_',' ');state.className=`pill ${s.running||s.phase==='complete'?'good':''}`;if(s.total){progress.max=s.total;progress.value=s.processed||0}else if(s.running){progress.removeAttribute('value')}else{progress.max=1;progress.value=s.phase==='complete'?1:0}detail.textContent=`${s.processed||0}/${s.total||0} · ${s.rate||0} items/s`;errorNode.textContent=s.error||'';errorNode.hidden=!s.error;analyze.disabled=s.running}
+async function pollStatus(){const response=await fetch('/api/status');const data=await response.json();const wasRunning=running;renderStatus(data.status);if(data.status.running)setTimeout(pollStatus,1500);else if(wasRunning)location.reload()}
+analyze.addEventListener('click',async()=>{analyze.disabled=true;try{const data=await api('/api/curate/analyze',{});renderStatus(data.status);setTimeout(pollStatus,800)}catch(error){errorNode.textContent=error.message;errorNode.hidden=false;analyze.disabled=false}});if(running)pollStatus();
+</script>
+{% endblock %}

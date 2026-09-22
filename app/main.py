@@ -415,6 +415,7 @@ def reconstruction():
     latest_structure = next(
         (run for run in ai_runs if run.get("request_kind") == "structure_analysis"), None,
     )
+
     if not reconstruction_summary.get("proposals"):
         recommended_step = "baseline"
     elif attention.get("structure_suggestions") or attention.get("review_questions"):
@@ -472,6 +473,83 @@ def reconstruction():
         structure_suggestions=(curator.list_structure_suggestions(limit=100)
                                if active_step in {"ai", "review"} else []),
     )
+
+
+@app.get("/curate")
+def curate():
+    preview = curator.sanitization_overview()
+    return render_template(
+        "curate.html", status=curator.status(), summary=curator.summary(),
+        preview=preview, allow_actions=curator.allow_actions,
+        ai_settings=curator.ai_provider_settings(),
+        conversation=curator.curation_conversation(),
+    )
+
+
+@app.post("/api/curate/analyze")
+def api_start_sanitization_analysis():
+    try:
+        if not curator.start_sanitization_analysis():
+            raise RuntimeError("Another scan or analysis job is already running.")
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 409
+    return jsonify({"ok": True, "status": curator.status()})
+
+
+@app.post("/curate/preview")
+def preview_sanitized_library():
+    try:
+        curator.sanitization_preview(authorize=True)
+    except Exception as exc:
+        return render_template(
+            "message.html", title="Preview not created", message=str(exc),
+        ), 400
+    return redirect(url_for("curate") + "#build-library")
+
+
+@app.post("/curate/build")
+def build_sanitized_library():
+    if request.form.get("confirmation", "").strip() != "CURATE":
+        return render_template(
+            "message.html", title="Build not started", message="Type CURATE exactly to confirm.",
+        ), 400
+    try:
+        result = curator.export_sanitized_library(
+            request.form.get("token", ""), request.form.get("allow_copy_fallback") == "1",
+        )
+    except Exception as exc:
+        return render_template(
+            "message.html", title="Review library not built", message=str(exc),
+        ), 400
+    return render_template(
+        "message.html", title="Review library built",
+        message=(
+            f"Created {result['hardlinked']:,} hardlinks, {result['reflinked']:,} reflink clones, "
+            f"and {result['copied']:,} full copies. Applied {result['repaired']:,} metadata date "
+            f"repairs; {result['repair_failed']:,} repairs and {result['failed']:,} exports failed. "
+            f"Manifest: {result['manifest']}"
+        ),
+    )
+
+
+@app.post("/api/curate/assistant/message")
+def api_curation_assistant_message():
+    values = request.get_json(silent=True) or {}
+    try:
+        conversation = curator.send_curation_message(str(values.get("message") or ""))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "conversation": conversation, "preview": curator.sanitization_overview()})
+
+
+@app.post("/api/curate/assistant/proposal/<int:proposal_id>")
+def api_review_curation_proposal(proposal_id: int):
+    values = request.get_json(silent=True) or {}
+    try:
+        result = curator.review_curation_proposal(proposal_id, str(values.get("decision") or ""))
+    except Exception as exc:
+        return jsonify({"ok": False, "error": str(exc)}), 400
+    return jsonify({"ok": True, "result": result, "preview": curator.sanitization_overview()})
 
 
 @app.post("/reconstruction/start")

@@ -1,5 +1,6 @@
 import os
 import csv
+import datetime as dt
 import json
 import stat
 import tempfile
@@ -167,6 +168,91 @@ class CuratorTests(unittest.TestCase):
             curator.decide(matches[0]["id"], "keep")
             result = curator.build_curated_library()
             self.assertEqual(result["exported"], 1)
+
+    def test_sanitization_build_omits_known_good_and_exact_duplicates_and_uses_safe_links(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config, known_good = (
+                root / name for name in ("source", "output", "quarantine", "config", "known-good")
+            )
+            for directory in (source, output, quarantine, config, known_good):
+                directory.mkdir()
+            trusted = known_good / "Trusted"
+            trusted.mkdir()
+            trusted_payload = b"already safely backed up"
+            (trusted / "trusted-original.bin").write_bytes(trusted_payload)
+            (source / "known-good-copy.bin").write_bytes(trusted_payload)
+            plain = source / "plain.bin"
+            plain.write_bytes(b"unique unchanged content")
+
+            dated = source / "IMG_20220102_030405.jpg"
+            Image.new("RGB", (80, 60), (25, 80, 140)).save(dated)
+            duplicate_folder = source / "duplicates"
+            duplicate_folder.mkdir()
+            (duplicate_folder / "copy.jpg").write_bytes(dated.read_bytes())
+
+            live_folder = source / "surviving"
+            zero_folder = source / "placeholders"
+            live_folder.mkdir()
+            zero_folder.mkdir()
+            live = live_folder / "legacy-name.jpg"
+            placeholder = zero_folder / "legacy-name.jpg"
+            Image.new("RGB", (90, 70), (80, 30, 20)).save(live)
+            placeholder.touch()
+            recovered_timestamp = int(dt.datetime(2018, 4, 5, 12, 30, tzinfo=dt.timezone.utc).timestamp())
+            os.utime(placeholder, (recovered_timestamp, recovered_timestamp))
+
+            curator = Curator(
+                source, output, quarantine, config / "catalog.sqlite3",
+                allow_actions=True, reference_root=known_good,
+            )
+            curator.add_reference_selection("Trusted")
+            curator.scan()
+            preview = curator.build_sanitization_foundation()
+
+            self.assertEqual(preview["known_good_excluded"], 1)
+            self.assertEqual(preview["duplicate_excluded"], 1)
+            self.assertEqual(preview["zero_evidence"], 1)
+            self.assertEqual(preview["included"], 3)
+            self.assertGreaterEqual(preview["repair_candidates"], 2)
+            self.assertGreaterEqual(preview["zero_date_repairs"], 1)
+            self.assertTrue(preview["same_filesystem"])
+
+            authorized = curator.sanitization_preview(authorize=True)
+            with patch("app.curator.apply_date_metadata", return_value=True):
+                result = curator.export_sanitized_library(
+                    authorized["token"], allow_copy_fallback=True,
+                )
+            self.assertEqual(result["failed"], 0)
+            self.assertGreaterEqual(result["hardlinked"], 1)
+            self.assertGreaterEqual(result["repaired"], 2)
+            self.assertTrue((output / "sanitization_manifest.csv").is_file())
+            self.assertFalse(any(path.name == "known-good-copy.bin" for path in output.rglob("*")))
+            self.assertEqual(len(list(output.rglob("*.jpg"))), 2)
+
+            plain_export = next(path for path in output.rglob("plain.bin"))
+            self.assertEqual(plain.stat().st_ino, plain_export.stat().st_ino)
+            legacy_export = next(path for path in output.rglob("legacy-name.jpg"))
+            self.assertNotEqual(live.stat().st_ino, legacy_export.stat().st_ino)
+            self.assertEqual(int(legacy_export.stat().st_mtime), recovered_timestamp)
+
+            overview = curator.sanitization_overview()
+            self.assertFalse(overview["authorized"])
+            self.assertEqual(overview["included"], 3)
+
+    def test_sanitization_rejects_output_nested_in_recovered_source(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source = root / "source"
+            output = source / "curated-output"
+            quarantine = root / "quarantine"
+            config = root / "config"
+            for directory in (source, output, quarantine, config):
+                directory.mkdir(parents=True, exist_ok=True)
+            (source / "recovered.txt").write_text("recovered", encoding="utf-8")
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+            with self.assertRaisesRegex(ValueError, "separate folder"):
+                curator.scan()
 
     def test_reset_catalog_preserves_library_files_but_clears_active_scan_settings(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -367,6 +453,9 @@ class CuratorTests(unittest.TestCase):
             self.assertIn("idx_files_relative_path", indexes)
             self.assertIn("idx_files_media_kind", indexes)
             self.assertIn("idx_files_media_origin", indexes)
+            self.assertTrue({
+                "curation_label", "sanitized_path", "sanitized_method", "sanitization_detail",
+            } <= columns)
             self.assertEqual(tuple(migrated), ("video", "unknown", "Videos"))
 
     def test_existing_reconstruction_tables_migrate_before_new_indexes(self):
@@ -943,6 +1032,46 @@ class CuratorTests(unittest.TestCase):
             self.assertTrue(result["package"]["complete"])
             with connect(config / "catalog.sqlite3") as db:
                 self.assertEqual(db.execute("SELECT COUNT(*) FROM ai_packet_imports").fetchone()[0], 1)
+
+    def test_conversational_curation_stages_and_applies_broad_label_rules(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            snaps = source / "SnapSave Export"
+            snaps.mkdir()
+            (snaps / "one.jpg").write_bytes(b"first recovered snap")
+            (snaps / "two.mp4").write_bytes(b"second recovered snap")
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+            curator.scan()
+            curator.save_ai_provider_settings({
+                "provider_id": "ollama", "provider_name": "Local Assistant",
+                "endpoint": "http://ai.local:11434/v1", "model": "test-model", "enabled": True,
+            })
+            ai_result = {
+                "reply": "That path is strong evidence for a Snapchat export collection.",
+                "proposals": [{
+                    "match_text": "SnapSave", "facet_type": "collection",
+                    "value": "Snapchat Exports", "confidence": 96,
+                    "reason": "The owner confirmed the application export folder.",
+                }],
+            }
+            with patch("app.ai.AIProviderClient.curation_conversation", return_value=ai_result):
+                conversation = curator.send_curation_message(
+                    "SnapSave Export is where I saved Snapchat exports."
+                )
+            proposal = conversation["proposals"][0]
+            self.assertEqual(proposal["affected_files"], 2)
+            applied = curator.review_curation_proposal(proposal["id"], "accepted")
+            self.assertEqual(applied["affected"], 2)
+            with connect(config / "catalog.sqlite3") as db:
+                labels = {row[0] for row in db.execute(
+                    "SELECT curation_label FROM files WHERE curation_label IS NOT NULL"
+                )}
+            self.assertEqual(labels, {"Snapchat Exports"})
 
     def test_reconstruction_review_dry_run_and_export_are_safety_gated(self):
         with tempfile.TemporaryDirectory() as temp:

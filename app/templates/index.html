@@ -43,17 +43,15 @@
     <form id="cancel-scan-form" method="post" action="/scan/stop">
       <button id="cancel-scan" class="danger" {% if not status.running %}disabled{% endif %}>Cancel Scan</button>
     </form>
-    <form method="post" action="/build-library">
-      <button class="secondary">Build curated library</button>
-    </form>
+    <a class="button secondary" href="/curate">Open curation workflow</a>
   </div>
   <p class="muted">Cancel Scan safely stops after the current checkpoint. Completed catalog work is retained. Resume always rechecks the source directory from the beginning, but unchanged files reuse their saved analysis and hashes.</p>
 </section>
 
 <section class="card" style="margin-top:18px">
-  <h2>Reconstruction and media analysis</h2>
-  <p>Classify photos and videos with multiple facets, review folder names found in the recovery, add context clues, and build a non-destructive proposed folder tree.</p>
-  <a class="button" href="/reconstruction">Open reconstruction workspace</a>
+  <h2>Sanitized review library</h2>
+  <p>Automatically omit known-good copies and exact duplicates, use zero-byte files as evidence, and build a space-saving library organized for human review—without claiming to recreate the original folders.</p>
+  <a class="button" href="/curate">Open curation workflow</a>
 </section>
 
 <section class="card" style="margin-top:18px">
@@ -66,7 +64,7 @@
     <p>The root is mounted, but no backup folders are selected yet.</p>
   {% endif %}
   <a class="button secondary" href="/references">Choose known-good folders</a>
-  <p class="muted">The next scan compares exact content hashes. Matching recovered files remain untouched but are excluded from curated output unless you explicitly mark one Keep.</p>
+  <p class="muted">The next scan compares exact content hashes. Matching recovered files remain untouched and are omitted from the sanitation workflow's review library.</p>
 </section>
 
 <section class="card" style="margin-top:18px">
