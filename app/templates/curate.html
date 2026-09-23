@@ -1,19 +1,19 @@
 {% extends "base.html" %}{% block title %}Curate review library — Recovery Curator{% endblock %}{% block content %}
-<div class="page-heading"><div><span class="eyebrow">Light-touch recovery</span><h2>Build a clean library for human review</h2><p>Organize what can be supported safely. Do not attempt to recreate the owner's original folders.</p></div><span class="safety-badge">Source remains unchanged</span></div>
+<div class="page-heading"><div><span class="eyebrow">Folder-preserving sanitation</span><h2>Build a cleaner mirror for manual review</h2><p>Keep the recovered folder tree exactly as it is while removing only well-supported redundancy and repairing safe metadata gaps.</p></div><span class="safety-badge">Source remains unchanged</span></div>
 
 <section class="card workflow-card">
   <div class="workflow-steps">
     <a href="#analyze" class="active-stage"><strong>1</strong><span>Analyze</span><small>Facts and relationships</small></a>
-    <a href="#assistant"><strong>2</strong><span>Label</span><small>Optional AI conversation</small></a>
+    <a href="#assistant"><strong>2</strong><span>Annotate</span><small>Optional AI conversation</small></a>
     <a href="#preview"><strong>3</strong><span>Preview</span><small>Automatic safe plan</small></a>
     <a href="#build-library"><strong>4</strong><span>Build</span><small>Links and safe clones</small></a>
   </div>
-  <p>Recovery Curator omits known-good copies and zero-byte placeholders, keeps one representative of every byte-identical group, retains visually similar variants, and groups the result by media type, broad source, label, and clearly identified date evidence.</p>
+  <p>Recovery Curator mirrors every discovered folder, including empty folders. It omits known-good copies and zero-byte placeholders, keeps one byte-identical representative, and removes a lower-resolution photo only when dimensions, aspect ratio, and perceptual evidence all agree. Nothing is reorganized.</p>
 </section>
 
 <section class="card" id="analyze">
   <div class="section-heading"><div><span class="step-label">Step 1</span><h3>Refresh factual evidence</h3></div><button id="start-sanitization" {% if status.running or not summary.files %}disabled{% endif %}>Analyze for sanitization</button></div>
-  <p class="muted">This validates pending media, extracts photo dates, camera details and GPS metadata, completes video metadata, refreshes exact known-good matches, and links zero-byte filenames to surviving content. It does not copy or modify files.</p>
+  <p class="muted">This validates pending media, extracts photo dates, camera details and GPS metadata, refreshes exact known-good matches, links zero-byte filenames to surviving content, and finds only strict lower-resolution photo copies. It does not copy or modify files.</p>
   <div class="live-job {% if status.running %}is-running{% endif %}" id="sanitize-job">
     <div class="job-heading"><div><span class="step-label">Current activity</span><h3 id="sanitize-message">{{ status.message }}</h3></div><span id="sanitize-state" class="pill {{ 'good' if status.running else '' }}">{{ 'Running' if status.running else status.phase|replace('_',' ')|title }}</span></div>
     <progress id="sanitize-progress" max="{{ status.total or 1 }}" value="{{ status.processed or 0 }}"></progress>
@@ -23,12 +23,12 @@
 </section>
 
 <section class="card" id="assistant">
-  <div class="section-heading"><div><span class="step-label">Step 2 · Optional</span><h3>Talk with the recovery assistant</h3><p class="muted">Use conversation to identify broad collections and sources. AI cannot reconstruct folders or touch files.</p></div><span class="pill {{ 'good' if ai_settings.enabled else 'warn' }}">{{ (ai_settings.provider_name ~ ' · ' ~ ai_settings.model) if ai_settings.enabled else 'AI not configured' }}</span></div>
+  <div class="section-heading"><div><span class="step-label">Step 2 · Optional</span><h3>Talk with the recovery assistant</h3><p class="muted">Use conversation to add searchable labels, sensitivity notes, or context for your later review. AI labels never move or omit files and are not required to build.</p></div><span class="pill {{ 'good' if ai_settings.enabled else 'warn' }}">{{ (ai_settings.provider_name ~ ' · ' ~ ai_settings.model) if ai_settings.enabled else 'AI not configured' }}</span></div>
   {% if not ai_settings.enabled %}<div class="notice">Configure a provider once, then return here for the conversational workflow. <a href="/reconstruction?step=ai#ai-provider">Open advanced AI connection settings</a>.</div>{% endif %}
   <div class="subcard">
     <div id="curation-chat" class="chat-thread"></div>
     <form id="curation-chat-form" class="chat-compose">
-      <textarea id="curation-chat-input" maxlength="4000" placeholder="For example: Folders containing SnapSave are exports from Snapchat. Help me separate those from ordinary downloads." {% if not ai_settings.enabled %}disabled{% endif %}></textarea>
+      <textarea id="curation-chat-input" maxlength="4000" placeholder="For example: Label filenames containing SnapSave as Snapchat exports so I can find them during manual review." {% if not ai_settings.enabled %}disabled{% endif %}></textarea>
       <button {% if not ai_settings.enabled %}disabled{% endif %}>Send</button>
     </form>
     <div id="curation-chat-status" class="connection-result" role="status" aria-live="polite">The assistant receives bounded catalog summaries, representative filenames, date/camera metadata, and neighborhood-scale GPS areas—not the recovered files themselves.</div>
@@ -52,30 +52,34 @@
     <div><div class="metric" id="preview-known-good">{{ preview.known_good_excluded }}</div><div class="muted">known-good copies omitted</div></div>
     <div><div class="metric" id="preview-duplicates">{{ preview.duplicate_excluded }}</div><div class="muted">exact duplicates omitted</div></div>
     <div><div class="metric" id="preview-zero">{{ preview.zero_evidence }}</div><div class="muted">zero-byte clues only</div></div>
-    <div><div class="metric warn" id="preview-repairs">{{ preview.repair_candidates }}</div><div class="muted">safe date repairs</div></div>
-    <div><div class="metric warn" id="preview-corrupt">{{ preview.corrupt_included }}</div><div class="muted">isolated for attention</div></div>
+    <div><div class="metric" id="preview-derivatives">{{ preview.derivative_excluded or 0 }}</div><div class="muted">strict smaller copies omitted</div></div>
+    <div><div class="metric warn" id="preview-repairs">{{ preview.repair_candidates }}</div><div class="muted">safe metadata repairs</div></div>
+    <div><div class="metric warn" id="preview-corrupt">{{ preview.corrupt_included }}</div><div class="muted">damaged files retained in place</div></div>
+    <div><div class="metric" id="preview-directories">{{ preview.preserved_directories or 0 }}</div><div class="muted">source folders preserved</div></div>
   </div>
-  {% if preview.stale %}<div class="notice"><strong>Labels changed since the last exact preview.</strong> The overview counts are retained for fast page loading, but generate a fresh preview before building so destinations and collision checks are current.</div>{% endif %}
+  {% if preview.stale %}<div class="notice"><strong>Sanitation evidence changed since the last exact preview.</strong> Generate a fresh preview before building so omission, repair, and collision checks are current.</div>{% endif %}
+  {% if preview.collisions %}<div class="notice bad"><strong>{{ preview.collisions }} output path conflict(s) found.</strong> Use an empty Curated Output folder. Recovery Curator will never overwrite or silently rename an existing file.</div>{% endif %}
+  {% if preview.legacy_output_warning %}<div class="notice bad"><strong>The Curated Output folder appears to contain an older or unrelated layout.</strong> Point Curated Output at a new empty folder before building this folder-preserving mirror. Nothing is deleted automatically.</div>{% endif %}
   {% if preview.included and not preview.same_filesystem %}<div class="notice bad"><strong>The source and curated output are not on the same filesystem.</strong> Hardlinks will not be possible. Map Curated Output to the same direct Unraid disk/filesystem as the recovered source to avoid duplicating file data.</div>
   {% elif preview.included %}<div class="notice good"><strong>Space-saving layout available.</strong> {{ preview.hardlink_candidates }} unchanged files can be hardlinked. {{ preview.independent_candidates }} files require an independent reflink or copy because they need repair or cross a filesystem boundary.</div>{% endif %}
   <p><strong>{{ preview.total_bytes_human }}</strong> of unique content is represented. Independent files account for at most <strong>{{ preview.independent_bytes_human }}</strong>; reflinks consume space only as repaired blocks diverge.</p>
-  <details class="review-drawer" {% if preview.collections %}open{% endif %}><summary>Planned top-level collections</summary><div class="table-wrap"><table><thead><tr><th>Collection</th><th>Files</th><th>Logical size</th></tr></thead><tbody>
+  <details class="review-drawer" {% if preview.collections %}open{% endif %}><summary>Preserved source roots</summary><div class="table-wrap"><table><thead><tr><th>Existing top-level folder</th><th>Included files</th><th>Logical size</th></tr></thead><tbody>
     {% for item in preview.collections %}<tr><td>{{ item.name }}</td><td>{{ item.files }}</td><td>{{ item.bytes_human }}</td></tr>{% endfor %}
   </tbody></table></div></details>
 </section>
 
 <section class="card" id="build-library">
   <div class="section-heading"><div><span class="step-label">Step 4</span><h3>Build the review library</h3></div><span class="safety-badge">Explicit confirmation required</span></div>
-  <p>Unchanged files use hardlinks when possible. Files receiving a high-confidence date repair use independent reflink clones. Existing output files are never overwritten, and every result is recorded in CSV and JSONL manifests.</p>
+  <p>The source folder tree is reproduced without renaming or regrouping. Unchanged files use hardlinks when possible. Any file receiving inherited EXIF, a high-confidence date, or a recovered timestamp first becomes an independent reflink clone. Existing output files are never overwritten; included and omitted files are recorded in separate CSV and JSONL manifests.</p>
   {% if not allow_actions %}<div class="notice">Set <strong>Allow Write Actions</strong> to <code>true</code> and restart the container when you are ready. The recovered source can remain read-only.</div>{% endif %}
   {% if preview.authorized %}
   <form method="post" action="/curate/build" class="stacked-form" onsubmit="return confirm('Build the sanitized review library now? The recovered source will remain unchanged.');">
     <input type="hidden" name="token" value="{{ preview.token }}">
     <label class="checkbox-label"><input type="checkbox" name="allow_copy_fallback" value="1"> Allow full-copy fallback when neither a hardlink nor reflink is possible</label>
     <label>Type <strong>CURATE</strong> to confirm <input name="confirmation" required autocomplete="off" pattern="CURATE"></label>
-    <button {% if not allow_actions or not preview.included %}disabled{% endif %}>Build sanitized review library</button>
+    <button {% if not allow_actions or not preview.included or preview.collisions or preview.legacy_output_warning %}disabled{% endif %}>Build sanitized review library</button>
   </form>
-  {% else %}<p class="muted">Generate a current preview after the latest scan or AI labeling change to unlock the build.</p>{% endif %}
+  {% else %}<p class="muted">Generate a current preview after the latest sanitation analysis to unlock the build.</p>{% endif %}
 </section>
 
 <style>
@@ -96,7 +100,7 @@ function renderConversation(value){
 async function api(url,body){const response=await fetch(url,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});let data={};try{data=await response.json()}catch(error){throw new Error(`Server returned ${response.status}.`)}if(!response.ok||data.ok===false)throw new Error(data.error||`Request failed (${response.status}).`);return data}
 function describeTurn(turn){if(!turn)return 'No changes are waiting for confirmation.';if(turn.staged)return `${turn.searches_run?`Searched the complete catalog ${turn.searches_run} time(s). `:''}${turn.staged} suggestion(s) are staged below for your confirmation.${turn.invalid?` ${turn.invalid} additional suggestion(s) could not be staged; see the validation section.`:''}`;if(turn.invalid)return `No changes were staged. ${turn.invalid} suggestion(s) failed validation; the exact reasons are shown below.`;return `${turn.searches_run?`Searched the complete catalog ${turn.searches_run} time(s). `:''}The assistant proposed no catalog changes in this reply. Answer its question or continue the conversation.`}
 chatForm.addEventListener('submit',async event=>{event.preventDefault();const message=chatInput.value.trim();if(!message)return;const button=chatForm.querySelector('button');button.disabled=true;chatInput.disabled=true;chatStatus.textContent='The recovery assistant is reviewing context and may search the complete catalog…';chatStatus.className='connection-result';try{const data=await api('/api/curate/assistant/message',{message});chatInput.value='';renderConversation(data.conversation);const summary=describeTurn(data.conversation.turn);chatStatus.textContent=summary;chatStatus.className=`connection-result ${data.conversation.turn?.invalid&&!data.conversation.turn?.staged?'error':'success'}`;turnSummary.textContent=summary;turnSummary.className=chatStatus.className}catch(error){chatStatus.textContent=error.message;chatStatus.className='connection-result error'}finally{button.disabled=false;chatInput.disabled=false;chatInput.focus()}});
-async function reviewProposal(id,decision){const verbs={accepted:'Applying the confirmed suggestion…',rejected:'Dismissing the suggestion…',undone:'Undoing the applied rule…'};chatStatus.textContent=verbs[decision]||'Updating suggestion…';try{const data=await api(`/api/curate/assistant/proposal/${id}`,{decision});renderConversation(data.result.conversation);chatStatus.textContent=decision==='accepted'?`Suggestion applied to ${data.result.affected.toLocaleString()} file(s). Generate a fresh preview when the conversation is done.`:decision==='undone'?`Rule undone for up to ${data.result.affected.toLocaleString()} file(s).`:'Suggestion dismissed.';chatStatus.className='connection-result success';turnSummary.textContent=chatStatus.textContent;turnSummary.className=chatStatus.className}catch(error){chatStatus.textContent=error.message;chatStatus.className='connection-result error'}}
+async function reviewProposal(id,decision){const verbs={accepted:'Applying the confirmed suggestion…',rejected:'Dismissing the suggestion…',undone:'Undoing the applied rule…'};chatStatus.textContent=verbs[decision]||'Updating suggestion…';try{const data=await api(`/api/curate/assistant/proposal/${id}`,{decision});renderConversation(data.result.conversation);chatStatus.textContent=decision==='accepted'?`Annotation applied to ${data.result.affected.toLocaleString()} file(s). It will not change the mirrored folder layout.`:decision==='undone'?`Annotation undone for up to ${data.result.affected.toLocaleString()} file(s).`:'Suggestion dismissed.';chatStatus.className='connection-result success';turnSummary.textContent=chatStatus.textContent;turnSummary.className=chatStatus.className}catch(error){chatStatus.textContent=error.message;chatStatus.className='connection-result error'}}
 renderConversation(initialConversation);
 turnSummary.textContent=initialConversation.proposals?.some(item=>item.status==='pending')?'Suggestions are waiting for confirmation below.':'No changes are waiting for confirmation. Continue the conversation or proceed to preview.';
 

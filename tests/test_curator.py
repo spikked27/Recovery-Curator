@@ -254,6 +254,7 @@ class CuratorTests(unittest.TestCase):
             duplicate_folder = source / "duplicates"
             duplicate_folder.mkdir()
             (duplicate_folder / "copy.jpg").write_bytes(dated.read_bytes())
+            (source / "empty" / "original" / "folders").mkdir(parents=True)
 
             live_folder = source / "surviving"
             zero_folder = source / "placeholders"
@@ -283,7 +284,7 @@ class CuratorTests(unittest.TestCase):
             self.assertTrue(preview["same_filesystem"])
 
             authorized = curator.sanitization_preview(authorize=True)
-            with patch("app.curator.apply_date_metadata", return_value=True):
+            with patch("app.curator.apply_missing_exif_metadata", return_value=True):
                 result = curator.export_sanitized_library(
                     authorized["token"], allow_copy_fallback=True,
                 )
@@ -291,18 +292,82 @@ class CuratorTests(unittest.TestCase):
             self.assertGreaterEqual(result["hardlinked"], 1)
             self.assertGreaterEqual(result["repaired"], 2)
             self.assertTrue((output / "sanitization_manifest.csv").is_file())
-            self.assertFalse(any(path.name == "known-good-copy.bin" for path in output.rglob("*")))
+            self.assertTrue((output / "sanitization_exclusions.csv").is_file())
+            self.assertFalse((output / "known-good-copy.bin").exists())
             self.assertEqual(len(list(output.rglob("*.jpg"))), 2)
+            self.assertTrue((output / "empty" / "original" / "folders").is_dir())
+            self.assertTrue((output / "duplicates").is_dir())
+            self.assertTrue((output / "placeholders").is_dir())
+            self.assertFalse((output / "placeholders" / "legacy-name.jpg").exists())
+            self.assertFalse((output / "Photos").exists())
 
-            plain_export = next(path for path in output.rglob("plain.bin"))
+            plain_export = output / "plain.bin"
             self.assertEqual(plain.stat().st_ino, plain_export.stat().st_ino)
-            legacy_export = next(path for path in output.rglob("legacy-name.jpg"))
+            legacy_export = output / "surviving" / "legacy-name.jpg"
             self.assertNotEqual(live.stat().st_ino, legacy_export.stat().st_ino)
             self.assertEqual(int(legacy_export.stat().st_mtime), recovered_timestamp)
 
             overview = curator.sanitization_overview()
             self.assertFalse(overview["authorized"])
             self.assertEqual(overview["included"], 3)
+
+    def test_sanitization_omits_only_strict_smaller_photo_and_inherits_missing_exif(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            album = source / "Recovered Album" / "Day One"
+            album.mkdir(parents=True)
+            larger = album / "photo-large.jpg"
+            smaller = album / "photo-small.jpg"
+            different = album / "different-color.jpg"
+            Image.new("RGB", (800, 600), (40, 90, 150)).save(larger, quality=92)
+            Image.new("RGB", (400, 300), (40, 90, 150)).save(smaller, quality=75)
+            Image.new("RGB", (400, 300), (180, 35, 25)).save(different, quality=75)
+
+            curator = Curator(
+                source, output, quarantine, config / "catalog.sqlite3", allow_actions=True,
+            )
+            curator.scan()
+            with connect(curator.db_path) as db:
+                db.execute(
+                    """UPDATE files SET exif_date='2019-06-07T08:09:10',exif_make='Example Camera',
+                              exif_model='Pocket One',exif_latitude=42.35,exif_longitude=-71.06
+                         WHERE relative_path='Recovered Album/Day One/photo-small.jpg'"""
+                )
+                db.commit()
+
+            preview = curator.build_sanitization_foundation()
+            self.assertEqual(preview["derivative_excluded"], 1)
+            self.assertEqual(preview["included"], 2)
+            self.assertEqual(preview["repair_candidates"], 1)
+            authorized = curator.sanitization_preview(authorize=True)
+            with patch("app.curator.apply_missing_exif_metadata", return_value=True) as apply_metadata:
+                result = curator.export_sanitized_library(
+                    authorized["token"], allow_copy_fallback=True,
+                )
+            self.assertEqual(result["failed"], 0)
+            self.assertTrue((output / "Recovered Album" / "Day One" / "photo-large.jpg").is_file())
+            self.assertFalse((output / "Recovered Album" / "Day One" / "photo-small.jpg").exists())
+            self.assertTrue((output / "Recovered Album" / "Day One" / "different-color.jpg").is_file())
+            self.assertNotEqual(
+                larger.stat().st_ino,
+                (output / "Recovered Album" / "Day One" / "photo-large.jpg").stat().st_ino,
+            )
+            repaired = apply_metadata.call_args.args[1]
+            self.assertEqual(repaired["exif_date"], "2019-06-07T08:09:10")
+            self.assertEqual(repaired["exif_make"], "Example Camera")
+            self.assertEqual(repaired["exif_model"], "Pocket One")
+            self.assertAlmostEqual(repaired["exif_latitude"], 42.35)
+            self.assertAlmostEqual(repaired["exif_longitude"], -71.06)
+            with (output / "sanitization_exclusions.csv").open(newline="", encoding="utf-8") as stream:
+                exclusions = list(csv.DictReader(stream))
+            smaller_record = next(item for item in exclusions if item["relative_path"].endswith("photo-small.jpg"))
+            self.assertEqual(smaller_record["exclusion_reason"], "strict_lower_resolution_copy")
+            self.assertTrue(smaller_record["keeper_relative_path"].endswith("photo-large.jpg"))
 
     def test_sanitization_rejects_output_nested_in_recovered_source(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1205,8 +1270,8 @@ class CuratorTests(unittest.TestCase):
             applied = curator.review_curation_proposal(proposal["id"], "accepted")
             self.assertEqual(applied["affected"], 2)
             retained_overview = curator.sanitization_overview()
-            self.assertTrue(retained_overview["stale"])
-            self.assertFalse(retained_overview["authorized"])
+            self.assertFalse(retained_overview.get("stale", False))
+            self.assertTrue(retained_overview["authorized"])
             self.assertEqual(retained_overview["included"], exact_preview["included"])
             with connect(config / "catalog.sqlite3") as db:
                 labels = {row[0] for row in db.execute(

@@ -417,6 +417,23 @@ def initialize(db_path: Path) -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_curation_rule_effects_file
               ON curation_rule_effects(file_id,proposal_id);
+            CREATE TABLE IF NOT EXISTS sanitization_derivatives (
+              file_id INTEGER PRIMARY KEY,
+              keeper_file_id INTEGER NOT NULL,
+              confidence INTEGER NOT NULL,
+              reason TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_sanitization_derivatives_keeper
+              ON sanitization_derivatives(keeper_file_id);
+            CREATE TABLE IF NOT EXISTS sanitization_metadata_repairs (
+              file_id INTEGER PRIMARY KEY,
+              metadata_json TEXT NOT NULL,
+              source_file_ids_json TEXT NOT NULL,
+              confidence INTEGER NOT NULL,
+              reason TEXT NOT NULL,
+              updated_at TEXT NOT NULL
+            );
             CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT);
             CREATE TABLE IF NOT EXISTS actions (
               id INTEGER PRIMARY KEY,
@@ -1851,6 +1868,7 @@ class Curator:
             self._check_cancel()
             self._refresh_known_good_relationships(db)
             self._build_placeholder_relationships(db)
+            self._build_sanitization_derivatives(db)
             db.execute(
                 "DELETE FROM settings WHERE key IN ('sanitization_export_token','sanitization_preview_json')"
             )
@@ -2060,6 +2078,178 @@ class Curator:
         finally:
             db.execute("DROP TABLE IF EXISTS temp.placeholder_candidates")
             db.commit()
+
+    @staticmethod
+    def _metadata_consensus(rows: list[dict], field: str) -> tuple[object | None, list[int]]:
+        values = [(row[field], int(row["id"])) for row in rows if row.get(field) not in (None, "")]
+        if not values:
+            return None, []
+        if field in {"exif_latitude", "exif_longitude", "exif_altitude"}:
+            tolerance = 0.0001 if field != "exif_altitude" else 1.0
+            numeric = [float(value) for value, _ in values]
+            if max(numeric) - min(numeric) > tolerance:
+                return None, []
+            return round(sum(numeric) / len(numeric), 7 if field != "exif_altitude" else 2), [item[1] for item in values]
+        canonical = {str(value).strip().casefold() for value, _ in values}
+        if len(canonical) != 1:
+            return None, []
+        return values[0][0], [item[1] for item in values]
+
+    @staticmethod
+    def _strict_visual_match(left: dict, right: dict, cache: dict[int, bytes | None]) -> bool:
+        """Reject pHash false positives using a small color-aware pixel comparison."""
+        def feature(row: dict) -> bytes | None:
+            file_id = int(row["id"])
+            if file_id in cache:
+                return cache[file_id]
+            try:
+                with Image.open(row["path"]) as image:
+                    normalized = ImageOps.exif_transpose(image).convert("RGB").resize(
+                        (32, 32), Image.Resampling.LANCZOS,
+                    )
+                    cache[file_id] = normalized.tobytes()
+            except (
+                OSError, ValueError, UnidentifiedImageError,
+                Image.DecompressionBombError, Image.DecompressionBombWarning,
+            ):
+                cache[file_id] = None
+            return cache[file_id]
+
+        left_feature, right_feature = feature(left), feature(right)
+        if left_feature is None or right_feature is None:
+            return False
+        differences = sorted(abs(a - b) for a, b in zip(left_feature, right_feature))
+        mean_difference = sum(differences) / max(len(differences), 1)
+        percentile_95 = differences[min(int(len(differences) * 0.95), len(differences) - 1)]
+        return mean_difference <= 8.0 and percentile_95 <= 24
+
+    def _build_sanitization_derivatives(self, db: sqlite3.Connection) -> None:
+        """Identify only strongly supported lower-resolution copies and safe metadata donors."""
+        db.execute("DELETE FROM sanitization_derivatives")
+        db.execute("DELETE FROM sanitization_metadata_repairs")
+        candidate_sql = """SELECT id,path,size,width,height,phash,content_hash,similar_group,quality_score,
+                      decision,exif_date,exif_make,exif_model,exif_lens_model,exif_software,
+                      exif_offset_time,exif_latitude,exif_longitude,exif_altitude
+                 FROM files
+                WHERE size>0 AND known_good_match=0 AND validation='valid'
+                  AND media_kind='photo' AND phash IS NOT NULL
+                  AND width>0 AND height>0 AND similar_group IS NOT NULL
+                  AND decision!='reject'"""
+        total = int(db.execute(f"SELECT COUNT(*) FROM ({candidate_sql})").fetchone()[0])
+        self._begin_phase(
+            "strict_derivatives", total,
+            "Checking visually similar photos for strict lower-resolution copies",
+        )
+        metadata_fields = (
+            "exif_date", "exif_make", "exif_model", "exif_lens_model", "exif_software",
+            "exif_offset_time", "exif_latitude", "exif_longitude", "exif_altitude",
+        )
+
+        def process_group(members: list[dict]) -> None:
+            if not members:
+                return
+            derivative_rows: list[tuple[int, int, int, str, str]] = []
+            derivative_ids: set[int] = set()
+            visual_cache: dict[int, bytes | None] = {}
+            donors_by_keeper: dict[int, list[dict]] = defaultdict(list)
+            keepers = {int(row["id"]): row for row in members}
+            ordered = sorted(
+                members,
+                key=lambda item: (
+                    int(item["width"]) * int(item["height"]), int(item["size"]),
+                    float(item["quality_score"] or 0), -int(item["id"]),
+                ),
+                reverse=True,
+            )
+            for candidate in ordered:
+                if candidate["decision"] == "keep":
+                    continue
+                candidate_pixels = int(candidate["width"]) * int(candidate["height"])
+                candidate_ratio = int(candidate["width"]) / int(candidate["height"])
+                keeper = None
+                for larger in ordered[:24]:
+                    if int(larger["id"]) in derivative_ids:
+                        continue
+                    larger_pixels = int(larger["width"]) * int(larger["height"])
+                    if larger_pixels < candidate_pixels * 1.25:
+                        continue
+                    if int(larger["width"]) < int(candidate["width"]) or int(larger["height"]) < int(candidate["height"]):
+                        continue
+                    if candidate.get("content_hash") and candidate["content_hash"] == larger.get("content_hash"):
+                        continue
+                    larger_ratio = int(larger["width"]) / int(larger["height"])
+                    if abs(math.log(max(candidate_ratio, 0.001) / max(larger_ratio, 0.001))) > 0.01:
+                        continue
+                    if BKTree.distance(int(candidate["phash"], 16), int(larger["phash"], 16)) > 3:
+                        continue
+                    if not self._strict_visual_match(candidate, larger, visual_cache):
+                        continue
+                    keeper = larger
+                    break
+                if keeper is None:
+                    continue
+                reason = (
+                    f"strict visual match; {candidate['width']}x{candidate['height']} is a lower-resolution "
+                    f"version of {keeper['width']}x{keeper['height']}"
+                )
+                derivative_rows.append((int(candidate["id"]), int(keeper["id"]), 96, reason, utcnow()))
+                derivative_ids.add(int(candidate["id"]))
+                donors_by_keeper[int(keeper["id"])].append(candidate)
+            if derivative_rows:
+                db.executemany(
+                    """INSERT INTO sanitization_derivatives(
+                         file_id,keeper_file_id,confidence,reason,updated_at
+                       ) VALUES(?,?,?,?,?)""",
+                    derivative_rows,
+                )
+            repairs = []
+            for keeper_id, donors in donors_by_keeper.items():
+                keeper = keepers[keeper_id]
+                metadata, source_ids = {}, set()
+                for field in metadata_fields:
+                    if keeper.get(field) not in (None, ""):
+                        continue
+                    value, contributors = self._metadata_consensus(donors, field)
+                    if value is not None:
+                        metadata[field] = value
+                        source_ids.update(contributors)
+                if metadata:
+                    repairs.append((
+                        keeper_id, json.dumps(metadata, ensure_ascii=False, separators=(",", ":")),
+                        json.dumps(sorted(source_ids), separators=(",", ":")), 94,
+                        "missing EXIF fields inherited from strict lower-resolution visual match", utcnow(),
+                    ))
+            if repairs:
+                db.executemany(
+                    """INSERT INTO sanitization_metadata_repairs(
+                         file_id,metadata_json,source_file_ids_json,confidence,reason,updated_at
+                       ) VALUES(?,?,?,?,?,?)""",
+                    repairs,
+                )
+
+        cursor = db.execute(
+            candidate_sql + " ORDER BY similar_group,(width*height) DESC,size DESC,quality_score DESC,id"
+        )
+        processed = 0
+        last_progress = 0
+        current_group, members = None, []
+        for raw in cursor:
+            row = dict(raw)
+            group = int(row["similar_group"])
+            if current_group is not None and group != current_group:
+                process_group(members)
+                processed += len(members)
+                members = []
+                if processed - last_progress >= 250 or processed == total:
+                    self._progress(processed, total)
+                    last_progress = processed
+                self._check_cancel()
+            current_group = group
+            members.append(row)
+        process_group(members)
+        processed += len(members)
+        db.commit()
+        self._progress(processed, total)
 
     def _refresh_folder_context(self, db: sqlite3.Connection) -> None:
         directories = {
@@ -4820,7 +5010,6 @@ class Curator:
                     "UPDATE curation_chat_proposals SET affected_files=? WHERE id=?",
                     (affected, proposal_id),
                 )
-                self._mark_sanitization_preview_stale(db)
             elif decision == "undone":
                 if proposal["status"] != "accepted":
                     raise ValueError("Only an applied suggestion can be undone.")
@@ -4884,7 +5073,6 @@ class Curator:
                         (proposal_id, proposal_id, utcnow(), source, proposal_id),
                     )
                 db.execute("DELETE FROM file_facets WHERE source=?", (source,))
-                self._mark_sanitization_preview_stale(db)
             else:
                 if proposal["status"] != "pending":
                     raise ValueError("Only a pending suggestion can be dismissed.")
@@ -5571,10 +5759,17 @@ class Curator:
               WHERE r.relationship='zero_same_name' AND r.confidence>=85
               GROUP BY r.related_file_id
             ), eligible AS (
-              SELECT f.*,z.zero_date,z.zero_date_confidence,z.zero_mtime_ns
+              SELECT f.*,z.zero_date,z.zero_date_confidence,z.zero_mtime_ns,
+                     mr.metadata_json metadata_repair_json,
+                     mr.source_file_ids_json metadata_repair_sources,
+                     mr.confidence metadata_repair_confidence
               FROM files f LEFT JOIN zero_date_evidence z ON z.related_file_id=f.id
+              LEFT JOIN sanitization_metadata_repairs mr ON mr.file_id=f.id
               WHERE f.size>0 AND f.known_good_match=0 AND f.decision!='reject'
                 AND COALESCE(f.validation,'unchecked')!='unreadable'
+                AND NOT EXISTS (
+                  SELECT 1 FROM sanitization_derivatives sd WHERE sd.file_id=f.id
+                )
             ), ranked AS (
               SELECT eligible.*,
                      ROW_NUMBER() OVER (
@@ -5599,56 +5794,46 @@ class Curator:
             return None
         return str(parsed.year), f"{parsed.month:02d}"
 
+    @staticmethod
+    def _validated_relative_path(value: str) -> str:
+        path = PurePosixPath(value)
+        if path.is_absolute() or not path.parts or any(part in {"", ".", ".."} for part in path.parts):
+            raise ValueError(f"unsafe catalog relative path: {value!r}")
+        return path.as_posix()
+
     def _sanitization_destination(self, row: sqlite3.Row | dict) -> dict:
+        """Plan a sanitized mirror entry without inventing any replacement hierarchy."""
         item = dict(row)
         media = str(item.get("media_kind") or "other")
-        extension = str(item.get("extension") or "").casefold()
-        type_name = {
-            "photo": "Photos", "video": "Videos", "audio": "Audio",
-            "document": "Documents", "email": "Email", "other": "Other Files",
-        }.get(media, "Other Files")
-        if media == "other" and extension in {".zip", ".7z", ".rar", ".tar", ".gz", ".bz2"}:
-            type_name = "Archives"
-
-        validation = str(item.get("validation") or "unchecked")
-        sensitivity = str(item.get("sensitivity") or "unknown")
-        origin = str(item.get("media_origin") or "unknown")
-        if validation == "corrupt":
-            root = ["Needs Attention", "Corrupt or Partially Readable", type_name]
-        elif sensitivity in {"adult", "intimate", "possibly_sensitive"}:
-            root = ["Private Review", type_name]
-        else:
-            root = [type_name]
-
-        label = str(item.get("curation_label") or "").strip()
-        path_text = str(item.get("relative_path") or "").casefold()
-        if label:
-            grouping = sanitize_component(label)
-        elif "nasa" in path_text or "jwst" in path_text:
-            grouping = "NASA and Space"
-        elif "wallpaper" in path_text or "background" in path_text:
-            grouping = "Wallpapers"
-        elif origin and origin != "unknown":
-            grouping = sanitize_component(origin.replace("_", " ").title())
-        else:
-            grouping = "Unsorted"
-        root.append(grouping)
-
+        relative_path = self._validated_relative_path(str(item.get("relative_path") or ""))
+        metadata_repair = {}
+        try:
+            candidate = json.loads(item.get("metadata_repair_json") or "{}")
+            if isinstance(candidate, dict):
+                metadata_repair = candidate
+        except (TypeError, ValueError, json.JSONDecodeError):
+            metadata_repair = {}
         date_value = None
         date_source = "unknown"
         date_confidence = 0
-        repair_date = None
         repair_mtime_ns = None
         if self._date_folder(item.get("exif_date")):
             date_value, date_source, date_confidence = item["exif_date"], "embedded_capture_date", 100
+        elif self._date_folder(metadata_repair.get("exif_date")):
+            date_value = metadata_repair["exif_date"]
+            date_source, date_confidence = "smaller_version_exif", int(item.get("metadata_repair_confidence") or 94)
         elif self._date_folder(item.get("video_creation_date")):
             date_value, date_source, date_confidence = item["video_creation_date"], "embedded_video_date", 100
         elif int(item.get("date_confidence") or 0) >= 85 and self._date_folder(item.get("filename_date")):
             date_value = item["filename_date"]
-            date_source, date_confidence, repair_date = "filename_date", int(item["date_confidence"]), date_value
+            date_source, date_confidence = "filename_date", int(item["date_confidence"])
+            if media == "photo":
+                metadata_repair["exif_date"] = date_value
         elif int(item.get("zero_date_confidence") or 0) >= 85 and self._date_folder(item.get("zero_date")):
             date_value = item["zero_date"]
-            date_source, date_confidence, repair_date = "zero_byte_filename_date", int(item["zero_date_confidence"]), date_value
+            date_source, date_confidence = "zero_byte_filename_date", int(item["zero_date_confidence"])
+            if media == "photo":
+                metadata_repair["exif_date"] = date_value
         elif int(item.get("zero_date_confidence") or 0) >= 85:
             try:
                 zero_modified = dt.datetime.fromtimestamp(
@@ -5674,27 +5859,15 @@ class Curator:
                     date_source, date_confidence = "filesystem_modified_date", 60
             except (OSError, OverflowError, TypeError, ValueError):
                 pass
-        folder = self._date_folder(date_value)
-        date_group = {
-            "embedded_capture_date": "Embedded Date",
-            "embedded_video_date": "Embedded Date",
-            "filename_date": "Inferred Date",
-            "zero_byte_filename_date": "Inferred Date",
-            "zero_byte_modified_date": "Recovered Modified Date",
-            "filesystem_modified_date": "Modified Date",
-        }.get(date_source, "Unknown Date")
-        root.append(date_group)
-        if folder:
-            root.extend(folder)
-        filename = sanitize_component(str(item.get("name") or f"file-{item.get('id')}"))
-        root.append(filename)
+        top_level = PurePosixPath(relative_path).parts[0] if len(PurePosixPath(relative_path).parts) > 1 else "Files at source root"
         return {
-            "relative_path": self._clean_relative_path(str(Path(*root))),
+            "relative_path": relative_path,
             "date_value": date_value, "date_source": date_source,
             "date_confidence": date_confidence,
-            "repair_date": repair_date if media == "photo" and not item.get("exif_date") else None,
+            "repair_date": metadata_repair.get("exif_date") if media == "photo" and not item.get("exif_date") else None,
             "repair_mtime_ns": repair_mtime_ns,
-            "collection": grouping, "type_name": type_name,
+            "metadata_repair": metadata_repair,
+            "collection": top_level, "type_name": top_level,
         }
 
     @staticmethod
@@ -5713,12 +5886,14 @@ class Curator:
                           COALESCE(SUM(size>0 AND known_good_match=0 AND decision='reject'),0) rejected_excluded,
                           COALESCE(SUM(size>0 AND known_good_match=0 AND validation='unreadable'),0) unreadable_excluded,
                           COALESCE(SUM(size>0 AND known_good_match=0 AND decision!='reject'
-                                       AND COALESCE(validation,'unchecked')!='unreadable'),0) duplicate_pool
+                                       AND COALESCE(validation,'unchecked')!='unreadable'),0) duplicate_pool,
+                          (SELECT COUNT(*) FROM sanitization_derivatives) derivative_excluded,
+                          (SELECT COUNT(*) FROM directories WHERE status='available') preserved_directories
                    FROM files"""
             ).fetchone())
             rows = db.execute(self._sanitization_query())
             signature = blake3()
-            included = repair_candidates = already_built = unavailable = corrupt = 0
+            included = repair_candidates = already_built = legacy_built = unavailable = corrupt = 0
             hardlink_candidates = independent_candidates = independent_bytes = total_bytes = 0
             zero_date_repairs = 0
             destinations: set[str] = set()
@@ -5736,36 +5911,74 @@ class Curator:
                 size = int(row["size"] or 0)
                 total_bytes += size
                 signature.update(json.dumps(
-                    [row["id"], row["updated_at"], plan["relative_path"], plan["date_source"],
-                     plan["repair_date"], plan["repair_mtime_ns"], row["sanitized_path"]],
+                    [row["id"], row["size"], row["mtime_ns"], row["content_hash"],
+                     plan["relative_path"], plan["date_source"],
+                     plan["metadata_repair"], plan["repair_mtime_ns"], row["sanitized_path"]],
                     ensure_ascii=False, separators=(",", ":"),
                 ).encode("utf-8"))
                 key = plan["relative_path"].casefold()
-                if key in destinations or (self.output / plan["relative_path"]).exists():
+                destination_exists = (self.output / plan["relative_path"]).exists()
+                already_matches = bool(
+                    row["sanitized_path"]
+                    and Path(row["sanitized_path"]) == self.output / plan["relative_path"]
+                    and destination_exists
+                )
+                if key in destinations or (destination_exists and not already_matches):
                     collisions += 1
                 destinations.add(key)
                 collections[plan["type_name"]][0] += 1
                 collections[plan["type_name"]][1] += size
                 if row["validation"] == "corrupt":
                     corrupt += 1
-                if plan["repair_date"] or plan["repair_mtime_ns"]:
+                if plan["metadata_repair"] or plan["repair_mtime_ns"]:
                     repair_candidates += 1
                     zero_date_repairs += plan["date_source"].startswith("zero_byte_")
-                if row["sanitized_path"] and Path(row["sanitized_path"]).exists():
+                if (
+                    row["sanitized_path"] and Path(row["sanitized_path"]).exists()
+                    and Path(row["sanitized_path"]) == self.output / plan["relative_path"]
+                ):
                     already_built += 1
                     continue
+                if row["sanitized_path"] and Path(row["sanitized_path"]).exists():
+                    legacy_built += 1
                 source = Path(row["path"])
                 try:
                     source_device = source.stat().st_dev
                 except OSError:
                     unavailable += 1
                     continue
-                if not plan["repair_date"] and not plan["repair_mtime_ns"] and output_device is not None and source_device == output_device:
+                if not plan["metadata_repair"] and not plan["repair_mtime_ns"] and output_device is not None and source_device == output_device:
                     hardlink_candidates += 1
                 else:
                     independent_candidates += 1
                     independent_bytes += size
-            counts["duplicate_excluded"] = max(int(counts["duplicate_pool"] or 0) - included, 0)
+            counts["duplicate_excluded"] = max(
+                int(counts["duplicate_pool"] or 0) - included - int(counts["derivative_excluded"] or 0), 0,
+            )
+        generated_names = {
+            "recovery_catalog.csv", "recovery_catalog.jsonl", "directory_catalog.csv",
+            "directory_catalog.jsonl", "sanitization_manifest.csv", "sanitization_manifest.jsonl",
+            "sanitization_exclusions.csv", "sanitization_exclusions.jsonl",
+        }
+        with connect(self.db_path) as db:
+            source_top_names = {
+                row["name"] for row in db.execute(
+                    "SELECT name FROM directories WHERE parent_relative_path='.'"
+                )
+            }
+            source_top_names.update(
+                row["name"] for row in db.execute(
+                    "SELECT name FROM files WHERE instr(relative_path,'/')=0"
+                )
+            )
+        try:
+            unexpected_output = [
+                item for item in self.output.iterdir()
+                if item.name not in generated_names and item.name not in source_top_names
+            ]
+        except OSError:
+            unexpected_output = []
+        legacy_output_warning = bool(legacy_built or unexpected_output)
         same_filesystem = bool(
             output_device is not None and source_root_device is not None
             and output_device == source_root_device
@@ -5780,6 +5993,7 @@ class Curator:
             "independent_bytes_human": human_bytes(independent_bytes),
             "total_bytes": total_bytes, "total_bytes_human": human_bytes(total_bytes),
             "collisions": collisions, "same_filesystem": same_filesystem,
+            "legacy_output_warning": legacy_output_warning,
             "collections": [
                 {"name": name, "files": values[0], "bytes": values[1], "bytes_human": human_bytes(values[1])}
                 for name, values in sorted(collections.items())
@@ -5841,17 +6055,19 @@ class Curator:
                           COALESCE(SUM(size>0 AND known_good_match=0 AND decision='reject'),0) rejected_excluded,
                           COALESCE(SUM(size>0 AND known_good_match=0 AND validation='unreadable'),0) unreadable_excluded,
                           COALESCE(SUM(size>0 AND known_good_match=0 AND decision!='reject'
-                                       AND COALESCE(validation,'unchecked')!='unreadable'),0) duplicate_pool
+                                       AND COALESCE(validation,'unchecked')!='unreadable'),0) duplicate_pool,
+                          (SELECT COUNT(*) FROM sanitization_derivatives) derivative_excluded,
+                          (SELECT COUNT(*) FROM directories WHERE status='available') preserved_directories
                    FROM files"""
             ).fetchone())
             collections = [dict(row) for row in db.execute(
-                f"""SELECT CASE COALESCE(media_kind,'other')
-                               WHEN 'photo' THEN 'Photos' WHEN 'video' THEN 'Videos'
-                               WHEN 'audio' THEN 'Audio' WHEN 'document' THEN 'Documents'
-                               WHEN 'email' THEN 'Email' ELSE 'Other Files' END name,
+                f"""SELECT CASE WHEN instr(relative_path,'/')>0
+                                  THEN substr(relative_path,1,instr(relative_path,'/')-1)
+                                  ELSE 'Files at source root' END name,
                             COUNT(*) files,COALESCE(SUM(size),0) bytes,
                             COALESCE(SUM(validation='corrupt'),0) corrupt_files,
                             COALESCE(SUM(media_kind='photo' AND exif_date IS NULL AND (
+                              metadata_repair_json IS NOT NULL OR
                               (date_confidence>=85 AND filename_date IS NOT NULL) OR
                               (zero_date_confidence>=85 AND zero_date IS NOT NULL)
                             )),0) repair_files
@@ -5872,13 +6088,16 @@ class Curator:
         result = {
             **counts, "included": included, "total_bytes": total_bytes,
             "corrupt_included": corrupt_included, "repair_candidates": repairs,
-            "duplicate_excluded": max(int(counts["duplicate_pool"] or 0) - included, 0),
+            "duplicate_excluded": max(
+                int(counts["duplicate_pool"] or 0) - included - int(counts["derivative_excluded"] or 0), 0,
+            ),
             "zero_date_repairs": 0, "already_built": 0, "unavailable": 0,
             "hardlink_candidates": max(included - independent, 0),
             "independent_candidates": independent, "independent_bytes": 0,
             "independent_bytes_human": "calculated in preview",
             "total_bytes_human": human_bytes(total_bytes),
             "collisions": 0, "same_filesystem": same_filesystem,
+            "legacy_output_warning": False,
             "collections": [
                 {
                     "name": item["name"], "files": item["files"], "bytes": item["bytes"],
@@ -5891,6 +6110,36 @@ class Curator:
         with self.lock:
             self._sanitization_overview_cache = (now, result)
         return result
+
+    def _mirror_destination(self, relative_path: str) -> Path:
+        relative = self._validated_relative_path(relative_path)
+        destination = self.output.joinpath(*PurePosixPath(relative).parts)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        self._normalize_output_directories(destination.parent, self.output)
+        if destination.exists():
+            raise FileExistsError(
+                f"Curated Output already contains {relative}; use an empty output folder or remove the conflict."
+            )
+        return destination
+
+    def _prepare_mirror_directories(self, db: sqlite3.Connection) -> int:
+        self.output.mkdir(parents=True, exist_ok=True)
+        self._normalize_output_directories(self.output, self.output)
+        created = 0
+        for row in db.execute(
+            """SELECT relative_path FROM directories
+                 WHERE status='available' AND relative_path!='.'
+                 ORDER BY length(relative_path),relative_path"""
+        ):
+            relative = self._validated_relative_path(row["relative_path"])
+            destination = self.output.joinpath(*PurePosixPath(relative).parts)
+            if destination.exists() and not destination.is_dir():
+                raise FileExistsError(f"Curated Output has a file where source folder {relative} must be mirrored.")
+            if not destination.exists():
+                destination.mkdir()
+                created += 1
+            self._normalize_output_directories(destination, self.output)
+        return created
 
     def _independent_clone(self, source: Path, destination: Path, allow_copy: bool) -> str:
         result = subprocess.run(
@@ -5922,26 +6171,43 @@ class Curator:
         preview = self.sanitization_preview(authorize=False)
         if not preview["authorized"] or not token or token != preview["token"]:
             raise RuntimeError("The catalog changed or has not been previewed. Generate a fresh preview first.")
+        if preview["collisions"]:
+            raise RuntimeError(
+                f"Curated Output contains {preview['collisions']:,} conflicting mirror path(s). "
+                "Use an empty output folder; existing files are never overwritten or renamed."
+            )
+        if preview.get("legacy_output_warning"):
+            raise RuntimeError(
+                "Curated Output already contains an older or unrelated folder layout. "
+                "Use an empty output folder for this folder-preserving build; existing output is not deleted automatically."
+            )
         hardlinked = reflinked = copied = repaired = repair_failed = failed = skipped = 0
+        directories_created = 0
         output_parent = self._existing_parent(self.output)
         output_device = output_parent.stat().st_dev if output_parent else None
         with connect(self.db_path) as db:
+            directories_created = self._prepare_mirror_directories(db)
             rows = db.execute(self._sanitization_query() + " ORDER BY id")
             for row in rows:
-                if row["sanitized_path"] and Path(row["sanitized_path"]).exists():
+                plan = self._sanitization_destination(row)
+                intended_destination = self.output.joinpath(*PurePosixPath(plan["relative_path"]).parts)
+                if (
+                    row["sanitized_path"] and Path(row["sanitized_path"]).exists()
+                    and Path(row["sanitized_path"]) == intended_destination
+                ):
                     skipped += 1
                     continue
                 source = Path(row["path"])
                 if not source.is_file():
                     skipped += 1
                     continue
-                plan = self._sanitization_destination(row)
-                destination = self._safe_destination(self.output, plan["relative_path"])
+                destination = intended_destination
                 method = ""
                 repair_state = "not_needed"
                 try:
+                    destination = self._mirror_destination(plan["relative_path"])
                     same_device = output_device is not None and source.stat().st_dev == output_device
-                    if not plan["repair_date"] and not plan["repair_mtime_ns"] and same_device:
+                    if not plan["metadata_repair"] and not plan["repair_mtime_ns"] and same_device:
                         try:
                             os.link(source, destination)
                             method = "hardlink"
@@ -5950,8 +6216,8 @@ class Curator:
                     else:
                         method = self._independent_clone(source, destination, allow_copy_fallback)
                     if method != "hardlink":
-                        if plan["repair_date"]:
-                            if apply_date_metadata(destination, plan["repair_date"]):
+                        if plan["metadata_repair"]:
+                            if apply_missing_exif_metadata(destination, plan["metadata_repair"]):
                                 repaired += 1
                                 repair_state = "applied"
                             else:
@@ -5975,7 +6241,9 @@ class Curator:
                     now = utcnow()
                     detail = json.dumps(
                         {"method": method, "date_source": plan["date_source"],
-                         "date_confidence": plan["date_confidence"], "repair": repair_state},
+                         "date_confidence": plan["date_confidence"], "repair": repair_state,
+                         "metadata_fields": sorted(plan["metadata_repair"]),
+                         "metadata_sources": json.loads(row["metadata_repair_sources"] or "[]")},
                         separators=(",", ":"),
                     )
                     db.execute(
@@ -6010,12 +6278,15 @@ class Curator:
             )
             db.commit()
         self.export_catalog(self.output)
+        self.export_directory_catalog(self.output)
         manifest = self.export_sanitization_manifest()
+        exclusions_manifest = self.export_sanitization_exclusions()
         self._invalidate_summaries()
         return {
             "hardlinked": hardlinked, "reflinked": reflinked, "copied": copied,
             "repaired": repaired, "repair_failed": repair_failed,
-            "failed": failed, "skipped": skipped, "manifest": str(manifest),
+            "failed": failed, "skipped": skipped, "directories_created": directories_created,
+            "manifest": str(manifest), "exclusions_manifest": str(exclusions_manifest),
         }
 
     def export_sanitization_manifest(self) -> Path:
@@ -6036,6 +6307,53 @@ class Curator:
             writer = csv.DictWriter(csv_file, fieldnames=fields)
             writer.writeheader()
             for row in db.execute("SELECT * FROM files WHERE sanitized_path IS NOT NULL ORDER BY id"):
+                item = {field: row[field] for field in fields}
+                writer.writerow(item)
+                json_file.write(json.dumps(item, ensure_ascii=False) + "\n")
+        self._normalize_output_file(csv_path)
+        self._normalize_output_file(jsonl_path)
+        return csv_path
+
+    def export_sanitization_exclusions(self) -> Path:
+        """Record every omitted source entry and the evidence-backed reason."""
+        self.output.mkdir(parents=True, exist_ok=True)
+        csv_path = self.output / "sanitization_exclusions.csv"
+        jsonl_path = self.output / "sanitization_exclusions.jsonl"
+        fields = [
+            "id", "relative_path", "size", "exclusion_reason", "keeper_file_id",
+            "keeper_relative_path", "known_good_library", "known_good_path", "confidence", "detail",
+        ]
+        query = f"""
+            WITH selected AS ({self._sanitization_query()}),
+            exact_keepers AS (
+              SELECT f.exact_group,MIN(s.id) keeper_id
+                FROM selected s JOIN files f ON f.id=s.id
+               WHERE f.exact_group IS NOT NULL GROUP BY f.exact_group
+            )
+            SELECT f.id,f.relative_path,f.size,
+                   CASE WHEN f.size=0 THEN 'zero_byte_placeholder'
+                        WHEN f.known_good_match=1 THEN 'exact_known_good_copy'
+                        WHEN f.decision='reject' THEN 'manually_rejected'
+                        WHEN COALESCE(f.validation,'unchecked')='unreadable' THEN 'unreadable'
+                        WHEN sd.file_id IS NOT NULL THEN 'strict_lower_resolution_copy'
+                        WHEN f.exact_group IS NOT NULL THEN 'redundant_byte_identical_copy'
+                        ELSE 'not_selected' END exclusion_reason,
+                   COALESCE(sd.keeper_file_id,ek.keeper_id) keeper_file_id,
+                   keeper.relative_path keeper_relative_path,
+                   f.known_good_library,f.known_good_path,
+                   COALESCE(sd.confidence,CASE WHEN f.known_good_match=1 OR f.exact_group IS NOT NULL THEN 100 END) confidence,
+                   COALESCE(sd.reason,f.validation_detail) detail
+              FROM files f
+              LEFT JOIN sanitization_derivatives sd ON sd.file_id=f.id
+              LEFT JOIN exact_keepers ek ON ek.exact_group=f.exact_group
+              LEFT JOIN files keeper ON keeper.id=COALESCE(sd.keeper_file_id,ek.keeper_id)
+             WHERE NOT EXISTS (SELECT 1 FROM selected s WHERE s.id=f.id)
+             ORDER BY f.relative_path,f.id
+        """
+        with connect(self.db_path) as db, csv_path.open("w", newline="", encoding="utf-8") as csv_file, jsonl_path.open("w", encoding="utf-8") as json_file:
+            writer = csv.DictWriter(csv_file, fieldnames=fields)
+            writer.writeheader()
+            for row in db.execute(query):
                 item = {field: row[field] for field in fields}
                 writer.writerow(item)
                 json_file.write(json.dumps(item, ensure_ascii=False) + "\n")
@@ -6197,16 +6515,46 @@ class Curator:
         return csv_path
 
 
-def apply_date_metadata(path: Path, iso_date: str) -> bool:
+def apply_missing_exif_metadata(path: Path, metadata: dict) -> bool:
+    """Write only the explicitly planned missing fields to an independent output clone."""
     try:
-        value = dt.datetime.fromisoformat(iso_date).strftime("%Y:%m:%d %H:%M:%S")
+        arguments = ["exiftool", "-overwrite_original"]
+        if metadata.get("exif_date"):
+            value = dt.datetime.fromisoformat(str(metadata["exif_date"]).replace("Z", "+00:00")).strftime("%Y:%m:%d %H:%M:%S")
+            arguments.extend((f"-DateTimeOriginal={value}", f"-CreateDate={value}", f"-ModifyDate={value}"))
+        text_tags = {
+            "exif_make": "Make", "exif_model": "Model", "exif_lens_model": "LensModel",
+            "exif_software": "Software", "exif_offset_time": "OffsetTimeOriginal",
+        }
+        for field, tag in text_tags.items():
+            if metadata.get(field) not in (None, ""):
+                arguments.append(f"-{tag}={str(metadata[field])[:300]}")
+        latitude = metadata.get("exif_latitude")
+        if latitude is not None:
+            latitude = float(latitude)
+            arguments.extend((f"-GPSLatitude={abs(latitude)}", f"-GPSLatitudeRef={'S' if latitude < 0 else 'N'}"))
+        longitude = metadata.get("exif_longitude")
+        if longitude is not None:
+            longitude = float(longitude)
+            arguments.extend((f"-GPSLongitude={abs(longitude)}", f"-GPSLongitudeRef={'W' if longitude < 0 else 'E'}"))
+        altitude = metadata.get("exif_altitude")
+        if altitude is not None:
+            altitude = float(altitude)
+            arguments.extend((f"-GPSAltitude={abs(altitude)}", f"-GPSAltitudeRef={1 if altitude < 0 else 0}"))
+        if len(arguments) == 2:
+            return True
+        arguments.append(str(path))
         result = subprocess.run(
-            ["exiftool", "-overwrite_original", f"-DateTimeOriginal={value}", f"-CreateDate={value}", f"-ModifyDate={value}", str(path)],
+            arguments,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60,
         )
         return result.returncode == 0
     except Exception:
         return False
+
+
+def apply_date_metadata(path: Path, iso_date: str) -> bool:
+    return apply_missing_exif_metadata(path, {"exif_date": iso_date})
 
 
 def sanitize_component(value: str) -> str:

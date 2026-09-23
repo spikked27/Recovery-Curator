@@ -525,9 +525,10 @@ def build_sanitized_library():
         "message.html", title="Review library built",
         message=(
             f"Created {result['hardlinked']:,} hardlinks, {result['reflinked']:,} reflink clones, "
-            f"and {result['copied']:,} full copies. Applied {result['repaired']:,} metadata date "
+            f"and {result['copied']:,} full copies while preserving the source folders "
+            f"({result['directories_created']:,} newly created). Applied {result['repaired']:,} metadata "
             f"repairs; {result['repair_failed']:,} repairs and {result['failed']:,} exports failed. "
-            f"Manifest: {result['manifest']}"
+            f"Included manifest: {result['manifest']}. Omitted manifest: {result['exclusions_manifest']}"
         ),
     )
 

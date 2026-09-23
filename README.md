@@ -1,6 +1,6 @@
 # Recovery Curator for Unraid
 
-Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and, after approval, a clean categorized library. It is deliberately conservative: the first scan mounts recovered files read-only, and no result is permanently deleted.
+Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and, after approval, a sanitized mirror with the same folder tree. It is deliberately conservative: the first scan mounts recovered files read-only, and no result is permanently deleted.
 
 ## What this version does
 
@@ -37,11 +37,12 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
   - Videos
   - Other Files
 - Independent media facets for media type, origin, sensitivity, topic, people, event, and source application. A file can carry several facets instead of being forced into one category.
-- A sanitation-first curation workflow that does not claim to reconstruct the owner's original folder tree.
+- A sanitation-first curation workflow that preserves the recovered folder tree exactly instead of trying to reconstruct or reinterpret it.
 - Automatic omission of zero-byte placeholders, exact known-good copies, rejected/unreadable entries, and redundant byte-identical duplicates from the review library.
-- Conservative review folders by media type, broad origin/collection clues, and the strongest available date evidence. Damaged non-empty files are retained under `Needs Attention`.
+- Strict lower-resolution photo suppression only when direct perceptual hash, dimensions, orientation, and aspect ratio agree; crops and ordinary similar-photo groups remain.
+- Empty folders and damaged non-empty files remain in their original relative locations for manual review.
 - Space-efficient export: unchanged files are hardlinked when source and output are on the same filesystem; files requiring repairs use independent reflink clones when supported.
-- Zero-byte names and timestamps remain evidence. A strong relationship can supply a missing date to an independent copy, but placeholders are never exported as content.
+- Zero-byte names and timestamps remain evidence. Strict smaller versions can donate missing EXIF fields to the best version, and a strong placeholder relationship can supply a missing date to an independent copy; placeholders are never exported as content.
 - Saved recovery context for devices, people, events, applications, folders, and privacy rules.
 - Optional OpenAI-compatible local or cloud vision provider with quick setup presets and cancellable batch analysis. The provider receives only reduced previews/contact sheets and structured evidence, never filesystem access or action permissions.
 - An in-app AI conversation that receives bounded catalog summaries, representative filenames, and the context you provide. It can request safe read-only searches across the complete catalog before answering, so useful patterns do not need to appear in its current sample window.
@@ -49,6 +50,7 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
 - AI proposals show their exact selector, estimated reach, representative matches, validation result, and reason before one confirmation. Applied rules have visible history and safe undo. They label the catalog only; the model cannot reconstruct folders, delete content, edit metadata, or run an export.
 - Exact duplicates share one AI classification, reducing local processing and cloud API use.
 - Safety-gated build based on a current preview and explicit `CURATE` confirmation. Existing output files are never overwritten.
+- Separate inclusion and exclusion manifests record every planned result, omission reason, and retained counterpart when one exists.
 - Filename-derived dates are written with ExifTool only to an independent reflink/copy, never to the recovered source or a hardlink.
 - File and directory CSV/JSONL catalogs containing paths, filesystem evidence, hashes, dates, validation, classifications, decisions, provenance, and blank AI enrichment columns.
 - Manual category overrides in the catalog; overrides are retained for unchanged files on later scans.
@@ -98,12 +100,12 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
 4. Recovery Curator inventories the selected trusted folders after source analysis. It hashes only known-good files whose sizes occur in the recovery set, then hashes the corresponding recovery candidates and records byte-for-byte matches.
 5. Open **Curate** and run **Analyze for curation**. Existing hashes and media analysis are reused; the app links zero-byte evidence, refreshes known-good matches, and prepares the sanitation plan.
 6. Optionally use the AI conversation. Explain broad clues such as “files containing `Snapchat-` are my saved snaps.” The assistant may ask a question or propose a small number of reusable labels. Inspect the match count and apply only rules that make sense.
-7. Generate the preview. Check the omission counts, repair counts, category summary, and whether source/output can use hardlinks. This is the complete decision point; individual file approval is not required.
+7. Generate the preview. Check known-good, exact-duplicate, strict smaller-copy, zero-byte, and repair counts, plus whether source/output can use hardlinks. The preserved top-level folders are shown as a sanity check; individual file approval is not required.
 8. When ready, set **Allow Write Actions** to `true`, restart the container, generate a fresh preview, type `CURATE`, and build the review library. If independent files cannot be reflinked, a full-copy fallback is used only when you explicitly enable it.
 9. Review the resulting folders with normal file-management or media tools. Recovery Curator is not intended to become a second manual-review application.
 10. Keep the original recovery set until the curated output and its manifest have been backed up and spot-checked.
 
-The review library deliberately avoids reconstructing an original hierarchy that the evidence cannot support. It uses broad, transparent groupings such as media type, source clue, private review, damaged content, and strongest available date. The human owner can reorganize the smaller, sanitized library later without the program presenting guesses as recovered fact.
+The review library is a sparse sanitized mirror: every discovered source folder is recreated at the same relative path, while omitted files simply leave gaps. Files are never moved into guessed media, date, source, or privacy collections. The human owner can reorganize the smaller library later without the program presenting guesses as recovered fact.
 
 ## Clearing a scan
 
@@ -154,7 +156,7 @@ Do not enable source write access merely to build the curated library. Quarantin
 
 The scanner records valid EXIF capture dates, timezone offsets, camera/lens/software fields, altitude, and GPS coordinates when they exist. The program never overwrites a valid existing EXIF capture date. It proposes a filename-derived date only when the name contains an unambiguous year-first date. A time is included only when all time components are present. No timezone is invented.
 
-Unchanged files may be hardlinked, so Recovery Curator never changes metadata, ownership, or permissions on those output entries: doing so would also change the recovered source inode. A photo that needs a high-confidence filename date is first made independent with a reflink (or an explicitly allowed copy), then ExifTool may set `DateTimeOriginal`, `CreateDate`, and `ModifyDate`. A strongly related zero-byte placeholder may supply a plausible older filesystem modification time when the evidence agrees; that repair is also applied only to an independent file. Every build and repair is recorded in the action log and catalog.
+Unchanged files may be hardlinked, so Recovery Curator never changes metadata, ownership, or permissions on those output entries: doing so would also change the recovered source inode. A best-resolution photo may inherit only EXIF fields it lacks when all strict smaller-version donors agree. A photo that needs a high-confidence filename date is handled the same way. The file is first made independent with a reflink (or an explicitly allowed copy), then ExifTool writes only the planned fields. A strongly related zero-byte placeholder may supply a plausible older filesystem modification time when the evidence agrees; that repair is also applied only to an independent file. Every build and repair is recorded in the action log and catalog.
 
 ## Optional AI provider and privacy
 
@@ -166,9 +168,9 @@ The Unraid template includes an optional masked `RECOVERY_AI_API_KEY` variable. 
 
 The normal AI workflow is a conversation inside **Curate**. Each turn begins with a bounded statistical summary, the context you entered, metadata coverage, capture-year distributions, camera models, neighborhood-scale GPS clusters, and a rotating sample of representative filenames. Exact coordinates stay in the local catalog; coordinates included in conversational context are rounded to 0.01-degree cells. When the initial context is insufficient, the assistant can ask Recovery Curator to run bounded read-only searches across the complete catalog by filename/path, media type, capture date, camera metadata, or rounded GPS area. It receives counts, representative matches, media types, dates, locations, and existing origins before it replies. Search selectors are locally validated and cannot execute arbitrary SQL or filesystem operations.
 
-The assistant can then stage reusable rules such as “filename starts with `~`” or “path contains `SnapSave`.” A single suggestion may set collection, origin, and sensitivity together. The confirmation queue shows its complete selector, actions, affected-file count, examples, confidence, and reason. Unsupported or zero-match suggestions remain visible with their validation errors instead of disappearing. Applied, dismissed, invalid, and undone rules have separate histories; newer overlapping AI rules must be undone first so restoration remains deterministic. No proposal affects the catalog until **Apply suggestion** is selected, and any labeling change invalidates the prior build preview. The AI cannot create original-folder claims, choose deletions, suppress known-good safeguards, change metadata, or run the build.
+The assistant can then stage reusable annotations such as “filename starts with `~`” or “path contains `SnapSave`.” A single suggestion may set collection, origin, and sensitivity labels together. The confirmation queue shows its complete selector, actions, affected-file count, examples, confidence, and reason. Unsupported or zero-match suggestions remain visible with their validation errors instead of disappearing. Applied, dismissed, invalid, and undone rules have separate histories; newer overlapping AI rules must be undone first so restoration remains deterministic. No proposal affects the catalog until **Apply suggestion** is selected. AI annotations never change mirrored paths, omission decisions, metadata repairs, or build authorization. The AI cannot choose deletions, suppress known-good safeguards, change metadata, or run the build.
 
-The Curate page reuses the last calculated overview instead of rerunning full-catalog deduplication during every conversation or rule action. Label changes immediately revoke build authorization and mark the visible overview stale; select **Generate current build preview** when the conversation is finished to refresh destinations, collision checks, and the build token.
+The Curate page reuses the last calculated overview instead of rerunning full-catalog deduplication during every conversation or annotation. Run **Analyze for sanitization** after a new scan or evidence change, then generate a current build preview to verify omissions, repairs, exact paths, collision checks, and the build token.
 
 Legacy work packages, packet-response import, the full audit dossier, and reconstruction experiments remain available under Advanced options for compatibility and specialist inspection. They are not part of the recommended sanitation workflow and may expose private paths, filenames, notes, or captions if shared externally.
 
@@ -187,7 +189,7 @@ Run **Start or resume scan** again. Files whose size and nanosecond modification
 - Legacy binary Office formats receive only basic type detection in this release.
 - Known-good comparison is exact-content matching. A resized, recompressed, or metadata-edited version will not be treated as an identical trusted copy; it may still appear in similar-photo review.
 - Hardlinks require source and output to be on the same filesystem and may also be limited by host permissions. Reflink support depends on the filesystem. Cross-filesystem output can therefore require full additional storage, and Recovery Curator will not do that without an explicit per-build opt-in.
-- Similar-looking files are deliberately retained. Only byte-identical duplicates are collapsed automatically.
+- Similar-looking files are deliberately retained unless one is a strictly dominated lower-resolution copy with a direct, high-confidence visual and geometric match.
 
 ## Development checks
 
