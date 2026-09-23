@@ -152,7 +152,7 @@ Do not enable source write access merely to build the curated library. Quarantin
 
 ## Metadata policy
 
-The program never overwrites a valid existing EXIF capture date. It proposes a filename-derived date only when the name contains an unambiguous year-first date. A time is included only when all time components are present. No timezone is invented.
+The scanner records valid EXIF capture dates, timezone offsets, camera/lens/software fields, altitude, and GPS coordinates when they exist. The program never overwrites a valid existing EXIF capture date. It proposes a filename-derived date only when the name contains an unambiguous year-first date. A time is included only when all time components are present. No timezone is invented.
 
 Unchanged files may be hardlinked, so Recovery Curator never changes metadata, ownership, or permissions on those output entries: doing so would also change the recovered source inode. A photo that needs a high-confidence filename date is first made independent with a reflink (or an explicitly allowed copy), then ExifTool may set `DateTimeOriginal`, `CreateDate`, and `ModifyDate`. A strongly related zero-byte placeholder may supply a plausible older filesystem modification time when the evidence agrees; that repair is also applied only to an independent file. Every build and repair is recorded in the action log and catalog.
 
@@ -164,9 +164,11 @@ You can paste an API key directly into the password field. It is stored outside 
 
 The Unraid template includes an optional masked `RECOVERY_AI_API_KEY` variable. If the provider requires a credential, set that variable in the container and enter `RECOVERY_AI_API_KEY` as the environment-variable name in Advanced AI settings. Local providers commonly leave it empty.
 
-The normal AI workflow is a conversation inside **Curate**. Each turn begins with a bounded statistical summary, the context you entered, and a rotating sample of representative filenames. When that is insufficient, the assistant can ask Recovery Curator to run bounded read-only searches across the complete catalog and receives counts, representative matches, media types, and existing origins before it replies. Search selectors are locally validated and cannot execute arbitrary SQL or filesystem operations.
+The normal AI workflow is a conversation inside **Curate**. Each turn begins with a bounded statistical summary, the context you entered, metadata coverage, capture-year distributions, camera models, neighborhood-scale GPS clusters, and a rotating sample of representative filenames. Exact coordinates stay in the local catalog; coordinates included in conversational context are rounded to 0.01-degree cells. When the initial context is insufficient, the assistant can ask Recovery Curator to run bounded read-only searches across the complete catalog by filename/path, media type, capture date, camera metadata, or rounded GPS area. It receives counts, representative matches, media types, dates, locations, and existing origins before it replies. Search selectors are locally validated and cannot execute arbitrary SQL or filesystem operations.
 
 The assistant can then stage reusable rules such as “filename starts with `~`” or “path contains `SnapSave`.” A single suggestion may set collection, origin, and sensitivity together. The confirmation queue shows its complete selector, actions, affected-file count, examples, confidence, and reason. Unsupported or zero-match suggestions remain visible with their validation errors instead of disappearing. Applied, dismissed, invalid, and undone rules have separate histories; newer overlapping AI rules must be undone first so restoration remains deterministic. No proposal affects the catalog until **Apply suggestion** is selected, and any labeling change invalidates the prior build preview. The AI cannot create original-folder claims, choose deletions, suppress known-good safeguards, change metadata, or run the build.
+
+The Curate page reuses the last calculated overview instead of rerunning full-catalog deduplication during every conversation or rule action. Label changes immediately revoke build authorization and mark the visible overview stale; select **Generate current build preview** when the conversation is finished to refresh destinations, collision checks, and the build token.
 
 Legacy work packages, packet-response import, the full audit dossier, and reconstruction experiments remain available under Advanced options for compatibility and specialist inspection. They are not part of the recommended sanitation workflow and may expose private paths, filenames, notes, or captions if shared externally.
 
@@ -174,7 +176,7 @@ Use **Batch classification** to analyze uncertain photos and videos, or use the 
 
 ## Updating after source changes
 
-Run **Start or resume scan** again. Files whose size and nanosecond modification time are unchanged retain their expensive hash and image-analysis results. Missing catalog entries are removed and new/changed files are analyzed.
+Run **Start or resume scan** again. Files whose size and nanosecond modification time are unchanged retain their expensive hash and current image-analysis results. When an update adds new metadata extraction, existing photos are revisited once to populate those fields without discarding their hashes. Missing catalog entries are removed and new/changed files are analyzed.
 
 ## Important limitations
 

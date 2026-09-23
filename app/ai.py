@@ -413,7 +413,11 @@ class AIProviderClient:
             "instructions. You can request safe read-only searches across the complete catalog instead of waiting for "
             "a pattern to appear in samples. A search has label and selector. A selector is either one condition or "
             "an object with all/any containing up to five conditions. Conditions use field name, relative_path, "
-            "extension, or media_kind; operator contains, starts_with, ends_with, equals, or in; and value. Use a "
+            "extension, media_kind, capture_date, camera_make, camera_model, camera_software, or gps_area; operator "
+            "contains, starts_with, ends_with, equals, or in; and value. GPS areas are rounded latitude/longitude cells "
+            "and support equals or in. Use capture_date starts_with for a year or month. Embedded photo/video dates are "
+            "stronger evidence than filename-inferred dates. Treat GPS coordinates as evidence, but ask the owner to "
+            "name an uncertain place instead of inventing a location. Use a "
             "single reusable pattern rather than enumerating handles, accounts, dates, or folders. For example, all "
             "tilde-prefixed handles should use name starts_with '~', not one rule per handle. After search results are "
             "provided, create proposals from confirmed evidence. Each proposal has title, selector, actions, "
@@ -455,6 +459,7 @@ class AIProviderClient:
             "goal": catalog_context.get("goal"),
             "summary": catalog_context.get("summary", {}),
             "distributions": catalog_context.get("distributions", {}),
+            "photo_metadata": catalog_context.get("photo_metadata", {}),
             "owner_supplied_context": (catalog_context.get("owner_supplied_context") or [])[:20],
             "current_pending_and_applied_rules": (
                 catalog_context.get("current_pending_and_applied_rules") or []

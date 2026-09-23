@@ -62,6 +62,7 @@ SYSTEM_FOLDER_NAMES = {
     "appdata", "cache", "temp", "temporary internet files", "node_modules",
 }
 VIDEO_ANALYSIS_VERSION = 1
+IMAGE_ANALYSIS_VERSION = 2
 AI_PACKET_SCHEMA_VERSION = 1
 AI_PACKET_TARGET_CHARS = 160_000
 AI_PACKET_MAX_RESPONSE_BYTES = 5 * 1024 * 1024
@@ -129,6 +130,13 @@ def initialize(db_path: Path) -> None:
               exif_date TEXT,
               exif_make TEXT,
               exif_model TEXT,
+              exif_lens_model TEXT,
+              exif_software TEXT,
+              exif_offset_time TEXT,
+              exif_latitude REAL,
+              exif_longitude REAL,
+              exif_altitude REAL,
+              image_analysis_version INTEGER DEFAULT 0,
               filename_date TEXT,
               date_confidence INTEGER DEFAULT 0,
               date_reason TEXT,
@@ -245,6 +253,8 @@ def initialize(db_path: Path) -> None:
               UNIQUE(file_id,related_file_id,relationship)
             );
             CREATE INDEX IF NOT EXISTS idx_file_relationships_file ON file_relationships(file_id);
+            CREATE INDEX IF NOT EXISTS idx_file_relationships_kind_related
+              ON file_relationships(relationship,related_file_id,confidence,file_id);
             CREATE TABLE IF NOT EXISTS reconstruction_proposals (
               file_id INTEGER PRIMARY KEY,
               proposed_path TEXT NOT NULL,
@@ -422,6 +432,8 @@ def initialize(db_path: Path) -> None:
         )
         existing_columns = {row[1] for row in db.execute("PRAGMA table_info(files)")}
         migrations = {
+            "exif_date": "TEXT", "exif_make": "TEXT", "exif_model": "TEXT",
+            "filename_date": "TEXT", "date_confidence": "INTEGER DEFAULT 0", "date_reason": "TEXT",
             "ai_caption": "TEXT", "ai_people": "TEXT", "ai_objects": "TEXT", "ai_ocr_text": "TEXT",
             "ai_tags": "TEXT", "ai_model": "TEXT", "ai_updated_at": "TEXT",
             "known_good_match": "INTEGER DEFAULT 0", "known_good_count": "INTEGER DEFAULT 0",
@@ -433,6 +445,9 @@ def initialize(db_path: Path) -> None:
             "video_width": "INTEGER", "video_height": "INTEGER", "video_fps": "REAL",
             "video_codec": "TEXT", "audio_codec": "TEXT", "video_creation_date": "TEXT",
             "video_analysis_version": "INTEGER DEFAULT 0",
+            "exif_lens_model": "TEXT", "exif_software": "TEXT", "exif_offset_time": "TEXT",
+            "exif_latitude": "REAL", "exif_longitude": "REAL", "exif_altitude": "REAL",
+            "image_analysis_version": "INTEGER DEFAULT 0",
             "curation_label": "TEXT", "curation_label_source": "TEXT",
             "sanitized_path": "TEXT", "sanitized_method": "TEXT", "sanitized_at": "TEXT",
             "sanitization_detail": "TEXT",
@@ -481,6 +496,8 @@ def initialize(db_path: Path) -> None:
         db.execute("CREATE INDEX IF NOT EXISTS idx_files_known_good ON files(known_good_match)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_files_media_kind ON files(media_kind)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_files_media_origin ON files(media_origin)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_files_exif_date ON files(exif_date)")
+        db.execute("CREATE INDEX IF NOT EXISTS idx_files_exif_gps ON files(exif_latitude,exif_longitude)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_files_sanitized_path ON files(sanitized_path)")
         db.execute("CREATE INDEX IF NOT EXISTS idx_reconstruction_review ON reconstruction_proposals(review_state)")
         migrated_file_columns = {row[1] for row in db.execute("PRAGMA table_info(files)")}
@@ -569,6 +586,65 @@ def normalize_exif_date(raw: object) -> str | None:
     return None
 
 
+def _exif_text(raw: object) -> str | None:
+    if raw is None:
+        return None
+    if isinstance(raw, bytes):
+        raw = raw.decode("utf-8", errors="replace")
+    value = str(raw).strip().strip("\x00")
+    return value[:300] or None
+
+
+def _exif_number(raw: object) -> float | None:
+    try:
+        value = float(raw)
+    except (TypeError, ValueError, ZeroDivisionError):
+        try:
+            value = float(raw[0]) / float(raw[1])
+        except (TypeError, ValueError, ZeroDivisionError, IndexError):
+            return None
+    return value if math.isfinite(value) else None
+
+
+def extract_exif_gps(exif: object) -> tuple[float | None, float | None, float | None]:
+    """Read standard EXIF GPS DMS values without guessing missing references."""
+    try:
+        gps = exif.get_ifd(34853)
+    except (AttributeError, KeyError, TypeError, ValueError):
+        try:
+            gps = exif.get(34853) or {}
+        except AttributeError:
+            gps = {}
+    if not isinstance(gps, dict):
+        return None, None, None
+
+    def coordinate(raw: object, reference: object, maximum: float) -> float | None:
+        if not isinstance(raw, (tuple, list)) or len(raw) != 3:
+            return None
+        pieces = [_exif_number(item) for item in raw]
+        if any(item is None for item in pieces):
+            return None
+        ref = (_exif_text(reference) or "").upper()
+        if ref not in {"N", "S", "E", "W"}:
+            return None
+        value = float(pieces[0]) + float(pieces[1]) / 60 + float(pieces[2]) / 3600
+        if not 0 <= value <= maximum:
+            return None
+        if ref in {"S", "W"}:
+            value = -value
+        return round(value, 7)
+
+    latitude = coordinate(gps.get(2), gps.get(1), 90)
+    longitude = coordinate(gps.get(4), gps.get(3), 180)
+    altitude = _exif_number(gps.get(6))
+    altitude_ref = gps.get(5)
+    if isinstance(altitude_ref, bytes):
+        altitude_ref = altitude_ref[0] if altitude_ref else 0
+    if altitude is not None:
+        altitude = round(-altitude if altitude_ref == 1 else altitude, 2)
+    return latitude, longitude, altitude
+
+
 def infer_media_kind(path: Path, mime: str | None = None) -> str:
     extension = path.suffix.lower()
     mime = mime or ""
@@ -651,6 +727,9 @@ def analyze_video(path: Path) -> dict:
             "is_image": 0, "width": width, "height": height,
             "megapixels": round(width * height / 1_000_000, 3) if width and height else None,
             "phash": None, "exif_date": None, "exif_make": None, "exif_model": None,
+            "exif_lens_model": None, "exif_software": None, "exif_offset_time": None,
+            "exif_latitude": None, "exif_longitude": None, "exif_altitude": None,
+            "image_analysis_version": 0,
             "video_duration": duration, "video_width": width, "video_height": height,
             "video_fps": _parse_frame_rate(video.get("avg_frame_rate") or video.get("r_frame_rate")),
             "video_codec": video.get("codec_name"), "audio_codec": audio.get("codec_name") if audio else None,
@@ -661,6 +740,9 @@ def analyze_video(path: Path) -> dict:
             "validation": "corrupt", "validation_detail": str(exc)[:300], "is_image": 0,
             "width": None, "height": None, "megapixels": None, "phash": None,
             "exif_date": None, "exif_make": None, "exif_model": None,
+            "exif_lens_model": None, "exif_software": None, "exif_offset_time": None,
+            "exif_latitude": None, "exif_longitude": None, "exif_altitude": None,
+            "image_analysis_version": 0,
             "video_duration": None, "video_width": None, "video_height": None,
             "video_fps": None, "video_codec": None, "audio_codec": None,
             "video_creation_date": None, "video_analysis_version": VIDEO_ANALYSIS_VERSION,
@@ -708,8 +790,12 @@ def analyze_image(path: Path) -> dict:
             width, height = image.size
             exif = image.getexif()
             exif_date = normalize_exif_date(exif.get(36867) or exif.get(36868) or exif.get(306))
-            make = str(exif.get(271) or "").strip() or None
-            model = str(exif.get(272) or "").strip() or None
+            make = _exif_text(exif.get(271))
+            model = _exif_text(exif.get(272))
+            lens_model = _exif_text(exif.get(42036))
+            software = _exif_text(exif.get(305))
+            offset_time = _exif_text(exif.get(36881) or exif.get(36880))
+            latitude, longitude, altitude = extract_exif_gps(exif)
             # Decode at review resolution instead of allocating the full photo solely for pHash.
             image.draft("RGB", (512, 512))
             image = ImageOps.exif_transpose(image)
@@ -722,19 +808,30 @@ def analyze_image(path: Path) -> dict:
             "is_image": 1, "width": width, "height": height,
             "megapixels": round(pixels / 1_000_000, 3), "phash": perceptual,
             "exif_date": exif_date, "exif_make": make, "exif_model": model,
+            "exif_lens_model": lens_model, "exif_software": software,
+            "exif_offset_time": offset_time, "exif_latitude": latitude,
+            "exif_longitude": longitude, "exif_altitude": altitude,
+            "image_analysis_version": IMAGE_ANALYSIS_VERSION,
         }
     except (UnidentifiedImageError, OSError, ValueError, SyntaxError) as exc:
         return {
             "validation": "corrupt", "validation_detail": str(exc)[:300],
             "is_image": 1, "width": None, "height": None, "megapixels": None,
             "phash": None, "exif_date": None, "exif_make": None, "exif_model": None,
+            "exif_lens_model": None, "exif_software": None, "exif_offset_time": None,
+            "exif_latitude": None, "exif_longitude": None, "exif_altitude": None,
+            "image_analysis_version": IMAGE_ANALYSIS_VERSION,
         }
 
 
 def analyze_raw(path: Path) -> dict:
     try:
         result = subprocess.run(
-            ["exiftool", "-j", "-ImageWidth", "-ImageHeight", "-DateTimeOriginal", "-CreateDate", "-Make", "-Model", str(path)],
+            [
+                "exiftool", "-j", "-n", "-ImageWidth", "-ImageHeight", "-DateTimeOriginal",
+                "-CreateDate", "-OffsetTimeOriginal", "-OffsetTime", "-Make", "-Model",
+                "-LensModel", "-Software", "-GPSLatitude", "-GPSLongitude", "-GPSAltitude", str(path),
+            ],
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=60,
         )
         if result.returncode != 0:
@@ -749,13 +846,23 @@ def analyze_raw(path: Path) -> dict:
             "is_image": 1, "width": width, "height": height,
             "megapixels": round(width * height / 1_000_000, 3), "phash": None,
             "exif_date": normalize_exif_date(record.get("DateTimeOriginal") or record.get("CreateDate")),
-            "exif_make": record.get("Make"), "exif_model": record.get("Model"),
+            "exif_make": _exif_text(record.get("Make")), "exif_model": _exif_text(record.get("Model")),
+            "exif_lens_model": _exif_text(record.get("LensModel")),
+            "exif_software": _exif_text(record.get("Software")),
+            "exif_offset_time": _exif_text(record.get("OffsetTimeOriginal") or record.get("OffsetTime")),
+            "exif_latitude": _exif_number(record.get("GPSLatitude")),
+            "exif_longitude": _exif_number(record.get("GPSLongitude")),
+            "exif_altitude": _exif_number(record.get("GPSAltitude")),
+            "image_analysis_version": IMAGE_ANALYSIS_VERSION,
         }
     except Exception as exc:
         return {
             "validation": "unreadable", "validation_detail": str(exc)[:300], "is_image": 1,
             "width": None, "height": None, "megapixels": None, "phash": None,
             "exif_date": None, "exif_make": None, "exif_model": None,
+            "exif_lens_model": None, "exif_software": None, "exif_offset_time": None,
+            "exif_latitude": None, "exif_longitude": None, "exif_altitude": None,
+            "image_analysis_version": IMAGE_ANALYSIS_VERSION,
         }
 
 
@@ -855,6 +962,7 @@ def analyze_record(record: dict) -> dict:
         metadata = {
             "validation": "zero", "validation_detail": "zero-byte file", "is_image": 0,
             "video_analysis_version": VIDEO_ANALYSIS_VERSION if media_kind == "video" else 0,
+            "image_analysis_version": IMAGE_ANALYSIS_VERSION if media_kind == "photo" else 0,
         }
     elif media_kind == "video":
         metadata = analyze_video(path)
@@ -967,6 +1075,7 @@ class Curator:
         self.phase_started = time.monotonic()
         self._summary_cache: tuple[float, dict] | None = None
         self._reconstruction_summary_cache: tuple[float, dict] | None = None
+        self._sanitization_overview_cache: tuple[float, dict] | None = None
         self.state = {
             "running": False, "phase": "idle", "processed": 0, "total": 0,
             "rate": 0.0, "message": "Ready", "error": None, "job_id": 0,
@@ -1003,6 +1112,7 @@ class Curator:
             initialize(self.db_path)
             self._summary_cache = None
             self._reconstruction_summary_cache = None
+            self._sanitization_overview_cache = None
             self.stop_event.clear()
             self.state.update(
                 running=False, phase="idle", processed=0, total=0, rate=0.0,
@@ -1016,12 +1126,14 @@ class Curator:
                 values.setdefault("completed_at", utcnow())
                 self._summary_cache = None
                 self._reconstruction_summary_cache = None
+                self._sanitization_overview_cache = None
             self.state.update(values)
 
     def _invalidate_summaries(self) -> None:
         with self.lock:
             self._summary_cache = None
             self._reconstruction_summary_cache = None
+            self._sanitization_overview_cache = None
 
     def _start_job(self, phase: str, message: str, total: int = 0) -> bool:
         with self.lock:
@@ -1365,7 +1477,9 @@ class Curator:
                     db.execute(
                         """UPDATE files SET mime=NULL,detected_extension=NULL,validation='unchecked',validation_detail=NULL,
                            content_hash=NULL,is_image=0,width=NULL,height=NULL,megapixels=NULL,phash=NULL,exif_date=NULL,
-                           exif_make=NULL,exif_model=NULL,filename_date=NULL,date_confidence=0,date_reason=NULL,
+                           exif_make=NULL,exif_model=NULL,exif_lens_model=NULL,exif_software=NULL,
+                           exif_offset_time=NULL,exif_latitude=NULL,exif_longitude=NULL,exif_altitude=NULL,
+                           image_analysis_version=0,filename_date=NULL,date_confidence=0,date_reason=NULL,
                            category=NULL,category_confidence=0,category_reason=NULL,quality_score=0,exact_group=NULL,
                            similar_group=NULL,known_good_match=0,known_good_count=0,known_good_library=NULL,
                            known_good_path=NULL,decision='undecided',exported_path=NULL,ai_caption=NULL,ai_people=NULL,
@@ -1430,8 +1544,14 @@ class Curator:
         return inventory_result
 
     def _analyze_pending(self, db: sqlite3.Connection) -> None:
-        pending_where = "mime IS NULL OR (media_kind='video' AND COALESCE(video_analysis_version,0)<?)"
-        total = db.execute(f"SELECT COUNT(*) FROM files WHERE {pending_where}", (VIDEO_ANALYSIS_VERSION,)).fetchone()[0]
+        pending_where = (
+            "mime IS NULL OR (media_kind='photo' AND COALESCE(image_analysis_version,0)<?) "
+            "OR (media_kind='video' AND COALESCE(video_analysis_version,0)<?)"
+        )
+        analysis_versions = (IMAGE_ANALYSIS_VERSION, VIDEO_ANALYSIS_VERSION)
+        total = db.execute(
+            f"SELECT COUNT(*) FROM files WHERE {pending_where}", analysis_versions,
+        ).fetchone()[0]
         self._begin_phase(
             "analysis", total,
             f"Validating and classifying files with {self.analysis_workers} worker(s)",
@@ -1441,7 +1561,7 @@ class Curator:
             self._check_cancel()
             rows = [dict(row) for row in db.execute(
                 f"SELECT * FROM files WHERE {pending_where} ORDER BY id LIMIT ?",
-                (VIDEO_ANALYSIS_VERSION, self.batch_size),
+                (*analysis_versions, self.batch_size),
             ).fetchall()]
             if not rows:
                 break
@@ -1457,6 +1577,9 @@ class Curator:
                             "validation": "unreadable", "validation_detail": str(exc)[:300], "is_image": 0,
                             "width": None, "height": None, "megapixels": None, "phash": None, "exif_date": None,
                             "exif_make": None, "exif_model": None, "filename_date": None, "date_confidence": 0,
+                            "exif_lens_model": None, "exif_software": None, "exif_offset_time": None,
+                            "exif_latitude": None, "exif_longitude": None, "exif_altitude": None,
+                            "image_analysis_version": IMAGE_ANALYSIS_VERSION,
                             "date_reason": "analysis failed", "category": "Other Files", "category_confidence": 0,
                             "category_reason": "analysis failed", "quality_score": -1000,
                             "media_kind": infer_media_kind(Path(source_row["path"]), source_row.get("mime")),
@@ -1468,6 +1591,8 @@ class Curator:
                     db.execute(
                         """UPDATE files SET mime=?,detected_extension=?,validation=?,validation_detail=?,is_image=?,
                            width=?,height=?,megapixels=?,phash=?,exif_date=?,exif_make=?,exif_model=?,filename_date=?,
+                           exif_lens_model=?,exif_software=?,exif_offset_time=?,exif_latitude=?,exif_longitude=?,
+                           exif_altitude=?,image_analysis_version=?,
                            date_confidence=?,date_reason=?,category=?,category_confidence=?,category_reason=?,quality_score=?,
                            media_kind=?,media_origin=CASE WHEN media_origin_source IS NULL THEN ? ELSE media_origin END,
                            sensitivity=CASE WHEN sensitivity_source IS NULL THEN ? ELSE sensitivity END,
@@ -1477,7 +1602,10 @@ class Curator:
                         (result["mime"], result["detected_extension"], result.get("validation"), result.get("validation_detail"),
                          result.get("is_image", 0), result.get("width"), result.get("height"), result.get("megapixels"),
                          result.get("phash"), result.get("exif_date"), result.get("exif_make"), result.get("exif_model"),
-                         result.get("filename_date"), result.get("date_confidence", 0), result.get("date_reason"),
+                         result.get("filename_date"), result.get("exif_lens_model"), result.get("exif_software"),
+                         result.get("exif_offset_time"), result.get("exif_latitude"), result.get("exif_longitude"),
+                         result.get("exif_altitude"), result.get("image_analysis_version", 0),
+                         result.get("date_confidence", 0), result.get("date_reason"),
                          result.get("category"), result.get("category_confidence", 0), result.get("category_reason"),
                          result.get("quality_score", 0), result.get("media_kind", "other"),
                          result.get("media_origin", "unknown"), result.get("sensitivity", "unknown"),
@@ -3434,6 +3562,8 @@ class Curator:
                 "SELECT value FROM settings WHERE key='reconstruction_export_token'"
             ).fetchone()
         preview["authorized"] = bool(stored and stored["value"] == preview["token"])
+        with self.lock:
+            self._sanitization_overview_cache = (time.monotonic(), preview)
         return preview
 
     def export_reconstruction(self, token: str) -> dict:
@@ -4115,6 +4245,50 @@ class Curator:
                          WHERE size>0 AND known_good_match=0
                          GROUP BY value ORDER BY count DESC,value LIMIT 25"""
                 )]
+            metadata_coverage = dict(db.execute(
+                """SELECT
+                     SUM(media_kind='photo') photos,
+                     SUM(media_kind='photo' AND exif_date IS NOT NULL) photos_with_embedded_date,
+                     SUM(media_kind='photo' AND exif_latitude IS NOT NULL AND exif_longitude IS NOT NULL)
+                       photos_with_gps,
+                     SUM(media_kind='photo' AND (exif_make IS NOT NULL OR exif_model IS NOT NULL))
+                       photos_with_camera,
+                     SUM(media_kind='video' AND video_creation_date IS NOT NULL) videos_with_embedded_date
+                   FROM files WHERE size>0 AND known_good_match=0"""
+            ).fetchone())
+            metadata_coverage = {
+                key: int(value or 0) for key, value in metadata_coverage.items()
+            }
+            embedded_date_range = dict(db.execute(
+                """SELECT MIN(COALESCE(exif_date,video_creation_date)) earliest,
+                          MAX(COALESCE(exif_date,video_creation_date)) latest
+                   FROM files WHERE size>0 AND known_good_match=0
+                     AND COALESCE(exif_date,video_creation_date) IS NOT NULL"""
+            ).fetchone())
+            capture_years = [dict(row) for row in db.execute(
+                """SELECT substr(COALESCE(exif_date,video_creation_date,filename_date),1,4) year,
+                          COUNT(*) files,
+                          SUM(COALESCE(exif_date,video_creation_date) IS NOT NULL) embedded_dates
+                   FROM files WHERE size>0 AND known_good_match=0
+                     AND COALESCE(exif_date,video_creation_date,filename_date) IS NOT NULL
+                   GROUP BY year ORDER BY year"""
+            )]
+            camera_models = [dict(row) for row in db.execute(
+                """SELECT trim(COALESCE(exif_make,'') || ' ' || COALESCE(exif_model,'')) camera,
+                          COUNT(*) files,MIN(exif_date) earliest,MAX(exif_date) latest
+                   FROM files WHERE size>0 AND known_good_match=0
+                     AND (exif_make IS NOT NULL OR exif_model IS NOT NULL)
+                   GROUP BY camera ORDER BY files DESC,camera LIMIT 30"""
+            )]
+            gps_areas = [dict(row) for row in db.execute(
+                """SELECT printf('%.2f,%.2f',exif_latitude,exif_longitude) gps_area,
+                          COUNT(*) files,MIN(exif_date) earliest,MAX(exif_date) latest,
+                          COUNT(DISTINCT trim(COALESCE(exif_make,'') || ' ' || COALESCE(exif_model,'')))
+                            camera_count
+                   FROM files WHERE size>0 AND known_good_match=0
+                     AND exif_latitude IS NOT NULL AND exif_longitude IS NOT NULL
+                   GROUP BY gps_area ORDER BY files DESC,gps_area LIMIT 40"""
+            )]
             sample_count = int(db.execute(
                 "SELECT COUNT(*) FROM files WHERE size>0 AND known_good_match=0"
             ).fetchone()[0])
@@ -4124,7 +4298,15 @@ class Curator:
             sample_offset = ((max(message_count - 1, 0) * 40) % sample_count) if sample_count else 0
             samples = [dict(row) for row in db.execute(
                 """SELECT relative_path,name,media_kind,media_origin,category,validation,
-                          exif_date,video_creation_date,filename_date,curation_label
+                          exif_date,video_creation_date,filename_date,
+                          CASE WHEN exif_date IS NOT NULL THEN 'embedded_photo'
+                               WHEN video_creation_date IS NOT NULL THEN 'embedded_video'
+                               WHEN filename_date IS NOT NULL THEN 'filename_inference' END date_source,
+                          COALESCE(exif_date,video_creation_date,filename_date) capture_date,
+                          exif_make,exif_model,exif_lens_model,exif_software,
+                          CASE WHEN exif_latitude IS NOT NULL AND exif_longitude IS NOT NULL
+                               THEN printf('%.2f,%.2f',exif_latitude,exif_longitude) END gps_area,
+                          curation_label
                    FROM files WHERE size>0 AND known_good_match=0
                    ORDER BY (media_origin='unknown') DESC,category_confidence,id LIMIT 40 OFFSET ?""",
                 (sample_offset,),
@@ -4155,6 +4337,14 @@ class Curator:
         return {
             "goal": "label a sanitized browsing library; never reconstruct original folders",
             "summary": summary, "distributions": distributions,
+            "photo_metadata": {
+                "coverage": metadata_coverage,
+                "embedded_date_range": embedded_date_range,
+                "capture_years": capture_years,
+                "camera_models": camera_models,
+                "gps_areas": gps_areas,
+                "gps_precision_note": "GPS areas are rounded to 0.01 degrees before AI transmission.",
+            },
             "owner_supplied_context": owner_context,
             "current_pending_and_applied_rules": current_rules,
             "top_branches": top_branches,
@@ -4164,7 +4354,10 @@ class Curator:
 
     @staticmethod
     def _normalize_curation_selector(selector: object) -> dict:
-        fields = {"name", "relative_path", "extension", "media_kind"}
+        fields = {
+            "name", "relative_path", "extension", "media_kind", "capture_date",
+            "camera_make", "camera_model", "camera_software", "gps_area",
+        }
         operators = {"contains", "starts_with", "ends_with", "equals", "in"}
 
         def condition(value: object) -> dict:
@@ -4173,7 +4366,12 @@ class Curator:
             field = str(value.get("field") or "").strip().casefold()
             field = {
                 "filename": "name", "basename": "name", "path": "relative_path",
-                "relative path": "relative_path", "type": "media_kind",
+                "relative path": "relative_path", "type": "media_kind", "date": "capture_date",
+                "exif_date": "capture_date", "capture date": "capture_date",
+                "exif_make": "camera_make", "make": "camera_make",
+                "exif_model": "camera_model", "model": "camera_model",
+                "software": "camera_software", "exif_software": "camera_software",
+                "location": "gps_area", "gps": "gps_area", "gps area": "gps_area",
             }.get(field, field)
             operator = str(value.get("operator") or "").strip().casefold().replace("-", "_").replace(" ", "_")
             operator = {
@@ -4186,6 +4384,8 @@ class Curator:
                 raise ValueError(f"Unsupported selector field: {field or '(missing)' }.")
             if operator not in operators:
                 raise ValueError(f"Unsupported selector operator: {operator or '(missing)' }.")
+            if field == "gps_area" and operator not in {"equals", "in"}:
+                raise ValueError("GPS-area selectors support only equals or in.")
             if operator == "in":
                 if not isinstance(raw_value, list) or not raw_value or len(raw_value) > 25:
                     raise ValueError("The 'in' selector requires 1–25 values.")
@@ -4217,6 +4417,13 @@ class Curator:
         columns = {
             "name": "name", "relative_path": "relative_path",
             "extension": "extension", "media_kind": "media_kind",
+            "capture_date": "COALESCE(exif_date,video_creation_date,filename_date,'')",
+            "camera_make": "exif_make", "camera_model": "exif_model",
+            "camera_software": "exif_software",
+            "gps_area": (
+                "CASE WHEN exif_latitude IS NOT NULL AND exif_longitude IS NOT NULL "
+                "THEN printf('%.2f,%.2f',exif_latitude,exif_longitude) ELSE '' END"
+            ),
         }
 
         def compile_condition(item: dict) -> tuple[str, list[object]]:
@@ -4264,7 +4471,14 @@ class Curator:
         with connect(self.db_path) as db:
             count = int(db.execute(f"SELECT COUNT(*) FROM files WHERE {base}", params).fetchone()[0])
             examples = [dict(row) for row in db.execute(
-                f"""SELECT relative_path,name,media_kind,media_origin,sensitivity,curation_label
+                f"""SELECT relative_path,name,media_kind,media_origin,sensitivity,curation_label,
+                           COALESCE(exif_date,video_creation_date,filename_date) capture_date,
+                           CASE WHEN exif_date IS NOT NULL THEN 'embedded_photo'
+                                WHEN video_creation_date IS NOT NULL THEN 'embedded_video'
+                                WHEN filename_date IS NOT NULL THEN 'filename_inference' END date_source,
+                           exif_make,exif_model,
+                           CASE WHEN exif_latitude IS NOT NULL AND exif_longitude IS NOT NULL
+                                THEN printf('%.2f,%.2f',exif_latitude,exif_longitude) END gps_area
                     FROM files WHERE {base} ORDER BY quality_score DESC,id LIMIT 10""",
                 params,
             )]
@@ -4278,10 +4492,26 @@ class Curator:
                     FROM files WHERE {base} GROUP BY value ORDER BY count DESC LIMIT 10""",
                 params,
             )]
+            capture_years = [dict(row) for row in db.execute(
+                f"""SELECT substr(COALESCE(exif_date,video_creation_date,filename_date),1,4) value,
+                           COUNT(*) count
+                    FROM files WHERE {base}
+                      AND COALESCE(exif_date,video_creation_date,filename_date) IS NOT NULL
+                    GROUP BY value ORDER BY count DESC,value LIMIT 20""",
+                params,
+            )]
+            gps_areas = [dict(row) for row in db.execute(
+                f"""SELECT printf('%.2f,%.2f',exif_latitude,exif_longitude) value,COUNT(*) count
+                    FROM files WHERE {base}
+                      AND exif_latitude IS NOT NULL AND exif_longitude IS NOT NULL
+                    GROUP BY value ORDER BY count DESC,value LIMIT 20""",
+                params,
+            )]
         return {
             "label": str(label or "Catalog search")[:200], "selector": normalized,
             "selector_text": self._curation_selector_text(normalized), "matches": count,
             "examples": examples, "media_types": media_types, "origins": origins,
+            "capture_years": capture_years, "gps_areas": gps_areas,
         }
 
     @staticmethod
@@ -4499,6 +4729,27 @@ class Curator:
         }
         return conversation
 
+    @staticmethod
+    def _mark_sanitization_preview_stale(db: sqlite3.Connection) -> None:
+        """Keep expensive overview counts for display while revoking build authorization."""
+        stored = db.execute(
+            "SELECT value FROM settings WHERE key='sanitization_preview_json'"
+        ).fetchone()
+        if stored:
+            try:
+                preview = json.loads(stored["value"])
+            except (TypeError, ValueError, json.JSONDecodeError):
+                preview = None
+            if isinstance(preview, dict):
+                preview.update(token="", authorized=False, stale=True)
+                db.execute(
+                    "UPDATE settings SET value=? WHERE key='sanitization_preview_json'",
+                    (json.dumps(preview, ensure_ascii=False, separators=(",", ":")),),
+                )
+            else:
+                db.execute("DELETE FROM settings WHERE key='sanitization_preview_json'")
+        db.execute("DELETE FROM settings WHERE key='sanitization_export_token'")
+
     def review_curation_proposal(self, proposal_id: int, decision: str) -> dict:
         if decision not in {"accepted", "rejected", "undone"}:
             raise ValueError("Choose accepted, rejected, or undone.")
@@ -4569,9 +4820,7 @@ class Curator:
                     "UPDATE curation_chat_proposals SET affected_files=? WHERE id=?",
                     (affected, proposal_id),
                 )
-                db.execute(
-                    "DELETE FROM settings WHERE key IN ('sanitization_export_token','sanitization_preview_json')"
-                )
+                self._mark_sanitization_preview_stale(db)
             elif decision == "undone":
                 if proposal["status"] != "accepted":
                     raise ValueError("Only an applied suggestion can be undone.")
@@ -4635,9 +4884,7 @@ class Curator:
                         (proposal_id, proposal_id, utcnow(), source, proposal_id),
                     )
                 db.execute("DELETE FROM file_facets WHERE source=?", (source,))
-                db.execute(
-                    "DELETE FROM settings WHERE key IN ('sanitization_export_token','sanitization_preview_json')"
-                )
+                self._mark_sanitization_preview_stale(db)
             else:
                 if proposal["status"] != "pending":
                     raise ValueError("Only a pending suggestion can be dismissed.")
@@ -4664,6 +4911,13 @@ class Curator:
             "sensitivity": row["sensitivity"], "width": row["width"], "height": row["height"],
             "duration": row["video_duration"], "video_codec": row["video_codec"],
             "audio_codec": row["audio_codec"], "exif_date": row["exif_date"],
+            "camera_make": row["exif_make"], "camera_model": row["exif_model"],
+            "lens_model": row["exif_lens_model"], "camera_software": row["exif_software"],
+            "capture_time_offset": row["exif_offset_time"],
+            "gps_area": (
+                f"{row['exif_latitude']:.2f},{row['exif_longitude']:.2f}"
+                if row["exif_latitude"] is not None and row["exif_longitude"] is not None else None
+            ),
             "video_creation_date": row["video_creation_date"], "filename_date": row["filename_date"],
             "existing_facets": self.file_facets(file_id),
         }
@@ -5554,6 +5808,12 @@ class Curator:
 
     def sanitization_overview(self) -> dict:
         """Return a page-load summary without walking and statting every source file."""
+        now = time.monotonic()
+        with self.lock:
+            if self._sanitization_overview_cache:
+                cached_at, cached = self._sanitization_overview_cache
+                if now - cached_at < 30:
+                    return dict(cached)
         with connect(self.db_path) as db:
             stored_preview = db.execute(
                 "SELECT value FROM settings WHERE key='sanitization_preview_json'"
@@ -5570,6 +5830,8 @@ class Curator:
                     preview["authorized"] = bool(
                         stored_token and stored_token["value"] == preview.get("token")
                     )
+                    with self.lock:
+                        self._sanitization_overview_cache = (now, preview)
                     return preview
 
             counts = dict(db.execute(
@@ -5582,25 +5844,23 @@ class Curator:
                                        AND COALESCE(validation,'unchecked')!='unreadable'),0) duplicate_pool
                    FROM files"""
             ).fetchone())
-            eligible = dict(db.execute(
-                f"""SELECT COUNT(*) included,COALESCE(SUM(size),0) total_bytes,
-                            COALESCE(SUM(validation='corrupt'),0) corrupt_included,
-                            COALESCE(SUM(media_kind='photo' AND exif_date IS NULL AND (
-                              (date_confidence>=85 AND filename_date IS NOT NULL) OR
-                              (zero_date_confidence>=85 AND zero_date IS NOT NULL)
-                            )),0) repair_candidates
-                     FROM ({self._sanitization_query()})"""
-            ).fetchone())
             collections = [dict(row) for row in db.execute(
                 f"""SELECT CASE COALESCE(media_kind,'other')
                                WHEN 'photo' THEN 'Photos' WHEN 'video' THEN 'Videos'
                                WHEN 'audio' THEN 'Audio' WHEN 'document' THEN 'Documents'
                                WHEN 'email' THEN 'Email' ELSE 'Other Files' END name,
-                            COUNT(*) files,COALESCE(SUM(size),0) bytes
+                            COUNT(*) files,COALESCE(SUM(size),0) bytes,
+                            COALESCE(SUM(validation='corrupt'),0) corrupt_files,
+                            COALESCE(SUM(media_kind='photo' AND exif_date IS NULL AND (
+                              (date_confidence>=85 AND filename_date IS NOT NULL) OR
+                              (zero_date_confidence>=85 AND zero_date IS NOT NULL)
+                            )),0) repair_files
                      FROM ({self._sanitization_query()}) GROUP BY name ORDER BY name"""
             )]
-        included = int(eligible["included"] or 0)
-        repairs = int(eligible["repair_candidates"] or 0)
+        included = sum(int(item["files"] or 0) for item in collections)
+        total_bytes = sum(int(item["bytes"] or 0) for item in collections)
+        corrupt_included = sum(int(item["corrupt_files"] or 0) for item in collections)
+        repairs = sum(int(item["repair_files"] or 0) for item in collections)
         output_parent = self._existing_parent(self.output)
         try:
             same_filesystem = bool(
@@ -5609,21 +5869,28 @@ class Curator:
         except OSError:
             same_filesystem = False
         independent = repairs if same_filesystem else included
-        return {
-            **counts, **eligible,
+        result = {
+            **counts, "included": included, "total_bytes": total_bytes,
+            "corrupt_included": corrupt_included, "repair_candidates": repairs,
             "duplicate_excluded": max(int(counts["duplicate_pool"] or 0) - included, 0),
             "zero_date_repairs": 0, "already_built": 0, "unavailable": 0,
             "hardlink_candidates": max(included - independent, 0),
             "independent_candidates": independent, "independent_bytes": 0,
             "independent_bytes_human": "calculated in preview",
-            "total_bytes_human": human_bytes(int(eligible["total_bytes"] or 0)),
+            "total_bytes_human": human_bytes(total_bytes),
             "collisions": 0, "same_filesystem": same_filesystem,
             "collections": [
-                {**item, "bytes_human": human_bytes(int(item["bytes"] or 0))}
+                {
+                    "name": item["name"], "files": item["files"], "bytes": item["bytes"],
+                    "bytes_human": human_bytes(int(item["bytes"] or 0)),
+                }
                 for item in collections
             ],
             "token": "", "authorized": False,
         }
+        with self.lock:
+            self._sanitization_overview_cache = (now, result)
+        return result
 
     def _independent_clone(self, source: Path, destination: Path, allow_copy: bool) -> str:
         result = subprocess.run(
@@ -5761,7 +6028,9 @@ class Curator:
             "content_hash", "validation", "media_kind", "media_origin", "media_origin_source",
             "sensitivity", "sensitivity_source", "curation_label", "curation_label_source",
             "known_good_match", "exact_group", "similar_group",
-            "exif_date", "video_creation_date", "filename_date", "date_confidence", "date_reason",
+            "exif_date", "exif_make", "exif_model", "exif_lens_model", "exif_software",
+            "exif_offset_time", "exif_latitude", "exif_longitude", "exif_altitude",
+            "video_creation_date", "filename_date", "date_confidence", "date_reason",
         ]
         with connect(self.db_path) as db, csv_path.open("w", newline="", encoding="utf-8") as csv_file, jsonl_path.open("w", encoding="utf-8") as json_file:
             writer = csv.DictWriter(csv_file, fieldnames=fields)
@@ -5842,7 +6111,9 @@ class Curator:
         fields = [
             "id", "relative_path", "name", "extension", "size", "mtime_ns", "ctime_ns", "mode", "uid", "gid",
             "evidence_role", "mime", "validation", "validation_detail",
-            "content_hash", "width", "height", "megapixels", "phash", "exif_date", "filename_date",
+            "content_hash", "width", "height", "megapixels", "phash", "exif_date",
+            "exif_make", "exif_model", "exif_lens_model", "exif_software", "exif_offset_time",
+            "exif_latitude", "exif_longitude", "exif_altitude", "image_analysis_version", "filename_date",
             "date_confidence", "date_reason", "category", "category_confidence", "category_reason",
             "quality_score", "exact_group", "similar_group", "known_good_match", "known_good_count",
             "known_good_library", "known_good_path", "decision", "exported_path",

@@ -110,7 +110,7 @@
 <section class="card" id="ai-provider">
   <div class="section-heading"><div><span class="step-label">Step 3 · Optional AI assist</span><h3>Interpret the evidence you supplied</h3></div><span id="ai-provider-state" class="pill {{ 'good' if ai_settings.enabled else 'warn' }}">{{ 'Enabled' if ai_settings.enabled else 'Not configured' }}</span></div>
   <p>AI can interpret your explanations and propose classifications, but nothing is applied until you approve it. It never gets filesystem access or permission to move files.</p>
-  <div class="provider-summary"><div><span class="muted">Current connection</span><strong id="provider-summary-name">{% if ai_settings.enabled %}{{ ai_settings.provider_name }} · {{ ai_settings.model }}{% else %}No AI provider enabled{% endif %}</strong></div><span class="muted">Folder interpretation sends names, notes, and context—not photos or videos.</span></div>
+  <div class="provider-summary"><div><span class="muted">Current connection</span><strong id="provider-summary-name">{% if ai_settings.enabled %}{{ ai_settings.provider_name }} · {{ ai_settings.model }}{% else %}No AI provider enabled{% endif %}</strong></div><span class="muted">AI conversations may send names, notes, capture dates, camera details, and rounded GPS areas—not photos or videos.</span></div>
   <details class="review-drawer connection-drawer" {% if not ai_settings.enabled %}open{% endif %}><summary>Configure or change the AI connection</summary>
   {% if ai_settings.endpoint and not ai_settings.is_local and not ai_settings.allow_cloud_media %}<div class="notice"><strong>Remote endpoint detected.</strong> Preview transmission is blocked until you opt in below.</div>{% endif %}
   <form class="stacked-form ai-connect" id="ai-provider-form">
@@ -143,7 +143,7 @@
     <div id="ai-provider-result" class="connection-result" role="status" aria-live="polite">No test run in this browser session.</div>
     <div class="check-row">
       <label><input type="checkbox" name="enabled" value="1" {% if ai_settings.enabled %}checked{% endif %}> Enable provider</label>
-      <label><input type="checkbox" name="allow_cloud_media" value="1" {% if ai_settings.allow_cloud_media %}checked{% endif %}> Allow previews and context to leave my network</label>
+      <label><input type="checkbox" name="allow_cloud_media" value="1" {% if ai_settings.allow_cloud_media %}checked{% endif %}> Allow previews and metadata/context, including rounded GPS areas, to leave my network</label>
       <label><input type="checkbox" name="allow_sensitive_media" value="1" {% if ai_settings.allow_sensitive_media %}checked{% endif %}> Include media already marked sensitive</label>
     </div>
     <details class="advanced-settings"><summary>Advanced settings</summary><div class="form-grid">

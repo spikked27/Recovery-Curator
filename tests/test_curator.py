@@ -11,7 +11,7 @@ from unittest.mock import MagicMock, Mock, patch
 from PIL import Image
 
 from app.ai import AIProviderClient, AIProviderResponseError, ProviderConfig
-from app.curator import Curator, connect, parse_filename_date
+from app.curator import IMAGE_ANALYSIS_VERSION, Curator, connect, extract_exif_gps, parse_filename_date
 
 
 class CuratorTests(unittest.TestCase):
@@ -21,6 +21,70 @@ class CuratorTests(unittest.TestCase):
         self.assertGreaterEqual(parsed.confidence, 90)
         self.assertIsNone(parse_filename_date("vacation_03-04-21.jpg").value)
         self.assertIsNone(parse_filename_date("IMG_20230231_120000.jpg").value)
+
+    def test_exif_gps_coordinates_are_normalized(self):
+        latitude, longitude, altitude = extract_exif_gps({
+            34853: {
+                1: "N", 2: (40, 42, 46.8),
+                3: "W", 4: (74, 0, 21.6),
+                5: 0, 6: 12.5,
+            },
+        })
+        self.assertAlmostEqual(latitude, 40.713, places=6)
+        self.assertAlmostEqual(longitude, -74.006, places=6)
+        self.assertEqual(altitude, 12.5)
+
+    def test_photo_metadata_context_and_search_use_dates_cameras_and_rounded_gps(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            Image.new("RGB", (120, 80), (30, 60, 90)).save(source / "trip.jpg")
+            Image.new("RGB", (120, 80), (90, 60, 30)).save(source / "other.jpg")
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+            curator.scan()
+            with connect(config / "catalog.sqlite3") as db:
+                db.execute(
+                    """UPDATE files SET exif_date='2021-07-04T14:30:00',exif_make='Apple',
+                              exif_model='iPhone 12',exif_lens_model='Wide Camera',
+                              exif_software='iOS 14',exif_latitude=40.71281,exif_longitude=-74.00602
+                       WHERE name='trip.jpg'"""
+                )
+                db.commit()
+
+            context = curator._curation_conversation_context()
+            metadata = context["photo_metadata"]
+            self.assertEqual(metadata["coverage"]["photos_with_embedded_date"], 1)
+            self.assertEqual(metadata["coverage"]["photos_with_gps"], 1)
+            self.assertEqual(metadata["camera_models"][0]["camera"], "Apple iPhone 12")
+            self.assertEqual(metadata["gps_areas"][0]["gps_area"], "40.71,-74.01")
+            sample = next(item for item in context["representative_samples"] if item["name"] == "trip.jpg")
+            self.assertEqual(sample["date_source"], "embedded_photo")
+            self.assertEqual(sample["gps_area"], "40.71,-74.01")
+
+            result = curator._catalog_search_for_curation({
+                "all": [
+                    {"field": "capture_date", "operator": "starts_with", "value": "2021-07"},
+                    {"field": "gps_area", "operator": "equals", "value": "40.71,-74.01"},
+                    {"field": "camera_model", "operator": "equals", "value": "iPhone 12"},
+                ],
+            }, "July NYC photos")
+            self.assertEqual(result["matches"], 1)
+            self.assertEqual(result["examples"][0]["date_source"], "embedded_photo")
+            self.assertEqual(result["gps_areas"], [{"value": "40.71,-74.01", "count": 1}])
+
+            with connect(config / "catalog.sqlite3") as db:
+                db.execute("UPDATE files SET image_analysis_version=0 WHERE name='other.jpg'")
+                db.commit()
+            curator.scan()
+            with connect(config / "catalog.sqlite3") as db:
+                version = db.execute(
+                    "SELECT image_analysis_version FROM files WHERE name='other.jpg'"
+                ).fetchone()[0]
+            self.assertEqual(version, IMAGE_ANALYSIS_VERSION)
 
     def test_scan_groups_and_catalog(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -456,6 +520,8 @@ class CuratorTests(unittest.TestCase):
             self.assertTrue({
                 "curation_label", "media_origin_source", "sensitivity_source",
                 "sanitized_path", "sanitized_method", "sanitization_detail",
+                "exif_latitude", "exif_longitude", "exif_lens_model", "exif_software",
+                "exif_offset_time", "image_analysis_version",
             } <= columns)
             self.assertEqual(tuple(migrated), ("video", "unknown", "Videos"))
 
@@ -1134,8 +1200,14 @@ class CuratorTests(unittest.TestCase):
                 )
             proposal = conversation["proposals"][0]
             self.assertEqual(proposal["affected_files"], 2)
+            exact_preview = curator.sanitization_preview(authorize=True)
+            self.assertTrue(exact_preview["authorized"])
             applied = curator.review_curation_proposal(proposal["id"], "accepted")
             self.assertEqual(applied["affected"], 2)
+            retained_overview = curator.sanitization_overview()
+            self.assertTrue(retained_overview["stale"])
+            self.assertFalse(retained_overview["authorized"])
+            self.assertEqual(retained_overview["included"], exact_preview["included"])
             with connect(config / "catalog.sqlite3") as db:
                 labels = {row[0] for row in db.execute(
                     "SELECT curation_label FROM files WHERE curation_label IS NOT NULL"

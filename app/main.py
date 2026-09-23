@@ -539,7 +539,7 @@ def api_curation_assistant_message():
         conversation = curator.send_curation_message(str(values.get("message") or ""))
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
-    return jsonify({"ok": True, "conversation": conversation, "preview": curator.sanitization_overview()})
+    return jsonify({"ok": True, "conversation": conversation})
 
 
 @app.post("/api/curate/assistant/proposal/<int:proposal_id>")
@@ -549,7 +549,7 @@ def api_review_curation_proposal(proposal_id: int):
         result = curator.review_curation_proposal(proposal_id, str(values.get("decision") or ""))
     except Exception as exc:
         return jsonify({"ok": False, "error": str(exc)}), 400
-    return jsonify({"ok": True, "result": result, "preview": curator.sanitization_overview()})
+    return jsonify({"ok": True, "result": result})
 
 
 @app.post("/reconstruction/start")

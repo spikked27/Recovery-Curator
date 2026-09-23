@@ -13,7 +13,7 @@
 
 <section class="card" id="analyze">
   <div class="section-heading"><div><span class="step-label">Step 1</span><h3>Refresh factual evidence</h3></div><button id="start-sanitization" {% if status.running or not summary.files %}disabled{% endif %}>Analyze for sanitization</button></div>
-  <p class="muted">This validates pending media, completes video metadata, refreshes exact known-good matches, and links zero-byte filenames to surviving content. It does not copy or modify files.</p>
+  <p class="muted">This validates pending media, extracts photo dates, camera details and GPS metadata, completes video metadata, refreshes exact known-good matches, and links zero-byte filenames to surviving content. It does not copy or modify files.</p>
   <div class="live-job {% if status.running %}is-running{% endif %}" id="sanitize-job">
     <div class="job-heading"><div><span class="step-label">Current activity</span><h3 id="sanitize-message">{{ status.message }}</h3></div><span id="sanitize-state" class="pill {{ 'good' if status.running else '' }}">{{ 'Running' if status.running else status.phase|replace('_',' ')|title }}</span></div>
     <progress id="sanitize-progress" max="{{ status.total or 1 }}" value="{{ status.processed or 0 }}"></progress>
@@ -31,7 +31,7 @@
       <textarea id="curation-chat-input" maxlength="4000" placeholder="For example: Folders containing SnapSave are exports from Snapchat. Help me separate those from ordinary downloads." {% if not ai_settings.enabled %}disabled{% endif %}></textarea>
       <button {% if not ai_settings.enabled %}disabled{% endif %}>Send</button>
     </form>
-    <div id="curation-chat-status" class="connection-result" role="status" aria-live="polite">The assistant receives bounded catalog summaries and representative filenames, not the recovered files themselves.</div>
+    <div id="curation-chat-status" class="connection-result" role="status" aria-live="polite">The assistant receives bounded catalog summaries, representative filenames, date/camera metadata, and neighborhood-scale GPS areas—not the recovered files themselves.</div>
   </div>
   <div id="curation-turn-summary" class="connection-result" role="status" aria-live="polite"></div>
   <div class="proposal-section">
@@ -55,6 +55,7 @@
     <div><div class="metric warn" id="preview-repairs">{{ preview.repair_candidates }}</div><div class="muted">safe date repairs</div></div>
     <div><div class="metric warn" id="preview-corrupt">{{ preview.corrupt_included }}</div><div class="muted">isolated for attention</div></div>
   </div>
+  {% if preview.stale %}<div class="notice"><strong>Labels changed since the last exact preview.</strong> The overview counts are retained for fast page loading, but generate a fresh preview before building so destinations and collision checks are current.</div>{% endif %}
   {% if preview.included and not preview.same_filesystem %}<div class="notice bad"><strong>The source and curated output are not on the same filesystem.</strong> Hardlinks will not be possible. Map Curated Output to the same direct Unraid disk/filesystem as the recovered source to avoid duplicating file data.</div>
   {% elif preview.included %}<div class="notice good"><strong>Space-saving layout available.</strong> {{ preview.hardlink_candidates }} unchanged files can be hardlinked. {{ preview.independent_candidates }} files require an independent reflink or copy because they need repair or cross a filesystem boundary.</div>{% endif %}
   <p><strong>{{ preview.total_bytes_human }}</strong> of unique content is represented. Independent files account for at most <strong>{{ preview.independent_bytes_human }}</strong>; reflinks consume space only as repaired blocks diverge.</p>
