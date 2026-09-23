@@ -219,6 +219,17 @@ class AIProviderClient:
             raise AIProviderError("The provider returned an unsupported message response.") from exc
 
     @staticmethod
+    def _stop_reason(response: dict) -> str:
+        """Return the native stop reason for Anthropic or OpenAI-style responses."""
+        reason = response.get("stop_reason")
+        if not reason:
+            try:
+                reason = response["choices"][0].get("finish_reason")
+            except (KeyError, IndexError, TypeError, AttributeError):
+                reason = ""
+        return str(reason or "").strip().casefold()
+
+    @staticmethod
     def _json_object(text: str, error: str) -> dict:
         text = text.strip()
         candidates = [text]
@@ -415,7 +426,9 @@ class AIProviderClient:
             "unless you include it in proposals. Return only one JSON object with keys reply, searches, and proposals. "
             "Use searches when full-catalog evidence is needed and leave proposals empty in that response. When search "
             "results are supplied, searches must be empty and you may return up to eight distinct reusable proposals. "
-            "Use empty arrays when asking a clarifying question or when no changes are warranted."
+            "Use empty arrays when asking a clarifying question or when no changes are warranted. Keep reply under 120 "
+            "words, each title under 12 words, and each reason under 25 words. Never enumerate matching files in reply; "
+            "summarize the pattern and counts instead. Request at most six searches and return at most eight proposals."
         )
         prompt = (
             f"Current bounded catalog context:\n{json.dumps(catalog_context, ensure_ascii=False)}\n\n"
@@ -423,12 +436,63 @@ class AIProviderClient:
             f"Prior assistant search plan, if any:\n{json.dumps(prior_plan or {}, ensure_ascii=False)}\n\n"
             f"Full-catalog search results, if any:\n{json.dumps(search_results or [], ensure_ascii=False)}"
         )
-        response = self._message(system, prompt, timeout=120, max_tokens=3000)
-        if response.get("stop_reason") in {"max_tokens", "refusal"}:
-            raw = self._response_text(response)
+        response = self._message(system, prompt, timeout=120, max_tokens=4096)
+        raw = self._response_text(response)
+        stop_reason = self._stop_reason(response)
+        if stop_reason == "refusal":
             raise AIProviderResponseError(
-                f"The provider stopped before completing the conversation ({response['stop_reason']}).", raw,
+                "The provider refused the conversation request.", raw,
             )
-        return self._json_object(
-            self._response_text(response), "The provider did not return a usable conversation response."
+        try:
+            # Some providers set max_tokens even when a complete JSON object was
+            # returned. A valid object is safe to use regardless of that flag.
+            return self._json_object(raw, "The provider did not return a usable conversation response.")
+        except AIProviderResponseError:
+            if stop_reason not in {"max_tokens", "length"}:
+                raise
+
+        compact_context = {
+            "goal": catalog_context.get("goal"),
+            "summary": catalog_context.get("summary", {}),
+            "distributions": catalog_context.get("distributions", {}),
+            "owner_supplied_context": (catalog_context.get("owner_supplied_context") or [])[:20],
+            "current_pending_and_applied_rules": (
+                catalog_context.get("current_pending_and_applied_rules") or []
+            )[:15],
+            "top_branches": (catalog_context.get("top_branches") or [])[:15],
+            "sample_window": catalog_context.get("sample_window", {}),
+            "representative_samples": (catalog_context.get("representative_samples") or [])[:12],
+        }
+        compact_search_results = []
+        for item in (search_results or [])[:6]:
+            if not isinstance(item, dict):
+                continue
+            shortened = dict(item)
+            shortened["examples"] = (item.get("examples") or [])[:5]
+            shortened["media_types"] = (item.get("media_types") or [])[:8]
+            shortened["origins"] = (item.get("origins") or [])[:8]
+            compact_search_results.append(shortened)
+        retry_prompt = (
+            "Your previous response was cut off. Answer again as compact JSON only. Do not explain the schema, list "
+            "files, repeat evidence, or include Markdown. Keep reply under 80 words, use no more than four searches "
+            "or six proposals, and keep every reason under 18 words.\n\n"
+            f"Compact catalog context:\n{json.dumps(compact_context, ensure_ascii=False)}\n\n"
+            f"Recent conversation:\n{json.dumps(conversation[-12:], ensure_ascii=False)}\n\n"
+            f"Prior assistant search plan, if any:\n{json.dumps(prior_plan or {}, ensure_ascii=False)}\n\n"
+            f"Full-catalog search results, if any:\n{json.dumps(compact_search_results, ensure_ascii=False)}"
         )
+        retry = self._message(system, retry_prompt, timeout=120, max_tokens=8192)
+        retry_raw = self._response_text(retry)
+        retry_reason = self._stop_reason(retry)
+        if retry_reason == "refusal":
+            raise AIProviderResponseError("The provider refused the compact retry.", retry_raw)
+        try:
+            return self._json_object(
+                retry_raw, "The provider did not return a usable conversation response after a compact retry."
+            )
+        except AIProviderResponseError as retry_error:
+            if retry_reason in {"max_tokens", "length"}:
+                raise AIProviderResponseError(
+                    "The provider exceeded its output limit twice, including a compact automatic retry.", retry_raw,
+                ) from retry_error
+            raise

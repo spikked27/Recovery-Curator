@@ -781,6 +781,56 @@ class CuratorTests(unittest.TestCase):
         self.assertEqual(raised.exception.raw_response, reply)
         self.assertIn("Provider reply began", str(raised.exception))
 
+    def test_curation_conversation_accepts_complete_json_with_max_tokens_stop(self):
+        client = AIProviderClient(ProviderConfig(
+            provider_id="anthropic", provider_name="Claude",
+            endpoint="https://api.anthropic.com/v1", model="claude-test",
+            enabled=True, allow_cloud_media=True,
+        ))
+        expected = {"reply": "One short answer.", "searches": [], "proposals": []}
+        response = {
+            "stop_reason": "max_tokens",
+            "content": [{"type": "text", "text": json.dumps(expected)}],
+        }
+        with patch.object(client, "_message", return_value=response) as message:
+            result = client.curation_conversation([], {"summary": {}})
+        self.assertEqual(result, expected)
+        self.assertEqual(message.call_count, 1)
+
+    def test_curation_conversation_compactly_retries_truncated_response(self):
+        client = AIProviderClient(ProviderConfig(
+            provider_id="anthropic", provider_name="Claude",
+            endpoint="https://api.anthropic.com/v1", model="claude-test",
+            enabled=True, allow_cloud_media=True,
+        ))
+        expected = {"reply": "Here is the concise answer.", "searches": [], "proposals": []}
+        responses = [
+            {
+                "stop_reason": "max_tokens",
+                "content": [{"type": "text", "text": '{"reply":"unfinished'}],
+            },
+            {
+                "stop_reason": "end_turn",
+                "content": [{"type": "text", "text": json.dumps(expected)}],
+            },
+        ]
+        context = {
+            "summary": {"files": 100},
+            "representative_samples": [{"name": f"sample-{index}"} for index in range(40)],
+        }
+        with patch.object(client, "_message", side_effect=responses) as message:
+            result = client.curation_conversation(
+                [{"role": "user", "content": "Answer one question."}], context,
+            )
+        self.assertEqual(result, expected)
+        self.assertEqual(message.call_count, 2)
+        self.assertEqual(message.call_args_list[0].kwargs["max_tokens"], 4096)
+        self.assertEqual(message.call_args_list[1].kwargs["max_tokens"], 8192)
+        retry_prompt = message.call_args_list[1].args[1]
+        self.assertIn("previous response was cut off", retry_prompt)
+        self.assertIn("sample-11", retry_prompt)
+        self.assertNotIn("sample-12", retry_prompt)
+
     def test_anthropic_endpoint_is_recognized_for_existing_custom_settings(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
