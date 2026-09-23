@@ -38,7 +38,7 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
   - Other Files
 - Independent media facets for media type, origin, sensitivity, topic, people, event, and source application. A file can carry several facets instead of being forced into one category.
 - A sanitation-first curation workflow that preserves the recovered folder tree exactly instead of trying to reconstruct or reinterpret it.
-- Automatic omission of zero-byte placeholders, exact known-good copies, rejected/unreadable entries, and redundant byte-identical duplicates from the review library.
+- Automatic omission of zero-byte placeholders, exact known-good copies, redundant byte-identical duplicates, and only strict lower-resolution photo copies. Non-empty damaged, unreadable, and previously rejected entries remain for manual review.
 - Strict lower-resolution photo suppression only when direct perceptual hash, dimensions, orientation, and aspect ratio agree; crops and ordinary similar-photo groups remain.
 - Empty folders and damaged non-empty files remain in their original relative locations for manual review.
 - Space-efficient export: unchanged files are hardlinked when source and output are on the same filesystem; files requiring repairs use independent reflink clones when supported.

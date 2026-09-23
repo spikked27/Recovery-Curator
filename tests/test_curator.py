@@ -383,6 +383,29 @@ class CuratorTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "separate folder"):
                 curator.scan()
 
+    def test_sanitization_retains_nonempty_unreadable_and_legacy_rejected_files(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            damaged = source / "damaged-but-nonempty.bin"
+            damaged.write_bytes(b"partial recovered bytes")
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3", allow_actions=True)
+            curator.scan()
+            with connect(curator.db_path) as db:
+                db.execute(
+                    "UPDATE files SET validation='unreadable',decision='reject' WHERE relative_path=?",
+                    (damaged.name,),
+                )
+                db.commit()
+            preview = curator.build_sanitization_foundation()
+            self.assertEqual(preview["included"], 1)
+            self.assertEqual(preview["unreadable_included"], 1)
+            self.assertEqual(preview["manually_rejected_included"], 1)
+
     def test_reset_catalog_preserves_library_files_but_clears_active_scan_settings(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

@@ -2134,7 +2134,7 @@ class Curator:
                 WHERE size>0 AND known_good_match=0 AND validation='valid'
                   AND media_kind='photo' AND phash IS NOT NULL
                   AND width>0 AND height>0 AND similar_group IS NOT NULL
-                  AND decision!='reject'"""
+                  """
         total = int(db.execute(f"SELECT COUNT(*) FROM ({candidate_sql})").fetchone()[0])
         self._begin_phase(
             "strict_derivatives", total,
@@ -5765,8 +5765,7 @@ class Curator:
                      mr.confidence metadata_repair_confidence
               FROM files f LEFT JOIN zero_date_evidence z ON z.related_file_id=f.id
               LEFT JOIN sanitization_metadata_repairs mr ON mr.file_id=f.id
-              WHERE f.size>0 AND f.known_good_match=0 AND f.decision!='reject'
-                AND COALESCE(f.validation,'unchecked')!='unreadable'
+              WHERE f.size>0 AND f.known_good_match=0
                 AND NOT EXISTS (
                   SELECT 1 FROM sanitization_derivatives sd WHERE sd.file_id=f.id
                 )
@@ -5883,10 +5882,10 @@ class Curator:
                 """SELECT COUNT(*) catalog_files,
                           COALESCE(SUM(size=0),0) zero_evidence,
                           COALESCE(SUM(size>0 AND known_good_match=1),0) known_good_excluded,
-                          COALESCE(SUM(size>0 AND known_good_match=0 AND decision='reject'),0) rejected_excluded,
-                          COALESCE(SUM(size>0 AND known_good_match=0 AND validation='unreadable'),0) unreadable_excluded,
-                          COALESCE(SUM(size>0 AND known_good_match=0 AND decision!='reject'
-                                       AND COALESCE(validation,'unchecked')!='unreadable'),0) duplicate_pool,
+                          0 rejected_excluded,0 unreadable_excluded,
+                          COALESCE(SUM(size>0 AND known_good_match=0),0) duplicate_pool,
+                          COALESCE(SUM(size>0 AND known_good_match=0 AND decision='reject'),0) manually_rejected_included,
+                          COALESCE(SUM(size>0 AND known_good_match=0 AND validation='unreadable'),0) unreadable_included,
                           (SELECT COUNT(*) FROM sanitization_derivatives) derivative_excluded,
                           (SELECT COUNT(*) FROM directories WHERE status='available') preserved_directories
                    FROM files"""
@@ -5928,7 +5927,7 @@ class Curator:
                 destinations.add(key)
                 collections[plan["type_name"]][0] += 1
                 collections[plan["type_name"]][1] += size
-                if row["validation"] == "corrupt":
+                if row["validation"] in {"corrupt", "unreadable"}:
                     corrupt += 1
                 if plan["metadata_repair"] or plan["repair_mtime_ns"]:
                     repair_candidates += 1
@@ -6052,10 +6051,10 @@ class Curator:
                 """SELECT COUNT(*) catalog_files,
                           COALESCE(SUM(size=0),0) zero_evidence,
                           COALESCE(SUM(size>0 AND known_good_match=1),0) known_good_excluded,
-                          COALESCE(SUM(size>0 AND known_good_match=0 AND decision='reject'),0) rejected_excluded,
-                          COALESCE(SUM(size>0 AND known_good_match=0 AND validation='unreadable'),0) unreadable_excluded,
-                          COALESCE(SUM(size>0 AND known_good_match=0 AND decision!='reject'
-                                       AND COALESCE(validation,'unchecked')!='unreadable'),0) duplicate_pool,
+                          0 rejected_excluded,0 unreadable_excluded,
+                          COALESCE(SUM(size>0 AND known_good_match=0),0) duplicate_pool,
+                          COALESCE(SUM(size>0 AND known_good_match=0 AND decision='reject'),0) manually_rejected_included,
+                          COALESCE(SUM(size>0 AND known_good_match=0 AND validation='unreadable'),0) unreadable_included,
                           (SELECT COUNT(*) FROM sanitization_derivatives) derivative_excluded,
                           (SELECT COUNT(*) FROM directories WHERE status='available') preserved_directories
                    FROM files"""
@@ -6065,7 +6064,7 @@ class Curator:
                                   THEN substr(relative_path,1,instr(relative_path,'/')-1)
                                   ELSE 'Files at source root' END name,
                             COUNT(*) files,COALESCE(SUM(size),0) bytes,
-                            COALESCE(SUM(validation='corrupt'),0) corrupt_files,
+                            COALESCE(SUM(validation IN ('corrupt','unreadable')),0) corrupt_files,
                             COALESCE(SUM(media_kind='photo' AND exif_date IS NULL AND (
                               metadata_repair_json IS NOT NULL OR
                               (date_confidence>=85 AND filename_date IS NOT NULL) OR
@@ -6333,8 +6332,6 @@ class Curator:
             SELECT f.id,f.relative_path,f.size,
                    CASE WHEN f.size=0 THEN 'zero_byte_placeholder'
                         WHEN f.known_good_match=1 THEN 'exact_known_good_copy'
-                        WHEN f.decision='reject' THEN 'manually_rejected'
-                        WHEN COALESCE(f.validation,'unchecked')='unreadable' THEN 'unreadable'
                         WHEN sd.file_id IS NOT NULL THEN 'strict_lower_resolution_copy'
                         WHEN f.exact_group IS NOT NULL THEN 'redundant_byte_identical_copy'
                         ELSE 'not_selected' END exclusion_reason,
