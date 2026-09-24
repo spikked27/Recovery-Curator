@@ -17,12 +17,16 @@ services:
       SCAN_BATCH_SIZE: "64"
       SIMILARITY_DISTANCE: "6"
       REFERENCE_ROOT: "/known-good"
+      RECOVERY_DATA_ROOT: "/recovery-data"
+      SOURCE_SUBPATH: "Recovered"
+      OUTPUT_SUBPATH: "Recovered_Curated"
+      QUARANTINE_SUBPATH: "Recovered_Quarantine"
+      REFERENCE_SUBPATH: "Known-Good"
       RECOVERY_AI_API_KEY: ""
     volumes:
-      - /mnt/user/Recovered:/source:ro
-      - /mnt/user/Backups:/known-good:ro
-      - /mnt/user/Recovered_Curated:/output:rw
-      - /mnt/user/Recovered_Quarantine:/quarantine:rw
+      # Mount the common parent once. Separate /source and /output bind mounts
+      # prevent hardlinks inside Docker even when the host paths share a device.
+      - /mnt/user/Recovery:/recovery-data:rw
       - /mnt/user/appdata/recovery-curator:/config:rw
     mem_limit: 4g
     restart: unless-stopped

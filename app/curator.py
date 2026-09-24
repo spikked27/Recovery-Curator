@@ -5876,7 +5876,75 @@ class Curator:
             current = current.parent
         return current if current.exists() else None
 
+    @classmethod
+    def _mount_identity(cls, path: Path) -> str | None:
+        """Return Linux's mount ID for a path, following container symlinks."""
+        existing = cls._existing_parent(path)
+        if existing is None:
+            return None
+        try:
+            resolved = existing.resolve()
+            best: tuple[int, str] | None = None
+            with Path("/proc/self/mountinfo").open(encoding="utf-8") as stream:
+                for line in stream:
+                    left, separator, _right = line.partition(" - ")
+                    if not separator:
+                        continue
+                    fields = left.split()
+                    if len(fields) < 5:
+                        continue
+                    mount_point_text = re.sub(
+                        r"\\([0-7]{3})",
+                        lambda match: chr(int(match.group(1), 8)),
+                        fields[4],
+                    )
+                    mount_point = Path(mount_point_text)
+                    if resolved != mount_point and mount_point not in resolved.parents:
+                        continue
+                    candidate = (len(mount_point.parts), fields[0])
+                    if best is None or candidate[0] > best[0]:
+                        best = candidate
+            return best[1] if best else None
+        except (OSError, RuntimeError):
+            return None
+
+    def _hardlink_layout(self) -> dict:
+        output_parent = self._existing_parent(self.output)
+        source_parent = self._existing_parent(self.source)
+        try:
+            source_device = source_parent.stat().st_dev if source_parent else None
+            output_device = output_parent.stat().st_dev if output_parent else None
+        except OSError:
+            source_device = output_device = None
+        same_device = bool(
+            source_device is not None and output_device is not None
+            and source_device == output_device
+        )
+        source_mount = self._mount_identity(self.source)
+        output_mount = self._mount_identity(self.output)
+        shared_mount = (
+            source_mount == output_mount
+            if source_mount is not None and output_mount is not None
+            else None
+        )
+        hardlinks_available = same_device and shared_mount is not False
+        if source_device is None or output_device is None:
+            block_reason = "path_unavailable"
+        elif not same_device:
+            block_reason = "different_filesystems"
+        elif shared_mount is False:
+            block_reason = "separate_container_mounts"
+        else:
+            block_reason = ""
+        return {
+            "same_filesystem": hardlinks_available,
+            "same_device": same_device,
+            "shared_mount": shared_mount,
+            "hardlink_block_reason": block_reason,
+        }
+
     def _current_sanitization_preview(self) -> dict:
+        hardlink_layout = self._hardlink_layout()
         with connect(self.db_path) as db:
             counts = dict(db.execute(
                 """SELECT COUNT(*) catalog_files,
@@ -5900,10 +5968,6 @@ class Curator:
             collections: dict[str, list[int]] = defaultdict(lambda: [0, 0])
             output_parent = self._existing_parent(self.output)
             output_device = output_parent.stat().st_dev if output_parent else None
-            try:
-                source_root_device = self.source.stat().st_dev
-            except OSError:
-                source_root_device = None
             for row in rows:
                 plan = self._sanitization_destination(row)
                 included += 1
@@ -5946,7 +6010,11 @@ class Curator:
                 except OSError:
                     unavailable += 1
                     continue
-                if not plan["metadata_repair"] and not plan["repair_mtime_ns"] and output_device is not None and source_device == output_device:
+                if (
+                    not plan["metadata_repair"] and not plan["repair_mtime_ns"]
+                    and hardlink_layout["same_filesystem"]
+                    and output_device is not None and source_device == output_device
+                ):
                     hardlink_candidates += 1
                 else:
                     independent_candidates += 1
@@ -5978,10 +6046,6 @@ class Curator:
         except OSError:
             unexpected_output = []
         legacy_output_warning = bool(legacy_built or unexpected_output)
-        same_filesystem = bool(
-            output_device is not None and source_root_device is not None
-            and output_device == source_root_device
-        )
         return {
             **counts, "included": included, "repair_candidates": repair_candidates,
             "zero_date_repairs": zero_date_repairs, "already_built": already_built,
@@ -5991,7 +6055,7 @@ class Curator:
             "independent_bytes": independent_bytes,
             "independent_bytes_human": human_bytes(independent_bytes),
             "total_bytes": total_bytes, "total_bytes_human": human_bytes(total_bytes),
-            "collisions": collisions, "same_filesystem": same_filesystem,
+            "collisions": collisions, **hardlink_layout,
             "legacy_output_warning": legacy_output_warning,
             "collections": [
                 {"name": name, "files": values[0], "bytes": values[1], "bytes_human": human_bytes(values[1])}
@@ -6040,6 +6104,15 @@ class Curator:
                 except (TypeError, ValueError, json.JSONDecodeError):
                     preview = None
                 if isinstance(preview, dict):
+                    hardlink_layout = self._hardlink_layout()
+                    preview.update(hardlink_layout)
+                    if not hardlink_layout["same_filesystem"]:
+                        preview["hardlink_candidates"] = 0
+                        preview["independent_candidates"] = int(preview.get("included") or 0)
+                        preview["independent_bytes"] = int(preview.get("total_bytes") or 0)
+                        preview["independent_bytes_human"] = human_bytes(
+                            preview["independent_bytes"]
+                        )
                     preview["authorized"] = bool(
                         stored_token and stored_token["value"] == preview.get("token")
                     )
@@ -6076,13 +6149,8 @@ class Curator:
         total_bytes = sum(int(item["bytes"] or 0) for item in collections)
         corrupt_included = sum(int(item["corrupt_files"] or 0) for item in collections)
         repairs = sum(int(item["repair_files"] or 0) for item in collections)
-        output_parent = self._existing_parent(self.output)
-        try:
-            same_filesystem = bool(
-                output_parent and output_parent.stat().st_dev == self.source.stat().st_dev
-            )
-        except OSError:
-            same_filesystem = False
+        hardlink_layout = self._hardlink_layout()
+        same_filesystem = hardlink_layout["same_filesystem"]
         independent = repairs if same_filesystem else included
         result = {
             **counts, "included": included, "total_bytes": total_bytes,
@@ -6095,7 +6163,7 @@ class Curator:
             "independent_candidates": independent, "independent_bytes": 0,
             "independent_bytes_human": "calculated in preview",
             "total_bytes_human": human_bytes(total_bytes),
-            "collisions": 0, "same_filesystem": same_filesystem,
+            "collisions": 0, **hardlink_layout,
             "legacy_output_warning": False,
             "collections": [
                 {
@@ -6184,6 +6252,7 @@ class Curator:
         directories_created = 0
         output_parent = self._existing_parent(self.output)
         output_device = output_parent.stat().st_dev if output_parent else None
+        hardlink_layout = self._hardlink_layout()
         with connect(self.db_path) as db:
             directories_created = self._prepare_mirror_directories(db)
             rows = db.execute(self._sanitization_query() + " ORDER BY id")
@@ -6203,16 +6272,27 @@ class Curator:
                 destination = intended_destination
                 method = ""
                 repair_state = "not_needed"
+                hardlink_fallback = ""
                 try:
                     destination = self._mirror_destination(plan["relative_path"])
                     same_device = output_device is not None and source.stat().st_dev == output_device
-                    if not plan["metadata_repair"] and not plan["repair_mtime_ns"] and same_device:
+                    if (
+                        not plan["metadata_repair"] and not plan["repair_mtime_ns"]
+                        and same_device and hardlink_layout["same_filesystem"]
+                    ):
                         try:
                             os.link(source, destination)
                             method = "hardlink"
-                        except OSError:
+                        except OSError as exc:
+                            hardlink_fallback = f"link_error_{exc.errno}: {exc.strerror or exc}"
                             method = self._independent_clone(source, destination, allow_copy_fallback)
                     else:
+                        if plan["metadata_repair"] or plan["repair_mtime_ns"]:
+                            hardlink_fallback = "independent_clone_required_for_metadata_repair"
+                        elif not same_device:
+                            hardlink_fallback = "different_filesystems"
+                        else:
+                            hardlink_fallback = hardlink_layout["hardlink_block_reason"]
                         method = self._independent_clone(source, destination, allow_copy_fallback)
                     if method != "hardlink":
                         if plan["metadata_repair"]:
@@ -6241,6 +6321,7 @@ class Curator:
                     detail = json.dumps(
                         {"method": method, "date_source": plan["date_source"],
                          "date_confidence": plan["date_confidence"], "repair": repair_state,
+                         "hardlink_fallback": hardlink_fallback,
                          "metadata_fields": sorted(plan["metadata_repair"]),
                          "metadata_sources": json.loads(row["metadata_repair_sources"] or "[]")},
                         separators=(",", ":"),

@@ -41,7 +41,7 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
 - Automatic omission of zero-byte placeholders, exact known-good copies, redundant byte-identical duplicates, and only strict lower-resolution photo copies. Non-empty damaged, unreadable, and previously rejected entries remain for manual review.
 - Strict lower-resolution photo suppression only when direct perceptual hash, dimensions, orientation, and aspect ratio agree; crops and ordinary similar-photo groups remain.
 - Empty folders and damaged non-empty files remain in their original relative locations for manual review.
-- Space-efficient export: unchanged files are hardlinked when source and output are on the same filesystem; files requiring repairs use independent reflink clones when supported.
+- Space-efficient export: unchanged files are hardlinked when source and output share both a filesystem and one Docker mount namespace; files requiring repairs use independent reflink clones when supported.
 - Zero-byte names and timestamps remain evidence. Strict smaller versions can donate missing EXIF fields to the best version, and a strong placeholder relationship can supply a missing date to an independent copy; placeholders are never exported as content.
 - Saved recovery context for devices, people, events, applications, folders, and privacy rules.
 - Optional OpenAI-compatible local or cloud vision provider with quick setup presets and cancellable batch analysis. The provider receives only reduced previews/contact sheets and structured evidence, never filesystem access or action permissions.
@@ -70,25 +70,35 @@ Recovery Curator turns a mixed file-recovery dump into a reviewable catalog and,
 
 2. In Unraid, open **Docker > Add Container** and select **Recovery-Curator** from the template list.
 
-3. Set **Recovered Source** to the one top-level folder containing the Hetman output. Do not scan both `/mnt/user/...` and `/mnt/diskN/...` representations of the same files.
+3. Set **Recovery Workspace** to the one common host parent containing the source, curated output, and quarantine folders. Docker must receive that parent through one mapping; separate `/source` and `/output` mappings cause Linux to reject hardlinks with `EXDEV`, even when Unraid reports the same device for both host paths.
 
-   For a recovery set located entirely on one array disk, prefer the direct read-only path, such as `/mnt/disk3/Recovered`, rather than the `/mnt/user` view.
+   Example host layout:
 
-   Optionally set **Known-Good Root** to the common parent folder containing trusted backups. For example, if the two backups are `/mnt/user/Backups/Laptop` and `/mnt/user/Backups/Old-PC`, map `/mnt/user/Backups`. The container mounts it read-only; choose the individual folders later in the Web UI.
+   ```text
+   /mnt/user/Recovery/
+   ├── Recovered/
+   ├── Recovered_Curated/
+   └── Recovered_Quarantine/
+   ```
 
-   Keep **Appdata** and initial **Quarantine** paths on a non-array pool so catalog checkpoints do not cause parity writes. For a pool named `cache`, use:
+   Configure the template as:
 
-   - `/mnt/cache/appdata/recovery-curator`
-   - `/mnt/cache/appdata/recovery-curator/staging-quarantine`
+   - Recovery Workspace: `/mnt/user/Recovery`
+   - Recovered Source Subfolder: `Recovered`
+   - Curated Output Subfolder: `Recovered_Curated`
+   - Quarantine Subfolder: `Recovered_Quarantine`
 
-   To let unchanged files use no additional data space, map **Curated Output** to a separate folder on the same direct disk/filesystem as the recovered source. For example, use `/mnt/disk3/Recovery-Curated` with a source at `/mnt/disk3/Recovered`. Never place the output inside the source. A `/mnt/cache` output cannot hardlink files from `/mnt/disk3`; those files require a reflink or an explicitly permitted full copy.
+   The subfolder fields are relative names, not host paths. Never put the curated output inside the recovered source. Do not map both `/mnt/user/...` and `/mnt/diskN/...` representations of the same data.
+
+   If trusted backups are also beneath the workspace, set **Known-Good Subfolder** to their relative folder. Use `.` when the workspace itself should be the browseable known-good root. If trusted backups live elsewhere, leave that field blank and use the advanced read-only **Optional External Known-Good Root** mapping.
+
+   Keep **Appdata** on a non-array pool so catalog checkpoints do not cause parity writes. For a pool named `cache`, use `/mnt/cache/appdata/recovery-curator`.
 
 4. Leave these initial settings unchanged:
 
-   - Recovered Source access: **Read Only**
    - Allow Write Actions: **false**
 
-   If recovered permissions prevent UID 99 from reading parts of the source, temporarily set **User ID / PUID** to `0`. Keep the source read-only and write actions disabled. Hardlinks necessarily retain the source inode's owner, permissions, and timestamps. Independent repaired files and generated reports can use the configured Curated Output Owner UID/GID.
+   Shared-workspace mode requires the one workspace mapping to be read/write so the output directory and hardlinks can be created. Scanning remains read-only at the application level while **Allow Write Actions** is `false`. If recovered permissions prevent UID 99 from reading parts of the source, temporarily set **User ID / PUID** to `0`. Hardlinks necessarily retain the source inode's owner, permissions, and timestamps. Independent repaired files and generated reports can use the configured Curated Output Owner UID/GID.
 
 5. Apply the template and open the Web UI on port `8188`.
 
@@ -141,16 +151,26 @@ docker inspect Recovery-Curator --format '{{range .Mounts}}{{println .Source "->
 docker exec Recovery-Curator sh -c 'find /source -type f -print -quit'
 ```
 
-The first command should show the intended host recovery folder mapped to `/source` with read-only mode. The second should print one recovered file. If it prints nothing, correct the **Recovered Source** host path in the container settings before scanning again.
+The first command should show one host parent mapped read/write to `/recovery-data`; it should not show separate mounts at `/source`, `/output`, or `/quarantine`. Those internal paths are stable symlinks created inside the container so existing SQLite catalog paths remain valid. The second command should print one recovered file. If it prints nothing, correct the workspace and source-subfolder settings before scanning again.
+
+### Migrating an existing container for hardlinks
+
+An existing scan does not need to be repeated. Stop any running build, preserve or rename its partial output, then edit the Unraid container:
+
+1. Remove the old Docker path mappings whose container targets are `/source`, `/output`, and `/quarantine`. Remove `/known-good` too if that data is under the common parent.
+2. Add one read/write path mapping from the common host parent to `/recovery-data`.
+3. Set `RECOVERY_DATA_ROOT=/recovery-data` and enter the relative `SOURCE_SUBPATH`, `OUTPUT_SUBPATH`, and `QUARANTINE_SUBPATH` values. Set `REFERENCE_SUBPATH=.` when the common parent itself contains the known-good folders.
+4. Keep `/config` unchanged. Restart the container and generate a new Curate preview.
+
+The app continues to use `/source`, `/output`, `/quarantine`, and `/known-good` internally, so the saved scan database is still usable. The preview now checks Linux mount IDs as well as device numbers and explicitly reports legacy separate bind mounts.
 
 ## Quarantine mode
 
-Quarantine physically moves a source file, so it requires both:
+Quarantine physically moves a source file, so it requires:
 
 - **Allow Write Actions** = `true`
-- The **Recovered Source** container path changed from Read Only to Read/Write
 
-Do not enable source write access merely to build the curated library. Quarantine is optional; retaining the original recovery dump is safer.
+The shared workspace is already mapped read/write for output and hardlink creation. Quarantine remains an explicit action; retaining the original recovery dump is safer.
 
 ## Metadata policy
 
@@ -188,7 +208,7 @@ Run **Start or resume scan** again. Files whose size and nanosecond modification
 - Rule-based categories are an initial triage, not final semantic organization.
 - Legacy binary Office formats receive only basic type detection in this release.
 - Known-good comparison is exact-content matching. A resized, recompressed, or metadata-edited version will not be treated as an identical trusted copy; it may still appear in similar-photo review.
-- Hardlinks require source and output to be on the same filesystem and may also be limited by host permissions. Reflink support depends on the filesystem. Cross-filesystem output can therefore require full additional storage, and Recovery Curator will not do that without an explicit per-build opt-in.
+- Hardlinks require source and output to be on the same filesystem, beneath the same container mount, and permitted by host ownership rules. Separate Docker bind mounts can return `Invalid cross-device link` even when both host paths have the same device number. Reflink support depends on the filesystem. Cross-filesystem output can therefore require full additional storage, and Recovery Curator will not do that without an explicit per-build opt-in.
 - Similar-looking files are deliberately retained unless one is a strictly dominated lower-resolution copy with a direct, high-confidence visual and geometric match.
 
 ## Development checks

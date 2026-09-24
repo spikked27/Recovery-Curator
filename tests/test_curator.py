@@ -15,6 +15,54 @@ from app.curator import IMAGE_ANALYSIS_VERSION, Curator, connect, extract_exif_g
 
 
 class CuratorTests(unittest.TestCase):
+    def test_shared_workspace_symlinks_are_hardlink_compatible(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            workspace = root / "recovery-data"
+            source_target = workspace / "Recovered"
+            output_target = workspace / "Recovered_Curated"
+            quarantine_target = workspace / "Recovered_Quarantine"
+            config = root / "config"
+            for directory in (source_target, output_target, quarantine_target, config):
+                directory.mkdir(parents=True)
+            source_alias = root / "source"
+            output_alias = root / "output"
+            quarantine_alias = root / "quarantine"
+            source_alias.symlink_to(source_target, target_is_directory=True)
+            output_alias.symlink_to(output_target, target_is_directory=True)
+            quarantine_alias.symlink_to(quarantine_target, target_is_directory=True)
+
+            curator = Curator(
+                source_alias, output_alias, quarantine_alias, config / "catalog.sqlite3",
+            )
+            layout = curator._hardlink_layout()
+
+            self.assertTrue(layout["same_device"])
+            self.assertTrue(layout["shared_mount"])
+            self.assertTrue(layout["same_filesystem"])
+            self.assertEqual(layout["hardlink_block_reason"], "")
+
+    def test_separate_container_mount_ids_disable_hardlinks(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            source, output, quarantine, config = (
+                root / name for name in ("source", "output", "quarantine", "config")
+            )
+            for directory in (source, output, quarantine, config):
+                directory.mkdir()
+            curator = Curator(source, output, quarantine, config / "catalog.sqlite3")
+
+            with patch.object(
+                Curator, "_mount_identity",
+                side_effect=lambda path: "source-mount" if path == source else "output-mount",
+            ):
+                layout = curator._hardlink_layout()
+
+            self.assertTrue(layout["same_device"])
+            self.assertFalse(layout["shared_mount"])
+            self.assertFalse(layout["same_filesystem"])
+            self.assertEqual(layout["hardlink_block_reason"], "separate_container_mounts")
+
     def test_filename_date_is_conservative(self):
         parsed = parse_filename_date("IMG_20230517_142233.jpg")
         self.assertEqual(parsed.value, "2023-05-17T14:22:33")
