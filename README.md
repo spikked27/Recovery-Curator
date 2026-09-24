@@ -148,7 +148,7 @@ If the dashboard reports zero recovered files while known-good folders contain f
 
 ```sh
 docker inspect Recovery-Curator --format '{{range .Mounts}}{{println .Source "->" .Destination "(" .Mode ")"}}{{end}}'
-docker exec Recovery-Curator sh -c 'find /source -type f -print -quit'
+docker exec Recovery-Curator sh -c 'find -H /source -type f -print -quit'
 ```
 
 The first command should show one host parent mapped read/write to `/recovery-data`; it should not show separate mounts at `/source`, `/output`, or `/quarantine`. Those internal paths are stable symlinks created inside the container so existing SQLite catalog paths remain valid. The second command should print one recovered file. If it prints nothing, correct the workspace and source-subfolder settings before scanning again.
